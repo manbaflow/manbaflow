@@ -1,0 +1,610 @@
+# MambaFlow
+
+> 牢大带队，一人一城；需求落地，才喊 Mamba Out。
+
+MambaFlow 是一个计划使用 **Rust** 构建的企业级 **Human-Agent Flow** 平台。管理者只需要提出
+业务需求，系统就能生成 PRD、拆解任务、匹配团队/员工/Agent、估算工期、派发工作，并持续追踪
+Todo、阻塞、证据与交付结果，直到通过验收。
+
+这里的“人事管理”不是工资、考勤或招聘系统，而是对企业中 **人类员工、团队和 AI Agent 的工作
+关系进行统一编排**。人和 Agent 都是组织成员，都有身份、能力、权限、收件箱、任务和审计记录。
+
+> [!IMPORTANT]
+> MambaFlow 目前处于 **Preflight / 预飞阶段**。仓库现在只有设计文档，没有可运行代码、
+> 已发布 crate 或可用 CLI。本文描述的是待社区共同验证的产品与协议方向。
+
+## 一句话定位
+
+> **把管理者的需求转化为跨团队、员工和个人 Agent 的可执行 Flow，自动完成规划、匹配、估时、
+> 派发、协作、追踪、恢复与验收。**
+
+MambaFlow 不是聊天机器人外壳，也不是只在一个对话里拉起几个 sub-agents。它管理的是一条可能
+跨越多个用户、多个 Agent、多个系统和数天时间的持久化工作流程。
+
+## Flow 到底是什么
+
+`Flow` 不是 Agent 内部的一串 Tool Calls，而是一个企业任务从提出到交付的完整组织过程：
+
+```text
+需求提出
+   │
+   ▼
+PRD 生成与审批
+   │
+   ▼
+任务拆解与依赖分析
+   │
+   ▼
+团队 / 员工 / Agent 匹配
+   │
+   ▼
+工期、成本与风险评估
+   │
+   ▼
+WorkRequest 派发
+   │
+   ▼
+人类补充信息并批准执行
+   │
+   ▼
+Agent Flight / Human Task 执行
+   │
+   ▼
+Todo 追踪、阻塞升级与动态重排
+   │
+   ▼
+证据验证、人工验收与 Flow 关闭
+```
+
+Flow 中的每个节点都有明确的负责人、权限、输入、输出、期限、验收条件和可见范围。系统可以自动
+推进，但不能绕过组织权限或需要人工确认的 Gate。
+
+## 一个完整例子
+
+管理者在周一早上提出：
+
+> “这周完成一个 LLM Gateway，支持多 Provider、限流、重试和基础观测。”
+
+MambaFlow 创建 `FlowRun F-24`，然后执行以下流程。
+
+### 1. 生成 PRD
+
+需求 Agent 根据组织模板生成 PRD：
+
+```text
+目标
+- 为业务提供统一的 LLM 调用入口
+- 支持 OpenAI-compatible Provider
+- 提供超时、重试、限流和请求日志
+
+非目标
+- 第一版不做复杂计费
+- 第一版不提供跨地域容灾
+
+验收标准
+- 至少接入 2 个 Provider
+- 关键路径具有单元测试和集成测试
+- Provider 故障时能够按策略切换
+- Dashboard 能查看成功率和 P95 延迟
+```
+
+管理者可以修改、补充或批准 PRD。PRD 未批准前，系统不会进入正式派发阶段。
+
+### 2. 自动匹配
+
+组织调度 Agent 查询组织图谱、代码所有权、技能、权限、在途工作和日历，给出建议：
+
+```text
+推荐团队：Platform / AI Infra
+推荐负责人：工程师 A
+协作成员：工程师 B
+个人 Agent：Agent A
+
+原因
+- 工程师 A 负责现有 API Gateway
+- Agent A 已被授权读取 gateway 仓库和团队规范
+- 工程师 B 熟悉限流与可观测性
+- 本周预计可用产能：A 60%，B 30%
+
+预计工期
+- P50：3.2 个工作日
+- P80：4.8 个工作日
+- 置信度：中等
+- 主要风险：Provider API 差异、集成测试环境
+```
+
+管理者批准后，系统向团队、工程师和对应的个人 Agent 发送带权限链的 `WorkRequest`。
+
+### 3. 个人 Agent 生成技术计划
+
+Agent A 只能在工程师 A 授权的范围内读取：
+
+- 该工程师负责的 Git 仓库；
+- 现有架构、历史 PR 和 Issue；
+- 团队开发规范、测试命令和交付流程；
+- 与当前 Flow 相关的 PRD 和 Artifact。
+
+Agent A 将需求拆成具体 Todo：
+
+```text
+T-01  定义 Gateway API 与错误模型       owner=A        estimate=4h
+T-02  实现 Provider Adapter 接口         owner=A+AgentA estimate=6h
+T-03  接入 Provider 1 / Provider 2       owner=AgentA   estimate=8h
+T-04  实现限流、超时和重试策略           owner=B+AgentB estimate=8h
+T-05  添加请求日志与指标                 owner=A+AgentA estimate=6h
+T-06  集成测试与故障切换验证             owner=A+B      estimate=8h
+T-07  PR Review 与发布说明               owner=A        estimate=4h
+```
+
+工程师在自己的 Inbox 中补充技术约束、调整任务、接受或拒绝工期，并批准 Agent 开始执行。
+
+### 4. 执行与追踪
+
+批准后，Agent A 启动 Coding Flight，在隔离工作区中修改代码、运行测试并创建 PR。Tracker Agent
+持续消费 Git、CI、文档、人工反馈和 Flight 事件，更新 Todo 状态。
+
+管理员看到的组织级时间线类似：
+
+```text
+09:00  Demand submitted by Manager
+09:02  PRD draft generated
+09:15  PRD approved by Manager
+09:16  Routed to Platform / AI Infra
+09:16  Assigned to Engineer A + Agent A
+09:18  Repository access granted by Engineer A
+09:24  Technical plan generated
+09:31  Engineer A requested API compatibility changes
+09:36  Plan updated; ETA changed from 3.2d to 4.0d
+10:02  Coding Flight H-08 took off
+11:40  Unit tests passed: 128 / 128
+12:05  Integration test crashed: upstream timeout
+12:08  Flight H-24 resumed from Waypoint W-07
+14:20  Pull request opened
+16:10  Review requested changes
+17:05  Changes pushed; CI passed
+17:20  Delivery waiting for Manager acceptance
+```
+
+### 5. 验收与关闭
+
+代码、测试结果、PR、文档和监控截图作为 Evidence 进入 Landing Validator。满足 PRD 的验收条件后，
+系统请求管理者确认交付；确认后写入 `flow.closed`，CLI 可以显示：
+
+```text
+[MAMBA_OUT] Flow F-24 completed. All assignments settled.
+```
+
+这条从需求到交付、跨管理者、工程师和 Agent 的持久化因果链，就是 MambaFlow 中的 Flow。
+
+## 产品架构
+
+```text
+┌──────────────────────────────── Enterprise Surfaces ────────────────────────────────┐
+│ Web Console · mamba CLI · Feishu · Slack · Teams · Email · API                    │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │ demand / command / approval
+┌───────────────────────────────────────▼─────────────────────────────────────────────┐
+│                           Organization Control Plane                                │
+│                                                                                     │
+│ Demand Intake    PRD Planner     Matcher        Scheduler       Todo Tracker         │
+│ Approval Gates   Dispatcher      Escalation     Policy Engine   Flow Ledger          │
+└───────────────────────┬───────────────────────┬───────────────────────┬───────────────┘
+                        │                       │                       │
+              ┌─────────▼────────┐    ┌─────────▼────────┐    ┌─────────▼────────┐
+              │ Human / Team     │    │ Personal Agent  │    │ Org Agent        │
+              │ Inbox            │    │ 一人一城         │    │ shared service   │
+              └─────────┬────────┘    └─────────┬────────┘    └─────────┬────────┘
+                        │                       │                       │
+┌───────────────────────▼───────────────────────▼───────────────────────▼───────────────┐
+│                               Execution Plane                                       │
+│ Human Task · Agent Flight · Cabin · Tool · Skill · Artifact · Validator             │
+└───────────────────────────────────────┬─────────────────────────────────────────────┘
+                                        │ append
+┌───────────────────────────────────────▼─────────────────────────────────────────────┐
+│ Flow Ledger · Agent Black Box · Audit Log · Metrics · Cost · Evidence               │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Control Plane 管组织和工作，Execution Plane 管一次具体执行。Tower 不亲自调用模型完成业务任务，
+而是监督 Flow、路由 WorkRequest、管理权限、资源、预算和恢复策略。
+
+## 核心模型
+
+| 实体 | 说明 |
+| --- | --- |
+| `Tenant` | 企业租户及其安全边界 |
+| `OrgUnit` | 部门、团队、项目组或临时小队 |
+| `Principal` | 可以接收任务的 Human、Team 或 Agent |
+| `PersonalAgent` | 归属于某个员工的 Agent，继承有限授权而非员工全部权限 |
+| `Capability` | 编程、研究、表格、演示文稿、审批等可匹配能力 |
+| `Demand` | 管理者提出的原始需求 |
+| `FlowDefinition` | 可复用的组织流程模板 |
+| `FlowRun` | 一次需求从提出到关闭的持久化实例 |
+| `WorkPlan` | PRD、任务 DAG、依赖、工期和风险 |
+| `Task` | 可独立分配、跟踪和验收的工作单元 |
+| `Assignment` | Principal 与 Task 之间的责任关系 |
+| `WorkRequest` | 跨用户或 Agent 发送的带权限命令信封 |
+| `ApprovalGate` | 需要指定 Human 或 Policy 批准的流程节点 |
+| `Artifact` | PRD、代码、文档、表格、报告、PR 或其他交付物 |
+| `Evidence` | 证明 Task 满足验收条件的可验证材料 |
+| `Flight` | Agent 执行一个 Task 时产生的隔离运行实例 |
+| `FlowLedger` | 组织级、追加式的完整流程事件源 |
+| `BlackBox` | 单个 Agent Flight 的详细执行记录与航点 |
+
+平台管理员与业务管理者是不同角色：`TenantAdmin` 管理租户、身份源、策略和系统配置；`Manager`
+只能在自己的组织与授权范围内提出需求、分配工作和查看 Flow；`Requester` 可以追踪自己发起的
+需求。任何角色都不会因为名称里有“管理员”就自动获得员工私人上下文或 Secret 的读取权限。
+
+## 牢大与一人一城
+
+梗必须对应真实的组织约束，而不是给通用概念换皮。
+
+- **一人一城**：每个员工拥有自己的 Personal Agent、记忆、凭据、工作区和授权边界。其他人只能
+  发送 WorkRequest，不能直接接管他的 Agent 或读取其私人上下文。
+- **牢大 / Captain**：Flow 中负责带队的协调 Agent。它负责拆解、传球、汇总和升级，不拥有
+  队员的全部权限。
+- **传球 `PASS`**：把目标、上下文引用、期限、预算和验收条件交给另一个 Principal。
+- **助攻 `ASSIST`**：返回结构化结果、Evidence、Artifact、风险和剩余工作。
+- **24 秒**：任何任务都必须有响应或 Heartbeat 时限，不能长期霸占球权。
+- **81 分**：工具调用和子任务数量可以用作默认彩蛋，但必须受真实预算控制。
+- **凌晨四点**：定时任务也必须具备权限、Fuel、Lease 和终止条件。
+- **坠机 `CRASHED`**：Flight 失败并留下可恢复黑匣子，不等于整个 Flow 失败。
+- **Mamba Out**：Flow 完成验收、资源释放并正式关闭后的显示事件。
+
+公共协议使用稳定英文名称。中文梗属于 CLI 和产品显示层，不得牺牲 API、审计与错误分类的准确性。
+
+## WorkRequest：跨用户协作协议
+
+管理者不能通过一句 Prompt 直接操纵其他员工的 Agent。所有跨身份命令必须形成可审计的信封：
+
+```yaml
+work_request_id: WR-24
+flow_id: F-24
+issuer: user://manager-a
+acting_as: role://engineering-manager
+target: agent://engineer-a/personal-agent
+authority_grant: grant://platform-team/task-assignment
+
+objective: 为 LLM Gateway 生成技术方案并拆解 Todo
+context_refs:
+  - artifact://F-24/prd/v3
+deadline: 2026-07-18T18:00:00+08:00
+budget:
+  max_tokens: 120000
+  max_cost: 5.00USD
+
+visibility:
+  flow_events: manager_and_assignees
+  raw_tool_output: assignee_only
+requires_acceptance: true
+```
+
+接收方可以接受、拒绝、协商期限、要求补充信息或请求更高权限。Agent 只能使用信封中明确授予的
+Authority，不得把权限继续传递给无权的第三方。
+
+## 自动匹配
+
+Matcher 先应用硬约束，再对候选 Principal 排序。
+
+硬约束包括：
+
+- 是否属于允许接单的组织范围；
+- 是否拥有任务要求的 Capability；
+- 是否能够访问必要数据和系统；
+- 是否存在利益冲突或隔离要求；
+- 是否满足地域、时区、合规和审批要求。
+
+排序信号可以包括：
+
+- 领域技能与历史所有权；
+- 当前负载和日历可用性；
+- 任务上下文切换成本；
+- Agent 的模型、工具、预算和成功率；
+- 团队协作关系和关键依赖；
+- 费用、截止时间和风险偏好。
+
+系统必须展示匹配理由和备选方案。对 Human 的分配默认需要接受或管理者确认，不能把模型推荐当成
+不可申诉的人事决定，也不能使用敏感属性进行隐性绩效排名。
+
+## 工期估算
+
+MambaFlow 不允许 LLM 随口给出一个精确日期。工期由多个可解释部分组成：
+
+```text
+Lead Time = Queue Time
+          + Execution Effort / Available Capacity
+          + Dependency Time
+          + Approval Time
+          + Risk Buffer
+```
+
+每份 Estimate 至少包含：
+
+- 工作量与交付周期的区分；
+- P50 和 P80 时间范围；
+- 置信度和使用的数据来源；
+- 关键路径与并行机会；
+- 人类、Agent 和外部系统的可用产能；
+- 假设、风险和可能导致重估的条件。
+
+冷启动阶段使用组织模板、任务复杂度和人工校正。积累数据后，可以使用同类任务历史、团队吞吐和
+Agent 运行指标校准，但不得把未经解释的估算用于自动惩罚员工。
+
+## Todo 不是勾选框
+
+Todo 必须是可追踪、可验收的任务 DAG，而不是 Agent 自己声称“已完成 80%”：
+
+```yaml
+task_id: T-04
+flow_id: F-24
+title: 实现限流、超时和重试策略
+owner: user://engineer-b
+copilot: agent://engineer-b/personal-agent
+depends_on: [T-01, T-02]
+
+acceptance_contract:
+  - unit_tests_pass
+  - retry_policy_documented
+  - p95_latency_not_regressed
+
+estimate:
+  effort: 8h
+  p50_finish: 2026-07-16T15:00:00+08:00
+  p80_finish: 2026-07-17T12:00:00+08:00
+
+status: in_progress
+last_heartbeat: 2026-07-15T11:30:00+08:00
+blocker: null
+evidence: []
+```
+
+Tracker Agent 通过事件和 Evidence 更新状态：
+
+- `task.proposed`
+- `task.assigned`
+- `task.accepted`
+- `task.started`
+- `task.heartbeat`
+- `task.blocked`
+- `task.submitted`
+- `task.review_requested`
+- `task.completed`
+- `task.cancelled`
+
+长期没有 Heartbeat、关键依赖延期、Evidence 不足或预算异常时，Tracker 自动重新估时并按策略提醒、
+升级、重新匹配或请求管理者决策。
+
+## Human in the Loop
+
+Human 不是只在最后按一次“批准”，而是 Flow 中的一等节点：
+
+- 管理者审核 PRD、匹配结果、工期和高风险变更；
+- 员工接受、拒绝或协商 Assignment；
+- 员工为 Personal Agent 补充上下文并授权执行；
+- 敏感 Tool、数据访问和外部发送需要指定人员批准；
+- Agent 遇到模糊需求或阻塞时创建 Clarification Task；
+- 负责人审核中间交付物和最终 Evidence；
+- 管理者可以暂停、改派、缩减范围或终止整个 Flow。
+
+每个 Gate 可以配置为人工必审、策略自动通过、超时升级或多人会签，但所有决定都进入 Flow Ledger。
+
+## 全流程可见
+
+企业需要全流程可观测，但“可观测”不等于所有人默认读取所有秘密。MambaFlow 区分两层记录：
+
+### Flow Ledger
+
+组织级事件源，记录需求、负责人、匹配理由、审批、状态、工期变化、风险、成本、Evidence 和交付物。
+管理者在授权范围内可以查看完整流程，并从任意事件还原 Flow 状态。
+
+### Agent Black Box
+
+Flight 级详细记录，包括模型请求、Tool Call、命令输出、工作区变更、Token、费用、航点和坠机原因。
+原始内容可能包含源码、员工私人上下文或 Secret，因此按 RBAC/ABAC、数据分级和脱敏策略开放。
+任何人查看受限黑匣子本身也必须留下审计记录。
+
+## Agent Execution Plane
+
+当 Task 被分配给 Agent 时，执行层沿用 crash-first Flight 模型：
+
+```text
+GROUNDED
+    │ WorkRequest accepted + FlightManifest filed
+    ▼
+PREFLIGHT ──check failed────────────▶ CRASHED
+    │ passed
+    ▼
+READY ──takeoff─────────────────────▶ AIRBORNE
+                                        │
+                     ┌──────────────────┼──────────────────┐
+                     ▼                  ▼                  ▼
+                  LANDED             CRASHED            ABORTED
+```
+
+每个 Flight 拥有独立上下文、Tool 权限、Cabin、Fuel、Landing Contract 和 Black Box。坠机后，
+Tower 可以从 Waypoint 复飞、换 Agent、改派给 Human、缩小任务或将阻塞升级给管理者。
+
+## Capability Packs
+
+MambaFlow Core 不把某个工作领域写死。企业通过能力包让 Human 和 Agent 参与不同类型的 Flow。
+
+### Coding
+
+- Git 仓库、Issue、PR 和 Code Review；
+- 隔离 worktree / container；
+- 代码搜索、编辑、测试、构建和 CI；
+- 架构规范、代码所有权和发布流程；
+- 代码 Artifact、Diff 和测试 Evidence。
+
+### Office
+
+- 文档生成、修改、评论和审批；
+- 表格读取、公式、分析与可视化；
+- 演示文稿生成与品牌模板；
+- 邮件、日历、会议纪要和待办；
+- Microsoft 365、Google Workspace、飞书等连接器。
+
+### Research and Operations
+
+- Web 搜索、内部知识库和带引用报告；
+- 工单、CRM、客服和运营流程；
+- 数据查询、Dashboard 和定期汇报；
+- 企业自定义 MCP、Tool、Skill 和 Validator。
+
+能力包声明 Capability、权限、输入输出 Schema、成本模型和验收方式，Matcher 才能把任务合理派给
+对应的团队、员工或 Agent。
+
+## `mamba` CLI 设想
+
+以下命令用于表达产品方向，**目前均不可用**：
+
+```bash
+# 初始化一个本地组织
+mamba org init
+
+# 查看团队、员工、Agent 和能力
+mamba org chart
+
+# 管理者提出需求
+mamba demand create "这周完成一个 LLM Gateway"
+
+# 查看生成的 PRD、任务 DAG、匹配和工期
+mamba flow show F-24
+
+# 批准 Flow 计划
+mamba approve F-24 --stage planning
+
+# 员工查看自己的 Human / Agent Inbox
+mamba inbox
+
+# 接受或协商任务
+mamba task accept T-04
+mamba task negotiate T-04 --estimate 12h
+
+# 实时追踪整个 Flow
+mamba flow watch F-24
+
+# 查看组织级事件
+mamba timeline F-24
+
+# 查看一次 Agent 坠机的黑匣子
+mamba blackbox H-24
+```
+
+未来的 Web Console 会提供组织图、需求 Inbox、Flow DAG、甘特图、Todo、审批队列、Agent Fleet、
+成本和审计视图。CLI、Web、IM 和 API 必须消费同一套 Flow 协议。
+
+## v0 最小纵切面
+
+v0 先验证组织 Flow，不直接做完整 Coding Agent 或 Office Agent：
+
+- 单租户组织、团队、用户、Agent 和 Capability 注册；
+- 管理者提交 Demand；
+- 通用模型生成 PRD 和任务 DAG；
+- Matcher 根据手工录入的技能、归属、负载和可用性提出分配方案；
+- Scheduler 给出 P50/P80 工期、置信度和关键路径；
+- 管理者批准计划后生成 Assignment 和 WorkRequest；
+- Human / Agent Inbox 支持接受、拒绝、协商和补充信息；
+- Todo 状态、Heartbeat、阻塞、Evidence 和升级；
+- 追加式 Flow Ledger 和基础权限审计；
+- `mamba` CLI 展示、审批和追踪完整 Flow。
+
+v0 的 Agent 执行可以只接一个通用模型适配器和演示 Tool。Coding、Office、动态子机、Web Console、
+SSO/SCIM、远程 Worker 和生产级沙箱在核心 Flow 验证后逐步加入。
+
+## 为什么选择 Rust
+
+MambaFlow 计划优先使用 Rust 实现 Control Plane、Execution Runtime 和 CLI：
+
+- 枚举和类型系统适合表达严格的 Flow、Task、Approval 和 Flight 状态；
+- 所有权模型有助于限制跨用户和跨 Agent 的共享可变状态；
+- 异步 Runtime 适合消息、模型流、长任务、取消、Heartbeat 和 Lease；
+- 单二进制便于部署 CLI、Worker 和边缘执行节点；
+- 对进程、资源上限、隔离和审计边界有直接控制。
+
+具体库、Actor Runtime、数据库和消息系统尚未确定。Tokio、Clap、Ratatui、SQLite、PostgreSQL、
+NATS 等都只是候选，应通过 RFC 和原型验证，而不是在 README 阶段锁死。
+
+## 与 DeerFlow 的关系
+
+[DeerFlow](https://github.com/bytedance/deer-flow) 的定位是开源 long-horizon super agent harness：
+围绕一个 lead agent 编排 sub-agents、memory、sandbox、skills 和 tools，完成研究、编码和内容生成等
+长任务。
+
+MambaFlow 受到它的启发，但关注不同层级的问题：
+
+| | DeerFlow | MambaFlow |
+| --- | --- | --- |
+| 中心对象 | Thread / Lead Agent | Organization / FlowRun |
+| 执行拓扑 | Lead Agent 拉起内部 Sub-agents | 多 Human、Team、Personal Agent 和 Org Agent 协作 |
+| 委派 | Agent 内部任务调用 | 带组织权限链的跨身份 WorkRequest |
+| 人类参与 | 对话、澄清和目标控制 | 审批、接单、协商、执行、Review、验收和升级 |
+| 时间尺度 | 一次长任务 | 跨用户、跨系统、持续数天或更久的企业流程 |
+| 可见性 | 会话与 Agent 执行 | Flow Ledger + 权限受控的 Black Box |
+
+MambaFlow 不是 DeerFlow 的 fork。DeerFlow 可以成为某种 Agent Execution Backend，而 MambaFlow
+负责组织级需求、人员、权限、调度、追踪和审计。
+
+## 路线图
+
+- [x] 确立 Human-Agent Flow 产品定位
+- [x] 提出组织 Control Plane 与 Agent Execution Plane 分层
+- [ ] RFC-0001：Tenant、Org、Principal 与 Authority 模型
+- [ ] RFC-0002：FlowRun、Task DAG 与事件协议
+- [ ] RFC-0003：WorkRequest、Inbox、Handoff 与 Approval Gate
+- [ ] RFC-0004：Capability Matching 与可解释工期估算
+- [ ] RFC-0005：Todo Tracker、Heartbeat、Evidence 与 Escalation
+- [ ] RFC-0006：Flow Ledger、Black Box、可见性与审计
+- [ ] Rust workspace、测试基线和贡献规范
+- [ ] `mamba` CLI v0 最小纵切面
+- [ ] Personal Agent 与 Agent Flight Runtime
+- [ ] Coding Capability Pack
+- [ ] Office Capability Pack
+- [ ] Web Console 与企业连接器
+- [ ] 多租户、SSO/SCIM、策略引擎和生产级隔离
+
+## 设计原则
+
+- **Flow over chat**：企业工作不能只存在于一个人的聊天记录里。
+- **Human and Agent are principals**：两者都有身份、权限、任务、Inbox 和责任边界。
+- **Authority before autonomy**：先验证授权链，再允许 Agent 行动。
+- **Evidence over self-report**：Todo 完成依赖 Evidence 和 Validator，不依赖一句“已经做完”。
+- **Explainable assignment**：匹配和估时必须展示依据、范围、置信度和备选方案。
+- **Human right to negotiate**：员工可以拒绝、协商、补充或升级系统分配。
+- **One person, one city**：个人 Agent 的上下文和凭据属于本人授权域。
+- **Crash first**：Agent 一定会失败，恢复和改派必须是正常路径。
+- **Boring core, expressive UX**：核心协议稳定严肃，牢大梗留在产品显示层。
+
+## 非目标
+
+- 不做工资、考勤、招聘、绩效打分等传统 HRIS 功能；
+- 不允许管理者绕过授权直接读取员工私人 Agent 上下文；
+- 不把 Agent 推荐或工期估算作为自动惩罚员工的依据；
+- 不允许 Agent 自行扩大权限、预算、截止时间或数据范围；
+- 不用模糊的“完成百分比”代替验收条件和 Evidence；
+- 不追求第一版复制 DeerFlow、Jira、Claude Code 或 Office 套件的全部能力；
+- 不为了玩梗牺牲 API、权限、安全、审计和错误分类的准确性。
+
+## 参与建设
+
+当前最需要的是产品建模、协议设计和小型原型，而不是堆功能。欢迎通过 Issue 或 RFC 参与：
+
+- 企业组织图与跨用户授权模型；
+- Flow DAG、事件信封和持久化状态机；
+- Personal Agent 的所有权与代理边界；
+- 能力匹配、产能建模和工期校准；
+- Todo Tracker、Evidence 和自动升级；
+- Coding / Office Capability Pack；
+- 企业数据隔离、Secret、审计和合规；
+- Rust Actor、消息系统和取消语义；
+- 中文梗文化与英文公共 API 如何长期共存。
+
+正式接受大规模代码贡献前，项目还需要确定开源许可证、贡献者协议、行为准则和安全披露流程。
+
+欢迎大家多多参与本项目建设，争取都能拿到诸如字节 SSSP 或大模型四小龙 Agent 算法 & Infra
+的工作机会。
+
+## 声明
+
+本项目名称与术语来自中文互联网文化表达，与 Kobe Bryant、其家属、NBA 及相关球队无关，
+也不代表对任何现实事故或逝者的不尊重。
