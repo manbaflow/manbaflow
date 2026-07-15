@@ -10,9 +10,9 @@ Todo、阻塞、证据与交付结果，直到通过验收。
 关系进行统一编排**。人和 Agent 都是组织成员，都有身份、能力、权限、收件箱、任务和审计记录。
 
 > [!IMPORTANT]
-> MambaFlow 目前处于 **v0 / Preflight**。仓库已经包含可运行的 `mamba` CLI、SQLite Flow Ledger、
-> 本地规划器和 Claude Code / Codex 执行终端适配器，但还没有生产级身份系统、远程 Worker、沙箱或
-> Web Console。请先在测试仓库和非敏感数据上使用。
+> MambaFlow 目前处于 **v0 / Preflight**。仓库已经包含可运行的 Ratatui 塔台、`mamba` 自动化命令、
+> SQLite Flow Ledger、本地规划器和 Claude Code / Codex 执行终端适配器，但还没有生产级身份系统、
+> 远程 Worker、沙箱或 Web Console。请先在测试仓库和非敏感数据上使用。
 
 ## 一句话定位
 
@@ -474,6 +474,37 @@ Claude Code / Codex 副驾；它只写入 `.mambaflow/`，不会启动模型：
 
 ```bash
 ./target/release/mamba demo --workspace .
+./target/release/mamba
+```
+
+不带子命令时，`mamba` 默认进入全屏 Ratatui 塔台。也可以显式指定当前 Human 和工作区：
+
+```bash
+./target/release/mamba tui --as 牢大 --workspace .
+```
+
+塔台提供五个实时视图：组织总览、Flow/PRD/任务 DAG、个人 Inbox、团队阵容和 append-only 时间线。
+写操作直接调用同一套领域 API，不会在界面里维护另一份状态：
+
+| 按键 | 操作 |
+| --- | --- |
+| `1`–`5` / `Tab` | 切换总览、Flow、Inbox、阵容和时间线 |
+| `j` / `k` | 移动当前列表选择 |
+| `h` / `l` | 在 Flow Selector 和任务列表之间切换 |
+| `u` | 在已注册 Human 之间切换球权 |
+| `n` | 输入管理需求并生成 PRD、任务 DAG、匹配和工期 |
+| `a` | 批准 Flow 或接受 Assignment |
+| `s` | 根据当前状态接单、开工或提交验收 |
+| `e` / `b` / `c` | 添加 Evidence、报告阻塞、Human 最终验收 |
+| `r` | 从 Flow Ledger 重建界面状态 |
+| `?` / `q` | 打开帮助、退出塔台 |
+
+建议截图时将终端设为至少 120×36、字体 15–16px，进入总览或 Flow 页后隐藏其他窗口。macOS 可以按
+`Command + Shift + 4`，再按空格选择终端窗口。
+
+原来的命令行接口仍然保留，用于脚本、CI 和排障。例如：
+
+```bash
 ./target/release/mamba org chart
 
 ./target/release/mamba demand create \
@@ -576,6 +607,7 @@ Claude Code 使用[非交互 JSON 输出](https://code.claude.com/docs/en/headle
 - Flow 审批后生成 WorkRequest，Human / Agent Inbox 支持接受、拒绝和协商；
 - Task 的依赖门禁、Heartbeat、阻塞、Evidence、提交和 Human 最终验收；
 - SQLite append-only Flow Ledger，CLI 每次启动都从同一事件流重建状态；
+- Ratatui 塔台总览、Flow 工作台、个人 Inbox、阵容和黑匣子时间线；
 - Claude Code / Codex 只读规划与显式执行适配器，以及每次执行的 Black Box。
 
 目前没有自动改派、超时升级、工作日历、租户级 RBAC、动态恢复树、远程 Worker、生产级沙箱、
@@ -592,8 +624,8 @@ MambaFlow 使用 Rust 实现 Control Plane、Execution Runtime 和 CLI：
 - 单二进制便于部署 CLI、Worker 和边缘执行节点；
 - 对进程、资源上限、隔离和审计边界有直接控制。
 
-v0 使用 Tokio、Clap、Serde、Schemars 和 SQLite。后续是否引入 Actor Runtime、PostgreSQL、NATS、
-Ratatui 或其他基础设施，将由实际的远程执行与多租户需求决定。
+v0 使用 Tokio、Clap、Ratatui、Crossterm、Serde、Schemars 和 SQLite。后续是否引入 Actor Runtime、
+PostgreSQL、NATS 或其他基础设施，将由实际的远程执行与多租户需求决定。
 
 ## 与 DeerFlow 的关系
 
@@ -622,6 +654,7 @@ MambaFlow 不是 DeerFlow 的 fork。DeerFlow 可以成为某种 Agent Execution
 - [x] Rust workspace、测试基线和 `mamba` CLI v0
 - [x] SQLite Flow Ledger、事件回放、能力匹配与基础排期
 - [x] Claude Code / Codex 执行终端
+- [x] Ratatui 组织塔台与 Human Inbox
 - [ ] RFC-0001：Tenant、Org、Principal 与 Authority 模型
 - [ ] RFC-0002：FlowRun、Task DAG 与事件协议
 - [ ] RFC-0003：WorkRequest、Inbox、Handoff 与 Approval Gate

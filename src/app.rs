@@ -45,6 +45,11 @@ impl MambaApp {
         &self.data_dir
     }
 
+    pub fn reload(&mut self) -> Result<()> {
+        self.state = OrganizationState::replay(&self.store.load_all()?)?;
+        Ok(())
+    }
+
     pub fn init_organization(&mut self, name: &str, actor: &str) -> Result<Organization> {
         if self.state.organization.is_some() {
             return Err(MambaError::OrganizationAlreadyInitialized);

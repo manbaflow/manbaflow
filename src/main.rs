@@ -21,11 +21,18 @@ struct Cli {
     json: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// 打开全屏组织塔台
+    Tui {
+        #[arg(long = "as")]
+        actor: Option<String>,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
     /// 初始化和查看组织塔台
     Org {
         #[command(subcommand)]
@@ -301,7 +308,21 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     let mut app = MambaApp::open(&cli.data_dir)?;
-    match cli.command {
+    let command = cli.command.unwrap_or_else(|| Command::Tui {
+        actor: None,
+        workspace: PathBuf::from("."),
+    });
+    match command {
+        Command::Tui { actor, workspace } => {
+            manbaflow::tui::run(
+                &mut app,
+                manbaflow::tui::TuiOptions {
+                    workspace: absolute_path(workspace)?,
+                    actor,
+                },
+            )
+            .await?;
+        }
         Command::Org { command } => match command {
             OrgCommand::Init { name, by } => {
                 let org = app.init_organization(&name, &by)?;

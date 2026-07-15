@@ -9,6 +9,7 @@ pub mod planner;
 pub mod scheduler;
 pub mod state;
 pub mod store;
+pub mod tui;
 
 pub use app::MambaApp;
 pub use error::{MambaError, Result};
