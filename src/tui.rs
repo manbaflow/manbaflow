@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -12,11 +13,12 @@ use ratatui::widgets::{
     Row, Table, TableState, Tabs, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
+use tokio::sync::mpsc;
 
 use crate::MambaApp;
-use crate::domain::{Flow, FlowStatus, PrincipalKind, Task, TaskStatus};
+use crate::domain::{ExecutorMode, Flow, FlowStatus, PrincipalKind, Task, TaskStatus};
 use crate::error::{MambaError, Result};
-use crate::event::EventEnvelope;
+use crate::event::{DomainEvent, EventEnvelope};
 use crate::planner::PlannerKind;
 
 const BG: Color = Color::Rgb(13, 14, 16);
@@ -51,6 +53,7 @@ async fn run_loop(
 ) -> Result<()> {
     let mut state = UiState::new(app, options);
     loop {
+        state.poll_flights(app);
         terminal.draw(|frame| render(frame, app, &mut state))?;
         if event::poll(Duration::from_millis(180))? {
             match event::read()? {
@@ -104,12 +107,35 @@ enum InputPurpose {
     Demand,
     Evidence { task_id: String },
     Block { task_id: String },
+    Run { task_id: String, mode: ExecutorMode },
 }
 
 #[derive(Clone, Debug)]
 struct InputModal {
     purpose: InputPurpose,
     value: String,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveFlight {
+    flow_id: String,
+    task_id: String,
+    actor: String,
+    mode: ExecutorMode,
+    started_at: chrono::DateTime<Local>,
+}
+
+#[derive(Debug)]
+struct FlightResult {
+    task_id: String,
+    outcome: std::result::Result<LandedFlight, String>,
+}
+
+#[derive(Debug)]
+struct LandedFlight {
+    executor: String,
+    summary: String,
+    log_path: PathBuf,
 }
 
 struct UiState {
@@ -127,10 +153,15 @@ struct UiState {
     show_help: bool,
     message: String,
     message_is_error: bool,
+    active_flights: BTreeMap<String, ActiveFlight>,
+    flight_tx: mpsc::UnboundedSender<FlightResult>,
+    flight_rx: mpsc::UnboundedReceiver<FlightResult>,
+    last_flight_reload: Instant,
 }
 
 impl UiState {
     fn new(app: &MambaApp, options: TuiOptions) -> Self {
+        let (flight_tx, flight_rx) = mpsc::unbounded_channel();
         let humans = human_ids(app);
         let actor_id = options
             .actor
@@ -154,6 +185,10 @@ impl UiState {
             show_help: false,
             message: "塔台在线。按 ? 查看完整操作。".to_string(),
             message_is_error: false,
+            active_flights: BTreeMap::new(),
+            flight_tx,
+            flight_rx,
+            last_flight_reload: Instant::now(),
         };
         state.refresh_timeline(app);
         state
@@ -173,11 +208,11 @@ impl UiState {
             return self.handle_modal_key(app, key).await;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Ok(true);
+            return Ok(self.request_quit());
         }
 
         match key.code {
-            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('q') => return Ok(self.request_quit()),
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('1') => self.switch_view(app, View::Overview),
             KeyCode::Char('2') => self.switch_view(app, View::Flows),
@@ -228,6 +263,8 @@ impl UiState {
             KeyCode::Char('c') => self.complete_task(app),
             KeyCode::Char('e') => self.open_task_input(app, true),
             KeyCode::Char('b') => self.open_task_input(app, false),
+            KeyCode::Char('p') => self.open_run_confirmation(app, ExecutorMode::Plan),
+            KeyCode::Char('x') => self.open_run_confirmation(app, ExecutorMode::Execute),
             _ => {}
         }
         Ok(false)
@@ -268,6 +305,18 @@ impl UiState {
             return;
         };
 
+        if let InputPurpose::Run { task_id, mode } = &modal.purpose {
+            let expected = confirmation_token(mode);
+            if value != expected {
+                self.failure(MambaError::Validation(format!(
+                    "确认失败：请输入 {expected}"
+                )));
+                return;
+            }
+            self.launch_flight(app, task_id.clone(), actor, mode.clone());
+            return;
+        }
+
         let result = match modal.purpose {
             InputPurpose::Demand => app
                 .create_demand(value, &actor, PlannerKind::Local, &self.workspace, 300)
@@ -285,6 +334,7 @@ impl UiState {
             InputPurpose::Block { task_id } => app
                 .block_task(&task_id, &actor, value)
                 .map(|task| format!("{} 已阻塞，塔台收到求助", task.id)),
+            InputPurpose::Run { .. } => unreachable!(),
         };
         match result {
             Ok(message) => {
@@ -434,6 +484,39 @@ impl UiState {
             self.failure(MambaError::Validation("没有选中的任务".to_string()));
             return;
         };
+        if !matches!(
+            task.status,
+            TaskStatus::Accepted | TaskStatus::InProgress | TaskStatus::Blocked
+        ) {
+            self.failure(MambaError::Validation(format!(
+                "任务 {} 必须先接单，当前状态为 {:?}",
+                task.id, task.status
+            )));
+            return;
+        }
+        let Some((flow, _)) = self.selected_task_context(app) else {
+            return;
+        };
+        let incomplete = task
+            .depends_on
+            .iter()
+            .filter_map(|id| flow.task(id))
+            .filter(|dependency| dependency.status != TaskStatus::Completed)
+            .map(|dependency| dependency.key.as_str())
+            .collect::<Vec<_>>();
+        if !incomplete.is_empty() {
+            self.failure(MambaError::Validation(format!(
+                "仍在等待前置任务：{}",
+                incomplete.join(", ")
+            )));
+            return;
+        }
+        if !task_has_executor(app, task) {
+            self.failure(MambaError::Validation(
+                "当前 Assignment 没有 Claude Code 或 Codex 副驾".to_string(),
+            ));
+            return;
+        }
         self.modal = Some(InputModal {
             purpose: if evidence {
                 InputPurpose::Evidence {
@@ -446,6 +529,121 @@ impl UiState {
             },
             value: String::new(),
         });
+    }
+
+    fn open_run_confirmation(&mut self, app: &MambaApp, mode: ExecutorMode) {
+        if !self.active_flights.is_empty() {
+            self.failure(MambaError::Validation(
+                "当前已有航班在空中；v0 空域一次只允许一个执行终端".to_string(),
+            ));
+            return;
+        }
+        let Some((_, task)) = self.selected_task_context(app) else {
+            self.failure(MambaError::Validation("没有选中的任务".to_string()));
+            return;
+        };
+        self.modal = Some(InputModal {
+            purpose: InputPurpose::Run {
+                task_id: task.id.clone(),
+                mode,
+            },
+            value: String::new(),
+        });
+    }
+
+    fn launch_flight(
+        &mut self,
+        app: &MambaApp,
+        task_id: String,
+        actor: String,
+        mode: ExecutorMode,
+    ) {
+        let Some((flow, _)) = app.state().find_task(&task_id).ok() else {
+            self.failure(MambaError::NotFound {
+                entity: "task",
+                id: task_id,
+            });
+            return;
+        };
+        let flight = ActiveFlight {
+            flow_id: flow.id.clone(),
+            task_id: task_id.clone(),
+            actor: actor.clone(),
+            mode: mode.clone(),
+            started_at: Local::now(),
+        };
+        self.active_flights.insert(task_id.clone(), flight);
+        self.last_flight_reload = Instant::now();
+        self.success(format!(
+            "{} 航班已离场，mode={}",
+            task_id,
+            executor_mode_label(&mode)
+        ));
+
+        let data_dir = app.data_dir().to_path_buf();
+        let tx = self.flight_tx.clone();
+        tokio::spawn(async move {
+            let outcome = async {
+                let mut worker = MambaApp::open(data_dir).map_err(|error| error.to_string())?;
+                worker
+                    .run_task(&task_id, &actor, None, mode, 900)
+                    .await
+                    .map(|record| LandedFlight {
+                        executor: record.executor.to_string(),
+                        summary: record.summary,
+                        log_path: record.log_path,
+                    })
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            let _ = tx.send(FlightResult { task_id, outcome });
+        });
+    }
+
+    fn poll_flights(&mut self, app: &mut MambaApp) {
+        let mut changed = false;
+        while let Ok(result) = self.flight_rx.try_recv() {
+            self.active_flights.remove(&result.task_id);
+            match result.outcome {
+                Ok(flight) => self.success(format!(
+                    "{} 安全落地 · {} · {} · {}",
+                    result.task_id,
+                    flight.executor,
+                    compact_summary(&flight.summary, 48),
+                    flight.log_path.display()
+                )),
+                Err(error) => self.failure(MambaError::Validation(format!(
+                    "{} 坠机：{}",
+                    result.task_id, error
+                ))),
+            }
+            changed = true;
+        }
+
+        let should_reload = changed
+            || (!self.active_flights.is_empty()
+                && self.last_flight_reload.elapsed() >= Duration::from_millis(650));
+        if should_reload {
+            match app.reload() {
+                Ok(()) => {
+                    self.clamp_selection(app);
+                    self.refresh_timeline(app);
+                    self.last_flight_reload = Instant::now();
+                }
+                Err(error) => self.failure(error),
+            }
+        }
+    }
+
+    fn request_quit(&mut self) -> bool {
+        if self.active_flights.is_empty() {
+            true
+        } else {
+            self.failure(MambaError::Validation(
+                "仍有航班在空中；请等待安全落地或坠机记录写入黑匣子".to_string(),
+            ));
+            false
+        }
     }
 
     fn finish_action<T>(&mut self, app: &MambaApp, result: Result<T>)
@@ -540,7 +738,7 @@ fn render(frame: &mut Frame, app: &MambaApp, state: &mut UiState) {
         View::Flows => render_flows(frame, app, state, content),
         View::Inbox => render_inbox(frame, app, state, content),
         View::Roster => render_roster(frame, app, state, content),
-        View::Timeline => render_timeline(frame, state, content),
+        View::Timeline => render_timeline(frame, app, state, content),
     }
     render_status(frame, state, status);
     render_shortcuts(frame, state, help);
@@ -585,6 +783,17 @@ fn render_header(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect)
             Span::styled(organization, Style::new().fg(TEXT).bold()),
             Span::styled("  /  球权 ", Style::new().fg(MUTED)),
             Span::styled(actor, Style::new().fg(CYAN).bold()),
+            Span::styled("  /  航班 ", Style::new().fg(MUTED)),
+            Span::styled(
+                state.active_flights.len().to_string(),
+                Style::new()
+                    .fg(if state.active_flights.is_empty() {
+                        GREEN
+                    } else {
+                        ORANGE
+                    })
+                    .bold(),
+            ),
         ]))
         .block(
             Block::default()
@@ -1150,7 +1359,20 @@ fn render_roster(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
     frame.render_stateful_widget(table, principals, &mut table_state);
 }
 
-fn render_timeline(frame: &mut Frame, state: &mut UiState, area: Rect) {
+fn render_timeline(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+    let (ledger_area, flights_area) = if area.width >= 96 {
+        let [ledger, flights] =
+            Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
+                .spacing(1)
+                .areas(area);
+        (ledger, flights)
+    } else {
+        let [ledger, flights] =
+            Layout::vertical([Constraint::Percentage(67), Constraint::Percentage(33)])
+                .spacing(1)
+                .areas(area);
+        (ledger, flights)
+    };
     let items = state
         .timeline
         .iter()
@@ -1179,7 +1401,97 @@ fn render_timeline(frame: &mut Frame, state: &mut UiState, area: Rect) {
         .repeat_highlight_symbol(true);
     let mut list_state = ListState::default();
     list_state.select((!state.timeline.is_empty()).then_some(state.timeline_index));
-    frame.render_stateful_widget(list, area, &mut list_state);
+    frame.render_stateful_widget(list, ledger_area, &mut list_state);
+    render_flights(frame, app, state, flights_area);
+}
+
+fn render_flights(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect) {
+    let selected_flow = state.selected_flow(app).map(|flow| flow.id.as_str());
+    let mut items = state
+        .active_flights
+        .values()
+        .filter(|flight| selected_flow.is_none_or(|flow_id| flight.flow_id == flow_id))
+        .map(|flight| {
+            ListItem::new(Text::from(vec![
+                Line::from(vec![
+                    Span::styled("● AIRBORNE ", Style::new().fg(ORANGE).bold()),
+                    Span::styled(executor_mode_label(&flight.mode), Style::new().fg(CYAN)),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("  {}  ", flight.task_id), Style::new().fg(TEXT)),
+                    Span::styled(flight.actor.clone(), Style::new().fg(MUTED)),
+                ]),
+                Line::styled(
+                    format!("  takeoff {}", flight.started_at.format("%H:%M:%S")),
+                    Style::new().fg(MUTED),
+                ),
+            ]))
+        })
+        .collect::<Vec<_>>();
+
+    let mut records = app
+        .state()
+        .executions
+        .values()
+        .filter(|record| selected_flow.is_none_or(|flow_id| record.flow_id == flow_id))
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| Reverse(record.finished_at));
+    items.extend(records.into_iter().take(5).map(|record| {
+        let cost = record
+            .cost_usd
+            .map(|value| format!(" · ${value:.3}"))
+            .unwrap_or_default();
+        ListItem::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled("✓ LANDED ", Style::new().fg(GREEN).bold()),
+                Span::styled(record.executor.to_string(), Style::new().fg(CYAN)),
+                Span::styled(cost, Style::new().fg(MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("  {}  ", record.task_id), Style::new().fg(TEXT)),
+                Span::styled(executor_mode_label(&record.mode), Style::new().fg(PURPLE)),
+            ]),
+            Line::styled(
+                format!("  {}", record.log_path.display()),
+                Style::new().fg(MUTED),
+            ),
+        ]))
+    }));
+
+    items.extend(
+        state
+            .timeline
+            .iter()
+            .rev()
+            .filter_map(|event| match &event.event {
+                DomainEvent::ExecutorFailed {
+                    task_id, reason, ..
+                } => Some(ListItem::new(Text::from(vec![
+                    Line::styled("✕ CRASHED", Style::new().fg(RED).bold()),
+                    Line::styled(format!("  {task_id}"), Style::new().fg(TEXT)),
+                    Line::styled(
+                        format!("  {}", compact_summary(reason, 34)),
+                        Style::new().fg(RED),
+                    ),
+                ]))),
+                _ => None,
+            })
+            .take(3),
+    );
+
+    if items.is_empty() {
+        items.push(ListItem::new(Text::from(vec![
+            Line::styled("机队待命", Style::new().fg(MUTED)),
+            Line::styled("选中任务后按 p 规划", Style::new().fg(TEXT)),
+            Line::styled("或按 x 请求执行", Style::new().fg(TEXT)),
+        ])));
+    }
+    frame.render_widget(
+        List::new(items)
+            .block(panel_block("FLIGHT DECK / 航班", false))
+            .highlight_spacing(HighlightSpacing::Always),
+        area,
+    );
 }
 
 fn render_status(frame: &mut Frame, state: &UiState, area: Rect) {
@@ -1207,8 +1519,8 @@ fn render_status(frame: &mut Frame, state: &UiState, area: Rect) {
 fn render_shortcuts(frame: &mut Frame, state: &UiState, area: Rect) {
     let context = match state.view {
         View::Overview => "n 新需求  a 批准",
-        View::Flows => "h/l 切面板  a 批准/接单  s 推进",
-        View::Inbox => "a 接单  s 开工/提交  e 证据  b 阻塞  c 验收",
+        View::Flows => "h/l 切面板  a 接单  s 推进  p 规划  x 执行",
+        View::Inbox => "a 接单  s 推进  p 规划  x 执行  e 证据  c 验收",
         View::Roster => "u 切换球权",
         View::Timeline => "h/l 切 Flow  j/k 浏览事件",
     };
@@ -1228,6 +1540,19 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal) {
         InputPurpose::Demand => ("NEW DEMAND / 管理需求", "描述本周需要完成的目标", GOLD),
         InputPurpose::Evidence { .. } => ("EVIDENCE / 交付证据", "输入证据摘要", GREEN),
         InputPurpose::Block { .. } => ("BLOCK / 请求协防", "输入阻塞原因", RED),
+        InputPurpose::Run { mode, .. } => (
+            "FLIGHT CLEARANCE / 航班放行",
+            match mode {
+                ExecutorMode::Plan => "只读规划会调用已分配终端并产生模型费用；输入 PASS 放行",
+                ExecutorMode::Execute => {
+                    "执行模式允许终端修改注册工作区；确认仓库状态后输入 MAMBA 放行"
+                }
+            },
+            match mode {
+                ExecutorMode::Plan => CYAN,
+                ExecutorMode::Execute => ORANGE,
+            },
+        ),
     };
     let [hint, input, footer] = Layout::vertical([
         Constraint::Length(2),
@@ -1266,7 +1591,7 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal) {
 }
 
 fn render_help_modal(frame: &mut Frame) {
-    let area = centered(frame.area(), 78, 22);
+    let area = centered(frame.area(), 78, 25);
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::styled("塔台操作手册", Style::new().fg(GOLD).bold()),
@@ -1281,6 +1606,8 @@ fn render_help_modal(frame: &mut Frame) {
         help_line("s", "按状态接单、开工或提交验收"),
         help_line("e", "为当前任务补充 Evidence"),
         help_line("b", "报告阻塞，等待塔台协防"),
+        help_line("p", "确认后调用已分配终端进行只读规划"),
+        help_line("x", "Human 确认后授予终端 workspace-write"),
         help_line("c", "由当前 Human 完成最终验收"),
         help_line("r", "从 append-only Flow Ledger 重建状态"),
         help_line("q / Ctrl-C", "安全退出塔台"),
@@ -1356,6 +1683,49 @@ fn human_ids(app: &MambaApp) -> Vec<String> {
         .collect::<Vec<_>>();
     humans.sort_by(|left, right| left.name.cmp(&right.name));
     humans.into_iter().map(|human| human.id.clone()).collect()
+}
+
+fn task_has_executor(app: &MambaApp, task: &Task) -> bool {
+    let Some(assignment) = &task.assignment else {
+        return false;
+    };
+    app.state().principals.values().any(|principal| {
+        principal.executor.is_some()
+            && (principal.id == assignment.owner.id
+                || assignment
+                    .copilots
+                    .iter()
+                    .any(|copilot| copilot.id == principal.id)
+                || principal.owner_id.as_deref() == Some(assignment.owner.id.as_str()))
+    })
+}
+
+fn confirmation_token(mode: &ExecutorMode) -> &'static str {
+    match mode {
+        ExecutorMode::Plan => "PASS",
+        ExecutorMode::Execute => "MAMBA",
+    }
+}
+
+fn executor_mode_label(mode: &ExecutorMode) -> &'static str {
+    match mode {
+        ExecutorMode::Plan => "PLAN",
+        ExecutorMode::Execute => "EXECUTE",
+    }
+}
+
+fn compact_summary(value: &str, max_chars: usize) -> String {
+    let mut summary = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect::<String>();
+    if value.chars().count() > max_chars {
+        summary.push('…');
+    }
+    summary
 }
 
 fn shifted(current: usize, len: usize, delta: isize) -> usize {
@@ -1435,12 +1805,17 @@ fn event_style(kind: &str) -> Style {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::domain::PrincipalKind;
+    use crate::domain::{ExecutorConfig, ExecutorKind, PrincipalKind};
 
     #[tokio::test]
     async fn overview_renders_organization_and_flow() {
@@ -1495,6 +1870,155 @@ mod tests {
         assert!(content.contains("Mamba Labs"));
         assert!(content.contains("Prepare launch brief"));
         assert!(content.contains("TOWER BRIEF"));
+
+        state.view = View::Timeline;
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("FLOW LEDGER"));
+        assert!(content.contains("FLIGHT DECK"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_plan_runs_in_background_and_returns_to_ledger() {
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("fake-codex");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+result=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    result="$1"
+  fi
+  shift
+done
+printf '%s' 'terminal plan complete' > "$result"
+printf '%s\n' '{"thread_id":"fake-thread"}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Mamba Labs", "admin").unwrap();
+        let team = app
+            .create_team("Platform", "product,delivery", "admin")
+            .unwrap();
+        let human = app
+            .register_principal(
+                "牢大",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let agent = app
+            .register_principal(
+                "Codex 副驾",
+                PrincipalKind::Agent,
+                Some(&team.id),
+                Some(&human.id),
+                "delivery",
+                100,
+                Some(ExecutorConfig {
+                    kind: ExecutorKind::Codex,
+                    workspace: directory.path().to_path_buf(),
+                    model: None,
+                    command: Some(executable),
+                }),
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare launch brief",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let first_task = flow.tasks[0].id.clone();
+        let agent_task = flow
+            .tasks
+            .iter()
+            .find(|task| {
+                task.assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.owner.id == agent.id)
+            })
+            .unwrap()
+            .id
+            .clone();
+        app.approve_flow(&flow.id, &human.name).unwrap();
+        app.accept_task(&first_task, &human.name).unwrap();
+        app.start_task(&first_task, &human.name).unwrap();
+        app.add_evidence(
+            &first_task,
+            &human.name,
+            "document",
+            "docs/scope.md",
+            "scope approved",
+        )
+        .unwrap();
+        app.submit_task(&first_task, &human.name).unwrap();
+        app.complete_task(&first_task, &human.name).unwrap();
+        app.accept_task(&agent_task, &human.name).unwrap();
+
+        let mut state = UiState::new(
+            &app,
+            TuiOptions {
+                workspace: directory.path().to_path_buf(),
+                actor: Some(human.name.clone()),
+            },
+        );
+        state.view = View::Flows;
+        state.focus_tasks = true;
+        state.task_index = app
+            .state()
+            .flow(&flow.id)
+            .unwrap()
+            .tasks
+            .iter()
+            .position(|task| task.id == agent_task)
+            .unwrap();
+        state.open_run_confirmation(&app, ExecutorMode::Plan);
+        state.modal.as_mut().unwrap().value = "PASS".to_string();
+        state.submit_modal(&mut app).await;
+        assert_eq!(state.active_flights.len(), 1);
+
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            state.poll_flights(&mut app);
+            if state.active_flights.is_empty() {
+                break;
+            }
+        }
+
+        assert!(state.active_flights.is_empty());
+        assert_eq!(app.state().executions.len(), 1);
+        assert!(state.message.contains("安全落地"));
+        assert_eq!(
+            app.state().find_task(&agent_task).unwrap().1.evidence.len(),
+            1
+        );
     }
 
     #[test]

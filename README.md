@@ -495,6 +495,7 @@ Claude Code / Codex 副驾；它只写入 `.mambaflow/`，不会启动模型：
 | `n` | 输入管理需求并生成 PRD、任务 DAG、匹配和工期 |
 | `a` | 批准 Flow 或接受 Assignment |
 | `s` | 根据当前状态接单、开工或提交验收 |
+| `p` / `x` | 调用已分配终端进行只读规划 / Human 授权执行 |
 | `e` / `b` / `c` | 添加 Evidence、报告阻塞、Human 最终验收 |
 | `r` | 从 Flow Ledger 重建界面状态 |
 | `?` / `q` | 打开帮助、退出塔台 |
@@ -575,6 +576,11 @@ v0 不自己实现另一套 Coding Agent 循环，而是把已经安装并登录
 ./target/release/mamba task run TSK-xxxxxxxx --by "工程师 A" --mode execute
 ```
 
+在 Ratatui 中，进入 Flow 或 Inbox 选中已经接单且依赖完成的任务，按 `p` 发起只读规划，输入
+`PASS` 确认模型调用；按 `x` 请求执行，检查工作区后输入 `MAMBA` 才会授予写权限。航班在后台运行，
+界面仍可浏览其他 Flow；Flight Deck 会显示 `AIRBORNE`、`LANDED` 或 `CRASHED`、模型费用和黑匣子
+路径。没有资源租约系统前，单个塔台同时只放行一个执行终端，航班结束前也不会静默退出。
+
 当前适配器的权限映射如下：
 
 | MambaFlow 模式 | Claude Code | Codex |
@@ -608,6 +614,7 @@ Claude Code 使用[非交互 JSON 输出](https://code.claude.com/docs/en/headle
 - Task 的依赖门禁、Heartbeat、阻塞、Evidence、提交和 Human 最终验收；
 - SQLite append-only Flow Ledger，CLI 每次启动都从同一事件流重建状态；
 - Ratatui 塔台总览、Flow 工作台、个人 Inbox、阵容和黑匣子时间线；
+- TUI 后台 Flight、`PASS` / `MAMBA` 放行确认、实时状态回放与 Flight Deck；
 - Claude Code / Codex 只读规划与显式执行适配器，以及每次执行的 Black Box。
 
 目前没有自动改派、超时升级、工作日历、租户级 RBAC、动态恢复树、远程 Worker、生产级沙箱、
