@@ -1,0 +1,30 @@
+[package]
+name = "manbaflow"
+version = "0.1.0"
+edition = "2024"
+description = "Enterprise Human-Agent Flow control plane"
+license = "MIT"
+repository = "https://github.com/manbaflow/manbaflow"
+readme = "README.md"
+
+[[bin]]
+name = "mamba"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
