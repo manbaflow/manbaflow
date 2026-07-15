@@ -604,7 +604,8 @@ MambaFlow 不是 DeerFlow 的 fork。DeerFlow 可以成为某种 Agent Execution
 - Rust Actor、消息系统和取消语义；
 - 中文产品语言与英文公共 API 如何长期共存。
 
-正式接受大规模代码贡献前，项目还需要确定开源许可证、贡献者协议、行为准则和安全披露流程。
+项目采用 [MIT License](./LICENSE)。正式接受大规模代码贡献前，还需要补充贡献指南、行为准则和
+安全披露流程。
 
 欢迎大家多多参与本项目建设，争取都能拿到诸如字节 SSSP 或大模型四小龙 Agent 算法 & Infra
 的工作机会。
