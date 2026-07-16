@@ -86,6 +86,7 @@ struct InboxItem {
     flow_id: String,
     flow_title: String,
     task: Task,
+    blocked_by: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -206,10 +207,20 @@ async fn inbox(
     let items = app
         .inbox(&principal.id)?
         .into_iter()
-        .map(|(flow, task)| InboxItem {
-            flow_id: flow.id.clone(),
-            flow_title: flow.prd.title.clone(),
-            task: task.clone(),
+        .map(|(flow, task)| {
+            let blocked_by = task
+                .depends_on
+                .iter()
+                .filter_map(|id| flow.task(id))
+                .filter(|dependency| dependency.status != crate::domain::TaskStatus::Completed)
+                .map(|dependency| dependency.id.clone())
+                .collect();
+            InboxItem {
+                flow_id: flow.id.clone(),
+                flow_title: flow.prd.title.clone(),
+                task: task.clone(),
+                blocked_by,
+            }
         })
         .collect();
     Ok(Json(items))

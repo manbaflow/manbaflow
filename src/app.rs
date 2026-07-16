@@ -152,11 +152,6 @@ impl MambaApp {
                 "a human cannot have an owner or terminal executor".into(),
             ));
         }
-        if kind == PrincipalKind::Agent && executor.is_none() {
-            return Err(MambaError::Validation(
-                "an agent requires a Claude Code or Codex executor".into(),
-            ));
-        }
         let team_id = team
             .map(|value| self.state.team(value).map(|team| team.id.clone()))
             .transpose()?;
@@ -1483,6 +1478,40 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn remote_agent_does_not_require_a_server_local_executor() {
+        let directory = tempdir().unwrap();
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app.create_team("Platform", "backend", "admin").unwrap();
+        let human = app
+            .register_principal(
+                "Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "backend",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let agent = app
+            .register_principal(
+                "Engineer Personal Agent",
+                PrincipalKind::Agent,
+                Some(&team.id),
+                Some(&human.id),
+                "backend",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        assert!(agent.executor.is_none());
+        assert_eq!(agent.owner_id.as_deref(), Some(human.id.as_str()));
+    }
 
     #[test]
     fn api_credentials_authenticate_replay_and_revoke() {

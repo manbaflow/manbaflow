@@ -13,6 +13,7 @@ pub mod state;
 pub mod store;
 mod tracker;
 pub mod tui;
+pub mod worker;
 
 pub use app::MambaApp;
 pub use error::{MambaError, Result};

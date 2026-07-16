@@ -1845,7 +1845,10 @@ fn render_roster(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
                 .executor
                 .as_ref()
                 .map(|executor| executor.kind.to_string())
-                .unwrap_or_else(|| "human".to_string());
+                .unwrap_or_else(|| match principal.kind {
+                    PrincipalKind::Human => "human".to_string(),
+                    PrincipalKind::Agent => "remote-worker".to_string(),
+                });
             Row::new(vec![
                 Cell::from(principal.name.clone()).style(Style::new().fg(TEXT).bold()),
                 Cell::from(match principal.kind {

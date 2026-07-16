@@ -8,6 +8,7 @@ use manbaflow::domain::{
 };
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
+use manbaflow::worker::{RemoteWorker, WorkerOptions, WorkerOutcome, WorkerOutcomeStatus};
 use manbaflow::{MambaApp, Result};
 use serde::Serialize;
 use serde_json::json;
@@ -59,7 +60,7 @@ enum Command {
         #[command(subcommand)]
         command: TeamCommand,
     },
-    /// 注册 Human 和 Agent 执行终端
+    /// 注册 Human、本地 Agent 和远程 Personal Agent
     Principal {
         #[command(subcommand)]
         command: PrincipalCommand,
@@ -93,6 +94,11 @@ enum Command {
     Gitlab {
         #[command(subcommand)]
         command: GitLabCommand,
+    },
+    /// 在同事工作站运行只读 Personal Agent 航班
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
     },
     /// 从 Flow Ledger 查看完整事件时间线
     Timeline { flow: String },
@@ -199,6 +205,39 @@ enum GitLabCommand {
         #[arg(long)]
         url: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum WorkerCommand {
+    /// 领取并规划一个远程任务后退出
+    Once(WorkerArgs),
+    /// 持续轮询远程 Inbox，串行执行只读规划航班
+    Run {
+        #[command(flatten)]
+        worker: WorkerArgs,
+        #[arg(long, default_value_t = 30)]
+        poll_seconds: u64,
+    },
+}
+
+#[derive(Args)]
+struct WorkerArgs {
+    /// Control Plane 根地址；也可使用 MAMBA_SERVER
+    #[arg(long)]
+    server: Option<String>,
+    #[arg(long, value_enum)]
+    executor: ExecutorKindArg,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    executable: Option<PathBuf>,
+    /// 只处理指定 Task；默认选择第一个尚未规划的任务
+    #[arg(long)]
+    task: Option<String>,
+    #[arg(long, default_value_t = 900)]
+    timeout: u64,
 }
 
 #[derive(Args)]
@@ -548,7 +587,10 @@ async fn run(cli: Cli) -> Result<()> {
                                 .executor
                                 .as_ref()
                                 .map(|executor| executor.kind.to_string())
-                                .unwrap_or_else(|| "human".into())
+                                .unwrap_or_else(|| match principal.kind {
+                                    PrincipalKind::Human => "human".into(),
+                                    PrincipalKind::Agent => "remote-worker".into(),
+                                })
                         )
                     })
                     .collect::<Vec<_>>()
@@ -864,6 +906,32 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
         },
+        Command::Worker { command } => match command {
+            WorkerCommand::Once(args) => {
+                let worker = remote_worker(args, app.data_dir())?;
+                let outcome = worker.run_once().await?;
+                output(&outcome, cli.json, worker_outcome_text(&outcome));
+            }
+            WorkerCommand::Run {
+                worker: args,
+                poll_seconds,
+            } => {
+                if poll_seconds == 0 {
+                    return Err(manbaflow::MambaError::Validation(
+                        "worker poll interval must be greater than zero".into(),
+                    ));
+                }
+                let worker = remote_worker(args, app.data_dir())?;
+                loop {
+                    let outcome = worker.run_once().await?;
+                    output(&outcome, cli.json, worker_outcome_text(&outcome));
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(poll_seconds)) => {}
+                    }
+                }
+            }
+        },
         Command::Timeline { flow } => {
             let events = app.timeline(&flow)?;
             let text = events
@@ -1078,6 +1146,56 @@ fn task_details(task: &Task) -> String {
         }));
     }
     lines.join("\n")
+}
+
+fn remote_worker(args: WorkerArgs, data_dir: &Path) -> Result<RemoteWorker> {
+    let token = std::env::var("MAMBA_TOKEN").map_err(|_| {
+        manbaflow::MambaError::Validation("MAMBA_TOKEN is required for a remote worker".into())
+    })?;
+    let server_url = args
+        .server
+        .or_else(|| std::env::var("MAMBA_SERVER").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:7777".into());
+    RemoteWorker::new(WorkerOptions {
+        server_url,
+        token,
+        executor: args.executor.into(),
+        workspace: absolute_path(args.workspace)?,
+        model: args.model,
+        command: args.executable,
+        task_id: args.task,
+        timeout_seconds: args.timeout,
+        data_dir: data_dir.to_path_buf(),
+    })
+}
+
+fn worker_outcome_text(outcome: &WorkerOutcome) -> String {
+    let task = outcome.task_id.as_deref().unwrap_or("-");
+    match outcome.status {
+        WorkerOutcomeStatus::Idle => format!("塔台静默：{}", outcome.summary),
+        WorkerOutcomeStatus::Planned => format!(
+            "{} 只读航班安全落地 · {}\n{}\n黑匣子：{}",
+            outcome.principal,
+            task,
+            outcome.summary,
+            outcome
+                .log_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".into())
+        ),
+        WorkerOutcomeStatus::Crashed => format!(
+            "{} 规划航班坠机 · {}\n{}\n黑匣子：{}",
+            outcome.principal,
+            task,
+            outcome.summary,
+            outcome
+                .log_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".into())
+        ),
+    }
 }
 
 fn tracking_attention_line(attention: &TrackingAttention) -> String {
