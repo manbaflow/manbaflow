@@ -21,7 +21,10 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
 use crate::MambaApp;
-use crate::domain::{ExecutorMode, Flow, FlowStatus, PrincipalKind, Task, TaskStatus};
+use crate::domain::{
+    AttentionSeverity, ExecutorMode, Flow, FlowStatus, PrincipalKind, Task, TaskStatus,
+    TrackingEscalation,
+};
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 use crate::planner::PlannerKind;
@@ -148,6 +151,7 @@ enum MouseAction {
     Block,
     Complete,
     ScanTracker,
+    AcknowledgeEscalation,
     CycleActor,
     Help,
     Quit,
@@ -364,6 +368,7 @@ impl UiState {
             KeyCode::Char('p') => self.open_run_confirmation(app, ExecutorMode::Plan),
             KeyCode::Char('x') => self.open_run_confirmation(app, ExecutorMode::Execute),
             KeyCode::Char('t') => self.scan_tracker(app, true),
+            KeyCode::Char('g') => self.acknowledge_next_escalation(app),
             _ => {}
         }
         Ok(false)
@@ -459,6 +464,7 @@ impl UiState {
             MouseAction::Block => self.open_task_input(app, false),
             MouseAction::Complete => self.complete_task(app),
             MouseAction::ScanTracker => self.scan_tracker(app, true),
+            MouseAction::AcknowledgeEscalation => self.acknowledge_next_escalation(app),
             MouseAction::CycleActor => self.cycle_actor(app),
             MouseAction::Help => self.show_help = true,
             MouseAction::Quit => return Ok(self.request_quit()),
@@ -802,18 +808,55 @@ impl UiState {
     fn scan_tracker(&mut self, app: &mut MambaApp, announce: bool) {
         self.last_tracking_scan = Some(Instant::now());
         match app.scan_tracking(24, "tower://local") {
-            Ok(scan) if !scan.raised.is_empty() => self.success(format!(
-                "Tower Tracker 新增 {} 项 Attention，当前共 {} 项",
-                scan.raised.len(),
-                scan.active.len()
-            )),
-            Ok(scan) if announce || !scan.resolved.is_empty() => self.success(format!(
-                "Tower Tracker 已扫描 {} 个 Todo：解除 {}，活动 {}",
-                scan.scanned_tasks,
-                scan.resolved.len(),
-                scan.active.len()
-            )),
-            Ok(_) => {}
+            Ok(scan) => {
+                if !scan.raised.is_empty()
+                    || !scan.resolved.is_empty()
+                    || !scan.escalated.is_empty()
+                    || !scan.resolved_escalations.is_empty()
+                {
+                    self.refresh_timeline(app);
+                }
+                if !scan.raised.is_empty() || !scan.escalated.is_empty() {
+                    self.success(format!(
+                        "Tower Tracker 新增 {} 项 Attention、{} 个 Tower Call，当前活动 {} 项",
+                        scan.raised.len(),
+                        scan.escalated.len(),
+                        scan.active.len()
+                    ));
+                } else if announce || !scan.resolved.is_empty() {
+                    self.success(format!(
+                        "Tower Tracker 已扫描 {} 个 Todo：解除 {}，活动 {}",
+                        scan.scanned_tasks,
+                        scan.resolved.len(),
+                        scan.active.len()
+                    ));
+                }
+            }
+            Err(error) => self.failure(error),
+        }
+    }
+
+    fn acknowledge_next_escalation(&mut self, app: &mut MambaApp) {
+        let Some(actor) = self.actor_name(app).map(str::to_string) else {
+            self.failure(MambaError::Validation("没有可用的 Human 操作人".into()));
+            return;
+        };
+        let escalation_id = self
+            .actor_escalations(app)
+            .into_iter()
+            .find(|escalation| escalation.needs_acknowledgement())
+            .map(|escalation| escalation.id.clone());
+        let Some(escalation_id) = escalation_id else {
+            self.failure(MambaError::Validation(
+                "当前没有等待确认的 Tower Call".into(),
+            ));
+            return;
+        };
+        match app.acknowledge_escalation(&escalation_id, &actor) {
+            Ok(escalation) => {
+                self.refresh_timeline(app);
+                self.success(format!("{} 已收到呼叫 {}", actor, escalation.id));
+            }
             Err(error) => self.failure(error),
         }
     }
@@ -1009,6 +1052,24 @@ impl UiState {
         self.actor_name(app)
             .and_then(|actor| app.inbox(actor).ok())
             .unwrap_or_default()
+    }
+
+    fn actor_escalations<'a>(&self, app: &'a MambaApp) -> Vec<&'a TrackingEscalation> {
+        let Some(actor_id) = &self.actor_id else {
+            return Vec::new();
+        };
+        let mut escalations = app
+            .state()
+            .active_escalations()
+            .filter(|escalation| escalation.recipient_id == *actor_id)
+            .collect::<Vec<_>>();
+        escalations.sort_by(|left, right| {
+            right
+                .needs_acknowledgement()
+                .cmp(&left.needs_acknowledgement())
+                .then_with(|| right.raised_at.cmp(&left.raised_at))
+        });
+        escalations
     }
 
     fn selected_task_context<'a>(&self, app: &'a MambaApp) -> Option<(&'a Flow, &'a Task)> {
@@ -1533,10 +1594,26 @@ fn render_tasks(frame: &mut Frame, state: &mut UiState, app: &MambaApp, area: Re
 }
 
 fn render_inbox(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
-    let [table_area, detail_area] =
-        Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)])
-            .spacing(1)
-            .areas(area);
+    let escalations = state.actor_escalations(app);
+    let (calls_area, table_area, detail_area) = if escalations.is_empty() {
+        let [table, detail] =
+            Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)])
+                .spacing(1)
+                .areas(area);
+        (None, table, detail)
+    } else {
+        let [calls, table, detail] = Layout::vertical([
+            Constraint::Length(6),
+            Constraint::Percentage(48),
+            Constraint::Min(7),
+        ])
+        .spacing(1)
+        .areas(area);
+        (Some(calls), table, detail)
+    };
+    if let Some(calls_area) = calls_area {
+        render_escalations(frame, app, &escalations, calls_area);
+    }
     let items = state.inbox_items(app);
     let rows = items
         .iter()
@@ -1582,6 +1659,49 @@ fn render_inbox(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Re
         frame,
         items.get(state.inbox_index).map(|(_, task)| *task),
         detail_area,
+    );
+}
+
+fn render_escalations(
+    frame: &mut Frame,
+    app: &MambaApp,
+    escalations: &[&TrackingEscalation],
+    area: Rect,
+) {
+    let items = escalations
+        .iter()
+        .take(area.height.saturating_sub(2) as usize)
+        .map(|escalation| {
+            let severity = app
+                .state()
+                .attentions
+                .get(&escalation.attention_id)
+                .map(|attention| attention.severity)
+                .unwrap_or(AttentionSeverity::Warning);
+            let (status, color) = if escalation.needs_acknowledgement() {
+                match severity {
+                    AttentionSeverity::Critical => ("! CRITICAL", RED),
+                    AttentionSeverity::Warning => ("! WARNING", ORANGE),
+                }
+            } else {
+                ("✓ RECEIVED", GREEN)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{status:<12}"), Style::new().fg(color).bold()),
+                Span::styled(format!("{}  ", escalation.task_id), Style::new().fg(MUTED)),
+                Span::styled(
+                    compact_summary(&escalation.reason, 52),
+                    Style::new().fg(TEXT),
+                ),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(panel_block(
+            &format!("TOWER CALLS / {} · g 收到", escalations.len()),
+            false,
+        )),
+        area,
     );
 }
 
@@ -1957,6 +2077,7 @@ fn render_shortcuts(frame: &mut Frame, state: &mut UiState, area: Rect) {
         ],
         View::Inbox => &[
             ("接单", MouseAction::ApproveOrAccept),
+            ("收到", MouseAction::AcknowledgeEscalation),
             ("推进", MouseAction::Advance),
             ("规划", MouseAction::Plan),
             ("执行", MouseAction::Execute),
@@ -2121,7 +2242,7 @@ fn render_planner_selector(frame: &mut Frame, area: Rect, state: &mut UiState) {
 }
 
 fn render_help_modal(frame: &mut Frame) {
-    let area = centered(frame.area(), 78, 27);
+    let area = centered(frame.area(), 78, 29);
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::styled("塔台操作手册", Style::new().fg(GOLD).bold()),
@@ -2135,6 +2256,7 @@ fn render_help_modal(frame: &mut Frame) {
         help_line("u", "切换当前 Human 操作人"),
         help_line("n", "提出新需求，选择 Local / Claude Code / Codex 规划"),
         help_line("t", "立即巡航扫描 Todo 风险；后台每 30 秒自动扫描"),
+        help_line("g", "确认当前 Inbox 中首个未确认 Tower Call"),
         help_line("a", "批准 Flow，或接受当前 Assignment"),
         help_line("s", "按状态接单、开工或提交验收"),
         help_line("e", "为当前任务补充 Evidence"),
@@ -2269,6 +2391,7 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::Evidence | MouseAction::Complete => GREEN,
         MouseAction::Block | MouseAction::Quit => RED,
         MouseAction::ScanTracker => ORANGE,
+        MouseAction::AcknowledgeEscalation => GOLD,
         MouseAction::CycleActor | MouseAction::Help => PURPLE,
         MouseAction::ConfirmModal => GREEN,
         MouseAction::CancelModal => MUTED,
@@ -2614,6 +2737,85 @@ mod tests {
             .await
             .unwrap();
         assert!(state.modal.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbox_renders_and_acknowledges_tower_calls() {
+        let directory = tempdir().unwrap();
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Mamba Labs", "admin").unwrap();
+        let team = app
+            .create_team("Product", "product,delivery", "admin")
+            .unwrap();
+        let human = app
+            .register_principal(
+                "牢大",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare launch brief",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let task_id = flow.tasks[0].id.clone();
+        app.approve_flow(&flow.id, &human.name).unwrap();
+        app.accept_task(&task_id, &human.name).unwrap();
+        app.start_task(&task_id, &human.name).unwrap();
+        app.block_task(&task_id, &human.name, "waiting for access")
+            .unwrap();
+        let scan = app.scan_tracking(24, "tower").unwrap();
+        assert_eq!(scan.escalated.len(), 1);
+
+        let mut state = UiState::new(
+            &app,
+            TuiOptions {
+                workspace: directory.path().to_path_buf(),
+                actor: Some(human.name.clone()),
+            },
+        );
+        state.view = View::Inbox;
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("TOWER CALLS"));
+        assert!(content.contains("CRITICAL"));
+        assert!(content.contains("waiting for access"));
+
+        state.acknowledge_next_escalation(&mut app);
+        assert!(state.message.contains("已收到呼叫"));
+        assert!(!state.actor_escalations(&app)[0].needs_acknowledgement());
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("RECEIVED"));
     }
 
     #[cfg(unix)]

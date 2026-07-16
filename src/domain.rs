@@ -286,12 +286,39 @@ impl TrackingAttention {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackingEscalation {
+    pub id: String,
+    pub attention_id: String,
+    pub flow_id: String,
+    pub task_id: String,
+    pub recipient_id: String,
+    pub recipient_name: String,
+    pub reason: String,
+    pub raised_at: DateTime<Utc>,
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    pub acknowledged_by: Option<String>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+impl TrackingEscalation {
+    pub fn is_active(&self) -> bool {
+        self.resolved_at.is_none()
+    }
+
+    pub fn needs_acknowledgement(&self) -> bool {
+        self.is_active() && self.acknowledged_at.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrackingScan {
     pub scanned_at: DateTime<Utc>,
     pub scanned_tasks: usize,
     pub raised: Vec<TrackingAttention>,
     pub resolved: Vec<TrackingAttention>,
     pub active: Vec<TrackingAttention>,
+    pub escalated: Vec<TrackingEscalation>,
+    pub resolved_escalations: Vec<TrackingEscalation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

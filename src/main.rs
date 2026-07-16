@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use manbaflow::domain::{
     ExecutorConfig, ExecutorKind, ExecutorMode, Flow, PrincipalKind, Task, TrackingAttention,
+    TrackingEscalation,
 };
 use manbaflow::planner::PlannerKind;
 use manbaflow::{MambaApp, Result};
@@ -286,6 +287,8 @@ enum TrackCommand {
     Scan {
         #[arg(long, default_value_t = 24)]
         stale_hours: u64,
+        #[arg(long, default_value_t = 4)]
+        escalate_after_hours: u64,
         #[arg(long, default_value = "tower://local")]
         by: String,
     },
@@ -295,6 +298,19 @@ enum TrackCommand {
         flow: Option<String>,
         #[arg(long)]
         all: bool,
+    },
+    /// 查看指定 Human 收到的活动升级呼叫
+    Inbox {
+        #[arg(long = "for")]
+        target: String,
+        #[arg(long)]
+        all: bool,
+    },
+    /// 由接收人确认已经接手处理
+    Ack {
+        escalation: String,
+        #[arg(long)]
+        by: String,
     },
 }
 
@@ -591,14 +607,19 @@ async fn run(cli: Cli) -> Result<()> {
             output(&value, cli.json, text);
         }
         Command::Track { command } => match command {
-            TrackCommand::Scan { stale_hours, by } => {
-                let scan = app.scan_tracking(stale_hours, &by)?;
+            TrackCommand::Scan {
+                stale_hours,
+                escalate_after_hours,
+                by,
+            } => {
+                let scan = app.scan_tracking_with_policy(stale_hours, escalate_after_hours, &by)?;
                 let text = format!(
-                    "塔台扫描 {} 个 Todo：新增 {}，解除 {}，活动 {}\n{}",
+                    "塔台扫描 {} 个 Todo：新增 {}，解除 {}，活动 {}，升级 {}\n{}",
                     scan.scanned_tasks,
                     scan.raised.len(),
                     scan.resolved.len(),
                     scan.active.len(),
+                    scan.escalated.len(),
                     scan.active
                         .iter()
                         .map(tracking_attention_line)
@@ -634,6 +655,23 @@ async fn run(cli: Cli) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join("\n");
                 output(&attentions, cli.json, text);
+            }
+            TrackCommand::Inbox { target, all } => {
+                let escalations = app.escalation_inbox(&target, all)?;
+                let text = escalations
+                    .iter()
+                    .map(|escalation| tracking_escalation_line(escalation))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                output(&escalations, cli.json, text);
+            }
+            TrackCommand::Ack { escalation, by } => {
+                let escalation = app.acknowledge_escalation(&escalation, &by)?;
+                output(
+                    &escalation,
+                    cli.json,
+                    format!("{} 已收到呼叫 {}", by, escalation.id),
+                );
             }
         },
         Command::Timeline { flow } => {
@@ -843,6 +881,25 @@ fn tracking_attention_line(attention: &TrackingAttention) -> String {
         attention.flow_id,
         attention.task_id,
         attention.summary
+    )
+}
+
+fn tracking_escalation_line(escalation: &TrackingEscalation) -> String {
+    let status = if !escalation.is_active() {
+        "resolved"
+    } else if escalation.needs_acknowledgement() {
+        "waiting_ack"
+    } else {
+        "acknowledged"
+    };
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        escalation.id,
+        status,
+        escalation.recipient_name,
+        escalation.flow_id,
+        escalation.task_id,
+        escalation.reason
     )
 }
 

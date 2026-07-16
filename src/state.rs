@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::domain::{
-    ExecutionRecord, Flow, FlowStatus, Organization, Principal, TaskStatus, Team, TrackingAttention,
+    ExecutionRecord, Flow, FlowStatus, Organization, Principal, TaskStatus, Team,
+    TrackingAttention, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -14,6 +15,7 @@ pub struct OrganizationState {
     pub flows: BTreeMap<String, Flow>,
     pub executions: BTreeMap<String, ExecutionRecord>,
     pub attentions: BTreeMap<String, TrackingAttention>,
+    pub escalations: BTreeMap<String, TrackingEscalation>,
     pub last_sequence: i64,
 }
 
@@ -192,6 +194,46 @@ impl OrganizationState {
                 }
                 attention.resolved_at = Some(*resolved_at);
             }
+            DomainEvent::TrackingEscalationRaised { escalation } => {
+                let attention = self
+                    .attentions
+                    .get(&escalation.attention_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "tracking attention",
+                        id: escalation.attention_id.clone(),
+                    })?;
+                if attention.flow_id != escalation.flow_id
+                    || attention.task_id != escalation.task_id
+                {
+                    return Err(MambaError::Validation(format!(
+                        "tracking escalation {} does not match its attention",
+                        escalation.id
+                    )));
+                }
+                self.escalations
+                    .insert(escalation.id.clone(), escalation.clone());
+            }
+            DomainEvent::TrackingEscalationAcknowledged {
+                flow_id,
+                task_id,
+                escalation_id,
+                acknowledged_by,
+                acknowledged_at,
+            } => {
+                let escalation = self.escalation_mut(escalation_id, flow_id, task_id)?;
+                escalation.acknowledged_at = Some(*acknowledged_at);
+                escalation.acknowledged_by = Some(acknowledged_by.clone());
+            }
+            DomainEvent::TrackingEscalationResolved {
+                flow_id,
+                task_id,
+                escalation_id,
+                resolved_at,
+                ..
+            } => {
+                self.escalation_mut(escalation_id, flow_id, task_id)?
+                    .resolved_at = Some(*resolved_at);
+            }
             DomainEvent::ExecutorStarted { .. } | DomainEvent::ExecutorFailed { .. } => {}
             DomainEvent::ExecutorFinished { record } => {
                 self.executions.insert(record.id.clone(), record.clone());
@@ -269,6 +311,34 @@ impl OrganizationState {
         self.attentions
             .values()
             .filter(|attention| attention.is_active())
+    }
+
+    pub fn active_escalations(&self) -> impl Iterator<Item = &TrackingEscalation> {
+        self.escalations
+            .values()
+            .filter(|escalation| escalation.is_active())
+    }
+
+    fn escalation_mut(
+        &mut self,
+        escalation_id: &str,
+        flow_id: &str,
+        task_id: &str,
+    ) -> Result<&mut TrackingEscalation> {
+        let escalation =
+            self.escalations
+                .get_mut(escalation_id)
+                .ok_or_else(|| MambaError::NotFound {
+                    entity: "tracking escalation",
+                    id: escalation_id.to_string(),
+                })?;
+        if escalation.flow_id != flow_id || escalation.task_id != task_id {
+            return Err(MambaError::Validation(format!(
+                "tracking escalation {} event does not match its source",
+                escalation_id
+            )));
+        }
+        Ok(escalation)
     }
 
     fn task_mut(&mut self, flow_id: &str, task_id: &str) -> Result<&mut crate::domain::Task> {

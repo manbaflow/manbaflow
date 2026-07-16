@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::domain::{
-    Demand, Evidence, ExecutionRecord, ExecutorConfig, ExecutorMode, Flow, FlowStatus,
-    Organization, Principal, PrincipalKind, TargetKind, Task, TaskStatus, Team, TrackingAttention,
-    TrackingScan,
+    AttentionSeverity, Demand, Evidence, ExecutionRecord, ExecutorConfig, ExecutorMode, Flow,
+    FlowStatus, Organization, Principal, PrincipalKind, TargetKind, Task, TaskStatus, Team,
+    TrackingAttention, TrackingEscalation, TrackingScan,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -207,6 +207,13 @@ impl MambaApp {
                 "register at least one human or agent before creating a demand".into(),
             ));
         }
+        let requester = self.state.principal(requester)?;
+        if requester.kind != PrincipalKind::Human {
+            return Err(MambaError::Validation(
+                "a demand requester must be a registered human".into(),
+            ));
+        }
+        let requester = requester.name.clone();
         if !workspace.is_dir() {
             return Err(MambaError::InvalidWorkspace(workspace.to_path_buf()));
         }
@@ -238,7 +245,7 @@ impl MambaApp {
         let demand = Demand {
             id: demand_id,
             flow_id: flow_id.clone(),
-            requester: requester.to_string(),
+            requester: requester.clone(),
             summary: summary.trim().to_string(),
             created_at: now,
         };
@@ -257,7 +264,7 @@ impl MambaApp {
             completed_at: None,
         };
         self.commit(
-            requester,
+            &requester,
             vec![
                 DomainEvent::DemandCreated { demand },
                 DomainEvent::PlanGenerated { flow: flow.clone() },
@@ -333,13 +340,38 @@ impl MambaApp {
     }
 
     pub fn scan_tracking(&mut self, stale_after_hours: u64, actor: &str) -> Result<TrackingScan> {
-        self.scan_tracking_at(Utc::now(), stale_after_hours, actor)
+        self.scan_tracking_with_policy(stale_after_hours, 4, actor)
     }
 
+    pub fn scan_tracking_with_policy(
+        &mut self,
+        stale_after_hours: u64,
+        escalate_after_hours: u64,
+        actor: &str,
+    ) -> Result<TrackingScan> {
+        self.scan_tracking_with_policy_at(
+            Utc::now(),
+            stale_after_hours,
+            escalate_after_hours,
+            actor,
+        )
+    }
+
+    #[cfg(test)]
     fn scan_tracking_at(
         &mut self,
         now: DateTime<Utc>,
         stale_after_hours: u64,
+        actor: &str,
+    ) -> Result<TrackingScan> {
+        self.scan_tracking_with_policy_at(now, stale_after_hours, 4, actor)
+    }
+
+    fn scan_tracking_with_policy_at(
+        &mut self,
+        now: DateTime<Utc>,
+        stale_after_hours: u64,
+        escalate_after_hours: u64,
         actor: &str,
     ) -> Result<TrackingScan> {
         self.state.organization()?;
@@ -352,6 +384,10 @@ impl MambaApp {
             .ok()
             .and_then(Duration::try_hours)
             .ok_or_else(|| MambaError::Validation("stale-after hours is too large".into()))?;
+        let escalate_after = i64::try_from(escalate_after_hours)
+            .ok()
+            .and_then(Duration::try_hours)
+            .ok_or_else(|| MambaError::Validation("escalate-after hours is too large".into()))?;
         let findings = tracker::evaluate(&self.state, now, stale_after);
         let desired = findings
             .into_iter()
@@ -398,30 +434,104 @@ impl MambaApp {
         }
 
         let mut raised_ids = Vec::new();
-        for (key, finding) in desired {
-            if !current.contains_key(&key) {
+        let mut projected_attentions = Vec::new();
+        for (key, finding) in &desired {
+            if let Some(attention_id) = current.get(key) {
+                projected_attentions.push(
+                    self.state
+                        .attentions
+                        .get(attention_id)
+                        .ok_or_else(|| MambaError::NotFound {
+                            entity: "tracking attention",
+                            id: attention_id.clone(),
+                        })?
+                        .clone(),
+                );
+            } else {
                 let attention = TrackingAttention {
                     id: new_id("ATTN"),
-                    flow_id: finding.flow_id,
-                    task_id: finding.task_id,
+                    flow_id: finding.flow_id.clone(),
+                    task_id: finding.task_id.clone(),
                     kind: finding.kind,
                     severity: finding.severity,
-                    summary: finding.summary,
+                    summary: finding.summary.clone(),
                     raised_at: now,
                     resolved_at: None,
                 };
                 raised_ids.push(attention.id.clone());
+                projected_attentions.push(attention.clone());
                 events.push(DomainEvent::TrackingAttentionRaised { attention });
             }
+        }
+
+        let current_escalations = self
+            .state
+            .active_escalations()
+            .map(|escalation| (escalation.attention_id.clone(), escalation.id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let projected_ids = projected_attentions
+            .iter()
+            .map(|attention| attention.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut resolved_escalation_ids = Vec::new();
+        for (attention_id, escalation_id) in &current_escalations {
+            if !projected_ids.contains(attention_id.as_str()) {
+                let escalation = self.state.escalations.get(escalation_id).ok_or_else(|| {
+                    MambaError::NotFound {
+                        entity: "tracking escalation",
+                        id: escalation_id.clone(),
+                    }
+                })?;
+                resolved_escalation_ids.push(escalation_id.clone());
+                events.push(DomainEvent::TrackingEscalationResolved {
+                    flow_id: escalation.flow_id.clone(),
+                    task_id: escalation.task_id.clone(),
+                    escalation_id: escalation_id.clone(),
+                    resolved_at: now,
+                    reason: "source attention resolved".into(),
+                });
+            }
+        }
+
+        let mut escalated_ids = Vec::new();
+        for attention in &projected_attentions {
+            let should_escalate = attention.severity == AttentionSeverity::Critical
+                || now - attention.raised_at >= escalate_after;
+            if !should_escalate || current_escalations.contains_key(&attention.id) {
+                continue;
+            }
+            let Some(recipient) = self.escalation_recipient(attention) else {
+                continue;
+            };
+            let escalation = TrackingEscalation {
+                id: new_id("ESC"),
+                attention_id: attention.id.clone(),
+                flow_id: attention.flow_id.clone(),
+                task_id: attention.task_id.clone(),
+                recipient_id: recipient.id.clone(),
+                recipient_name: recipient.name.clone(),
+                reason: attention.summary.clone(),
+                raised_at: now,
+                acknowledged_at: None,
+                acknowledged_by: None,
+                resolved_at: None,
+            };
+            escalated_ids.push(escalation.id.clone());
+            events.push(DomainEvent::TrackingEscalationRaised { escalation });
         }
 
         if !events.is_empty() {
             self.commit(actor, events)?;
         }
 
-        let collect = |ids: &[String]| {
+        let collect_attentions = |ids: &[String]| {
             ids.iter()
                 .filter_map(|id| self.state.attentions.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        let collect_escalations = |ids: &[String]| {
+            ids.iter()
+                .filter_map(|id| self.state.escalations.get(id).cloned())
                 .collect::<Vec<_>>()
         };
         let mut active = self.state.active_attentions().cloned().collect::<Vec<_>>();
@@ -443,10 +553,102 @@ impl MambaApp {
         Ok(TrackingScan {
             scanned_at: now,
             scanned_tasks,
-            raised: collect(&raised_ids),
-            resolved: collect(&resolved_ids),
+            raised: collect_attentions(&raised_ids),
+            resolved: collect_attentions(&resolved_ids),
             active,
+            escalated: collect_escalations(&escalated_ids),
+            resolved_escalations: collect_escalations(&resolved_escalation_ids),
         })
+    }
+
+    pub fn escalation_inbox(
+        &self,
+        target: &str,
+        include_resolved: bool,
+    ) -> Result<Vec<&TrackingEscalation>> {
+        let principal = self.state.principal(target)?;
+        let mut escalations = self
+            .state
+            .escalations
+            .values()
+            .filter(|escalation| escalation.recipient_id == principal.id)
+            .filter(|escalation| include_resolved || escalation.is_active())
+            .collect::<Vec<_>>();
+        escalations.sort_by(|left, right| {
+            right
+                .needs_acknowledgement()
+                .cmp(&left.needs_acknowledgement())
+                .then_with(|| right.raised_at.cmp(&left.raised_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(escalations)
+    }
+
+    pub fn acknowledge_escalation(
+        &mut self,
+        escalation_id: &str,
+        actor: &str,
+    ) -> Result<TrackingEscalation> {
+        let principal = self.state.principal(actor)?;
+        if principal.kind != PrincipalKind::Human {
+            return Err(MambaError::Validation(
+                "tracking escalation acknowledgement requires a human".into(),
+            ));
+        }
+        let escalation = self
+            .state
+            .escalations
+            .get(escalation_id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "tracking escalation",
+                id: escalation_id.to_string(),
+            })?
+            .clone();
+        if escalation.recipient_id != principal.id {
+            return Err(MambaError::Validation(format!(
+                "{} is not the recipient of escalation {}",
+                principal.name, escalation.id
+            )));
+        }
+        if !escalation.is_active() {
+            return Err(MambaError::InvalidTransition(format!(
+                "escalation {} is already resolved",
+                escalation.id
+            )));
+        }
+        if escalation.acknowledged_at.is_some() {
+            return Err(MambaError::InvalidTransition(format!(
+                "escalation {} is already acknowledged",
+                escalation.id
+            )));
+        }
+        let actor_name = principal.name.clone();
+        self.commit(
+            &actor_name,
+            vec![DomainEvent::TrackingEscalationAcknowledged {
+                flow_id: escalation.flow_id.clone(),
+                task_id: escalation.task_id.clone(),
+                escalation_id: escalation.id.clone(),
+                acknowledged_by: actor_name.clone(),
+                acknowledged_at: Utc::now(),
+            }],
+        )?;
+        self.state
+            .escalations
+            .get(escalation_id)
+            .cloned()
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "tracking escalation",
+                id: escalation_id.to_string(),
+            })
+    }
+
+    fn escalation_recipient(&self, attention: &TrackingAttention) -> Option<&Principal> {
+        let flow = self.state.flows.get(&attention.flow_id)?;
+        self.state
+            .principal(&flow.demand.requester)
+            .ok()
+            .filter(|principal| principal.kind == PrincipalKind::Human)
     }
 
     pub fn accept_task(&mut self, task_id: &str, actor: &str) -> Result<Task> {
@@ -1015,6 +1217,17 @@ mod tests {
                 "admin",
             )
             .unwrap();
+        let error = app
+            .create_demand(
+                "Agent cannot own requester accountability",
+                &agent.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, MambaError::Validation(_)));
         let flow = app
             .create_demand(
                 "Prepare a launch brief",
@@ -1101,6 +1314,18 @@ mod tests {
             )
             .await
             .unwrap();
+        let observer = app
+            .register_principal(
+                "Observer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "operations",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
         let first_task = flow.tasks[0].id.clone();
         app.approve_flow(&flow.id, &human.name).unwrap();
         app.accept_task(&first_task, &human.name).unwrap();
@@ -1116,17 +1341,55 @@ mod tests {
             crate::domain::AttentionKind::Blocked
         );
         assert_eq!(blocked.active.len(), 1);
+        assert_eq!(blocked.escalated.len(), 1);
+        assert_eq!(blocked.escalated[0].recipient_id, human.id);
+        let escalation_id = blocked.escalated[0].id.clone();
+        let error = app
+            .acknowledge_escalation(&escalation_id, &observer.name)
+            .unwrap_err();
+        assert!(matches!(error, MambaError::Validation(_)));
+        let acknowledged = app
+            .acknowledge_escalation(&escalation_id, &human.name)
+            .unwrap();
+        assert!(acknowledged.acknowledged_at.is_some());
+        assert_eq!(app.escalation_inbox(&human.name, false).unwrap().len(), 1);
 
         let duplicate = app.scan_tracking_at(now, 24, "tower").unwrap();
         assert!(duplicate.raised.is_empty());
         assert!(duplicate.resolved.is_empty());
         assert_eq!(duplicate.active[0].id, blocked.active[0].id);
+        assert!(duplicate.escalated.is_empty());
 
         app.start_task(&first_task, &human.name).unwrap();
         let cleared = app.scan_tracking_at(Utc::now(), 24, "tower").unwrap();
         assert!(cleared.raised.is_empty());
         assert_eq!(cleared.resolved.len(), 1);
+        assert_eq!(cleared.resolved_escalations.len(), 1);
         assert!(cleared.active.is_empty());
+        assert!(app.escalation_inbox(&human.name, false).unwrap().is_empty());
+
+        let warning_time = Utc::now() + Duration::hours(2);
+        let warnings = app
+            .scan_tracking_with_policy_at(warning_time, 1, 1, "tower")
+            .unwrap();
+        assert!(!warnings.raised.is_empty());
+        assert!(
+            warnings
+                .active
+                .iter()
+                .all(|attention| attention.severity == AttentionSeverity::Warning)
+        );
+        assert!(warnings.escalated.is_empty());
+        let delayed = app
+            .scan_tracking_with_policy_at(warning_time + Duration::hours(1), 1, 1, "tower")
+            .unwrap();
+        assert_eq!(delayed.escalated.len(), warnings.active.len());
+        let warnings_cleared = app.scan_tracking_at(Utc::now(), 24, "tower").unwrap();
+        assert_eq!(
+            warnings_cleared.resolved_escalations.len(),
+            delayed.escalated.len()
+        );
+        assert!(warnings_cleared.active.is_empty());
 
         let future = flow.p80_finish + Duration::hours(48);
         let at_risk = app.scan_tracking_at(future, 24, "tower").unwrap();
@@ -1202,12 +1465,20 @@ mod tests {
 
         let replayed = MambaApp::open(&data_dir).unwrap();
         assert_eq!(replayed.state().active_attentions().count(), 0);
+        assert_eq!(replayed.state().active_escalations().count(), 0);
         assert!(
             replayed
                 .timeline(&flow.id)
                 .unwrap()
                 .iter()
                 .any(|event| event.kind == "tracking.attention_resolved")
+        );
+        assert!(
+            replayed
+                .timeline(&flow.id)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "tracking.escalation_acknowledged")
         );
     }
 }

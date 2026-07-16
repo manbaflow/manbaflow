@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     AttentionKind, Demand, Estimate, Evidence, ExecutionRecord, Flow, Organization, Principal,
-    Team, TrackingAttention,
+    Team, TrackingAttention, TrackingEscalation,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -100,6 +100,23 @@ pub enum DomainEvent {
         resolved_at: DateTime<Utc>,
         reason: String,
     },
+    TrackingEscalationRaised {
+        escalation: TrackingEscalation,
+    },
+    TrackingEscalationAcknowledged {
+        flow_id: String,
+        task_id: String,
+        escalation_id: String,
+        acknowledged_by: String,
+        acknowledged_at: DateTime<Utc>,
+    },
+    TrackingEscalationResolved {
+        flow_id: String,
+        task_id: String,
+        escalation_id: String,
+        resolved_at: DateTime<Utc>,
+        reason: String,
+    },
     ExecutorStarted {
         flow_id: String,
         task_id: String,
@@ -148,6 +165,9 @@ impl DomainEvent {
             Self::TaskCompleted { .. } => "task.completed",
             Self::TrackingAttentionRaised { .. } => "tracking.attention_raised",
             Self::TrackingAttentionResolved { .. } => "tracking.attention_resolved",
+            Self::TrackingEscalationRaised { .. } => "tracking.escalation_raised",
+            Self::TrackingEscalationAcknowledged { .. } => "tracking.escalation_acknowledged",
+            Self::TrackingEscalationResolved { .. } => "tracking.escalation_resolved",
             Self::ExecutorStarted { .. } => "executor.started",
             Self::ExecutorFinished { .. } => "executor.finished",
             Self::ExecutorFailed { .. } => "executor.failed",
@@ -171,10 +191,13 @@ impl DomainEvent {
             | Self::TaskSubmitted { flow_id, .. }
             | Self::TaskCompleted { flow_id, .. }
             | Self::TrackingAttentionResolved { flow_id, .. }
+            | Self::TrackingEscalationAcknowledged { flow_id, .. }
+            | Self::TrackingEscalationResolved { flow_id, .. }
             | Self::ExecutorStarted { flow_id, .. }
             | Self::ExecutorFailed { flow_id, .. }
             | Self::FlowCompleted { flow_id, .. } => Some(flow_id),
             Self::TrackingAttentionRaised { attention } => Some(&attention.flow_id),
+            Self::TrackingEscalationRaised { escalation } => Some(&escalation.flow_id),
             Self::ExecutorFinished { record } => Some(&record.flow_id),
             Self::OrganizationInitialized { .. }
             | Self::TeamCreated { .. }
