@@ -29,6 +29,13 @@ pub struct MambaApp {
     state: OrganizationState,
 }
 
+pub(crate) struct ExternalDeliverySync {
+    pub duplicate: bool,
+    pub stale: bool,
+    pub matched_tasks: usize,
+    pub changed_tasks: usize,
+}
+
 impl MambaApp {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
@@ -950,23 +957,14 @@ impl MambaApp {
             .collect::<BTreeMap<_, _>>();
         let mut changed = Vec::new();
         for artifact in incoming.into_values() {
-            if artifact.id.trim().is_empty()
-                || artifact.provider.trim().is_empty()
-                || artifact.kind.trim().is_empty()
-                || artifact.project.trim().is_empty()
-                || artifact.external_id.trim().is_empty()
-                || artifact.title.trim().is_empty()
-                || artifact.url.trim().is_empty()
-                || artifact.status.trim().is_empty()
-            {
-                return Err(MambaError::Validation(
-                    "external artifact fields cannot be empty".into(),
-                ));
-            }
+            validate_external_artifact(&artifact)?;
             if task
                 .external_artifacts
                 .iter()
-                .any(|existing| existing.id == artifact.id && existing.same_snapshot(&artifact))
+                .find(|existing| existing.id == artifact.id)
+                .is_some_and(|existing| {
+                    existing.same_snapshot(&artifact) || existing.synced_at > artifact.synced_at
+                })
             {
                 continue;
             }
@@ -986,6 +984,105 @@ impl MambaApp {
             .collect();
         self.commit(actor, events)?;
         Ok(changed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sync_bound_external_artifact(
+        &mut self,
+        provider: &str,
+        delivery_id: &str,
+        binding_kind: &str,
+        binding_project: &str,
+        binding_external_id: &str,
+        occurred_at: DateTime<Utc>,
+        artifact: ExternalArtifact,
+        actor: &str,
+    ) -> Result<ExternalDeliverySync> {
+        validate_external_artifact(&artifact)?;
+        let delivery_key = format!("{provider}:{delivery_id}");
+        if self.state.external_deliveries.contains_key(&delivery_key) {
+            return Ok(ExternalDeliverySync {
+                duplicate: true,
+                stale: false,
+                matched_tasks: 0,
+                changed_tasks: 0,
+            });
+        }
+        let binding_key =
+            format!("{provider}:{binding_kind}:{binding_project}:{binding_external_id}");
+        let matches = self
+            .state
+            .flows
+            .values()
+            .flat_map(|flow| {
+                flow.tasks.iter().filter_map(|task| {
+                    task.external_artifacts
+                        .iter()
+                        .find(|candidate| {
+                            candidate.provider == provider
+                                && candidate.kind == binding_kind
+                                && candidate.project == binding_project
+                                && candidate.external_id == binding_external_id
+                        })
+                        .map(|binding| (flow.id.clone(), task.id.clone(), binding.synced_at))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut stale = self
+            .state
+            .external_binding_clocks
+            .get(&binding_key)
+            .is_some_and(|current| *current > occurred_at);
+        let mut artifact_events = Vec::new();
+        if !stale {
+            for (flow_id, task_id, binding_synced_at) in &matches {
+                if *binding_synced_at > occurred_at {
+                    stale = true;
+                    continue;
+                }
+                let task = self.state.flow(flow_id)?.task(task_id).ok_or_else(|| {
+                    MambaError::NotFound {
+                        entity: "task",
+                        id: task_id.clone(),
+                    }
+                })?;
+                let mut task_artifact = artifact.clone();
+                if let Some(existing) = task
+                    .external_artifacts
+                    .iter()
+                    .find(|existing| existing.id == task_artifact.id)
+                {
+                    if task_artifact.revision.is_none() {
+                        task_artifact.revision = existing.revision.clone();
+                    }
+                    if existing.same_snapshot(&task_artifact)
+                        || existing.synced_at > task_artifact.synced_at
+                    {
+                        continue;
+                    }
+                }
+                artifact_events.push(DomainEvent::ExternalArtifactSynced {
+                    flow_id: flow_id.clone(),
+                    task_id: task_id.clone(),
+                    artifact: task_artifact,
+                });
+            }
+        }
+        let changed_tasks = artifact_events.len();
+        artifact_events.push(DomainEvent::ExternalDeliveryProcessed {
+            provider: provider.to_string(),
+            delivery_id: delivery_id.to_string(),
+            binding_key,
+            occurred_at,
+            processed_at: Utc::now(),
+        });
+        self.commit(actor, artifact_events)?;
+        Ok(ExternalDeliverySync {
+            duplicate: false,
+            stale,
+            matched_tasks: matches.len(),
+            changed_tasks,
+        })
     }
 
     pub fn authorize_task_actor(&self, task_id: &str, actor: &str) -> Result<()> {
@@ -1321,6 +1418,24 @@ fn ensure_status(task: &Task, expected: &[TaskStatus]) -> Result<()> {
     }
 }
 
+fn validate_external_artifact(artifact: &ExternalArtifact) -> Result<()> {
+    if artifact.id.trim().is_empty()
+        || artifact.provider.trim().is_empty()
+        || artifact.kind.trim().is_empty()
+        || artifact.project.trim().is_empty()
+        || artifact.external_id.trim().is_empty()
+        || artifact.title.trim().is_empty()
+        || artifact.url.trim().is_empty()
+        || artifact.status.trim().is_empty()
+    {
+        Err(MambaError::Validation(
+            "external artifact fields cannot be empty".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn hours(value: f64) -> Duration {
     Duration::milliseconds((value.max(0.0) * 3_600_000.0).round() as i64)
 }
@@ -1591,6 +1706,7 @@ mod tests {
             kind: "pipeline".into(),
             project: "platform/gateway".into(),
             external_id: "99".into(),
+            parent_id: Some("EXT-merge-request".into()),
             title: "Pipeline #99".into(),
             url: "https://gitlab.example/platform/gateway/-/pipelines/99".into(),
             status: "success".into(),
@@ -1608,11 +1724,41 @@ mod tests {
         let mut later_snapshot = artifact;
         later_snapshot.synced_at = Utc::now() + Duration::minutes(1);
         assert!(
-            app.sync_external_artifacts(&task_id, &human.name, vec![later_snapshot])
+            app.sync_external_artifacts(&task_id, &human.name, vec![later_snapshot.clone()])
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(app.timeline(&flow.id).unwrap().len(), event_count);
+
+        let mut failed_pipeline = later_snapshot.clone();
+        failed_pipeline.id = "EXT-failed".into();
+        failed_pipeline.external_id = "100".into();
+        failed_pipeline.title = "Pipeline #100".into();
+        failed_pipeline.status = "failed".into();
+        failed_pipeline.verified = false;
+        failed_pipeline.synced_at += Duration::minutes(1);
+        app.sync_external_artifacts(&task_id, &human.name, vec![failed_pipeline.clone()])
+            .unwrap();
+        assert!(app.submit_task(&task_id, &human.name).is_err());
+        assert_eq!(
+            app.state()
+                .find_task(&task_id)
+                .unwrap()
+                .1
+                .external_artifacts
+                .len(),
+            1
+        );
+
+        let mut recovered_pipeline = failed_pipeline;
+        recovered_pipeline.id = "EXT-recovered".into();
+        recovered_pipeline.external_id = "101".into();
+        recovered_pipeline.title = "Pipeline #101".into();
+        recovered_pipeline.status = "success".into();
+        recovered_pipeline.verified = true;
+        recovered_pipeline.synced_at += Duration::minutes(1);
+        app.sync_external_artifacts(&task_id, &human.name, vec![recovered_pipeline])
+            .unwrap();
         app.submit_task(&task_id, &human.name).unwrap();
         drop(app);
 

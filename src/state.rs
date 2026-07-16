@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
+
 use crate::domain::{
     ApiCredential, ExecutionRecord, Flow, FlowStatus, Organization, Principal, TaskStatus, Team,
     TrackingAttention, TrackingEscalation,
@@ -13,6 +15,8 @@ pub struct OrganizationState {
     pub teams: BTreeMap<String, Team>,
     pub principals: BTreeMap<String, Principal>,
     pub credentials: BTreeMap<String, ApiCredential>,
+    pub external_deliveries: BTreeMap<String, DateTime<Utc>>,
+    pub external_binding_clocks: BTreeMap<String, DateTime<Utc>>,
     pub flows: BTreeMap<String, Flow>,
     pub executions: BTreeMap<String, ExecutionRecord>,
     pub attentions: BTreeMap<String, TrackingAttention>,
@@ -168,6 +172,18 @@ impl OrganizationState {
                 artifact,
             } => {
                 let artifacts = &mut self.task_mut(flow_id, task_id)?.external_artifacts;
+                if let Some(parent_id) = &artifact.parent_id {
+                    artifacts.retain(|existing| {
+                        existing.id == artifact.id
+                            || existing.provider != artifact.provider
+                            || existing.kind != artifact.kind
+                            || existing.project != artifact.project
+                            || existing
+                                .parent_id
+                                .as_ref()
+                                .is_some_and(|existing_parent| existing_parent != parent_id)
+                    });
+                }
                 if let Some(existing) = artifacts
                     .iter_mut()
                     .find(|existing| existing.id == artifact.id)
@@ -176,6 +192,20 @@ impl OrganizationState {
                 } else {
                     artifacts.push(artifact.clone());
                 }
+            }
+            DomainEvent::ExternalDeliveryProcessed {
+                provider,
+                delivery_id,
+                binding_key,
+                occurred_at,
+                ..
+            } => {
+                self.external_deliveries
+                    .insert(format!("{provider}:{delivery_id}"), *occurred_at);
+                self.external_binding_clocks
+                    .entry(binding_key.clone())
+                    .and_modify(|current| *current = (*current).max(*occurred_at))
+                    .or_insert(*occurred_at);
             }
             DomainEvent::TaskSubmitted {
                 flow_id,

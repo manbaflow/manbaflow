@@ -443,7 +443,6 @@ async fn run(cli: Cli) -> Result<()> {
             stale_hours,
             escalate_after_hours,
         } => {
-            println!("MambaFlow control plane listening on http://{bind}");
             manbaflow::server::run(
                 app,
                 manbaflow::server::ServerOptions {

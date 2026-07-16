@@ -199,6 +199,8 @@ pub struct ExternalArtifact {
     pub kind: String,
     pub project: String,
     pub external_id: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
     pub title: String,
     pub url: String,
     pub status: String,
@@ -214,6 +216,7 @@ impl ExternalArtifact {
             && self.kind == other.kind
             && self.project == other.project
             && self.external_id == other.external_id
+            && self.parent_id == other.parent_id
             && self.title == other.title
             && self.url == other.url
             && self.status == other.status

@@ -2,7 +2,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,6 +17,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::MambaApp;
 use crate::domain::{Evidence, Flow, Principal, Task, TrackingEscalation};
 use crate::error::{MambaError, Result};
+use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -28,6 +30,7 @@ pub struct ServerOptions {
 #[derive(Clone)]
 struct ApiState {
     app: Arc<Mutex<MambaApp>>,
+    gitlab_webhook_auth: Option<GitLabWebhookAuth>,
 }
 
 #[derive(Debug)]
@@ -103,22 +106,38 @@ struct EvidenceInput {
     summary: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct GitLabWebhookResponse {
+    status: &'static str,
+    event: String,
+    matched_tasks: usize,
+    changed_tasks: usize,
+}
+
 pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
     if options.tracker_interval_seconds == 0 {
         return Err(MambaError::Validation(
             "tracker interval must be greater than zero".into(),
         ));
     }
+    let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
+    let listener = TcpListener::bind(options.bind).await?;
+    println!(
+        "MambaFlow control plane listening on http://{}",
+        options.bind
+    );
+    if gitlab_webhook_auth.is_some() {
+        println!("GitLab webhook receiver enabled");
+    }
     let app = Arc::new(Mutex::new(app));
     spawn_tracker(app.clone(), &options);
-    let listener = TcpListener::bind(options.bind).await?;
-    axum::serve(listener, router(app))
+    axum::serve(listener, router(app, gitlab_webhook_auth))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
 }
 
-fn router(app: Arc<Mutex<MambaApp>>) -> Router {
+fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAuth>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/me", get(me))
@@ -133,7 +152,12 @@ fn router(app: Arc<Mutex<MambaApp>>) -> Router {
         .route("/api/v1/tasks/{id}/evidence", post(add_evidence))
         .route("/api/v1/tasks/{id}/submit", post(submit_task))
         .route("/api/v1/tasks/{id}/complete", post(complete_task))
-        .with_state(ApiState { app })
+        .route("/api/v1/connectors/gitlab/webhook", post(gitlab_webhook))
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .with_state(ApiState {
+            app,
+            gitlab_webhook_auth,
+        })
 }
 
 fn spawn_tracker(app: Arc<Mutex<MambaApp>>, options: &ServerOptions) {
@@ -307,6 +331,87 @@ async fn ack_escalation(
     .await
 }
 
+async fn gitlab_webhook(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<GitLabWebhookResponse>> {
+    let auth = state.gitlab_webhook_auth.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "GitLab webhook is not configured".into(),
+    })?;
+    let message_id = webhook_header(&headers, "webhook-id")
+        .or_else(|| webhook_header(&headers, "idempotency-key"));
+    let verification = auth
+        .verify(
+            webhook_header(&headers, "webhook-signature"),
+            message_id,
+            webhook_header(&headers, "webhook-timestamp"),
+            webhook_header(&headers, "x-gitlab-token"),
+            message_id.or_else(|| webhook_header(&headers, "x-gitlab-event-uuid")),
+            &body,
+            chrono::Utc::now(),
+        )
+        .map_err(|_| ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "invalid GitLab webhook authentication".into(),
+        })?;
+    let event = parse_webhook_event(&body, verification.occurred_at)?;
+    let update = match event {
+        GitLabWebhookEvent::Update(update) => *update,
+        GitLabWebhookEvent::Ignored { object_kind } => {
+            return Ok(Json(GitLabWebhookResponse {
+                status: "ignored",
+                event: object_kind,
+                matched_tasks: 0,
+                changed_tasks: 0,
+            }));
+        }
+    };
+    let expected_header = match update.event_kind {
+        "merge_request" => "Merge Request Hook",
+        "pipeline" => "Pipeline Hook",
+        _ => unreachable!(),
+    };
+    if !webhook_header(&headers, "x-gitlab-event")
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected_header))
+    {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "GitLab webhook event header does not match its payload".into(),
+        });
+    }
+    let actor = format!("connector://gitlab/webhook/{}", verification.delivery_id);
+    let mut app = state.app.lock().await;
+    let result = app.sync_bound_external_artifact(
+        "gitlab",
+        &verification.delivery_id,
+        "merge_request",
+        &update.project,
+        &update.merge_request_iid,
+        verification.occurred_at,
+        update.artifact,
+        &actor,
+    )?;
+    let status = if result.duplicate {
+        "duplicate"
+    } else if result.stale {
+        "stale"
+    } else if result.matched_tasks == 0 {
+        "unbound"
+    } else if result.changed_tasks == 0 {
+        "unchanged"
+    } else {
+        "accepted"
+    };
+    Ok(Json(GitLabWebhookResponse {
+        status,
+        event: update.event_kind.to_string(),
+        matched_tasks: result.matched_tasks,
+        changed_tasks: result.changed_tasks,
+    }))
+}
+
 async fn mutate<T>(
     state: &ApiState,
     headers: &HeaderMap,
@@ -330,16 +435,28 @@ fn authenticate(app: &MambaApp, headers: &HeaderMap) -> ApiResult<Principal> {
         .ok_or_else(ApiError::unauthorized)
 }
 
+fn webhook_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use hmac::{Hmac, KeyInit, Mac};
+    use serde_json::json;
+    use sha2::Sha256;
     use tempfile::tempdir;
     use tower::ServiceExt;
 
     use super::*;
     use crate::domain::PrincipalKind;
     use crate::planner::PlannerKind;
+
+    type TestHmacSha256 = Hmac<Sha256>;
 
     #[tokio::test]
     async fn bearer_identity_drives_remote_inbox_and_task_actions() {
@@ -398,7 +515,7 @@ mod tests {
         );
 
         let app = Arc::new(Mutex::new(app));
-        let service = router(app.clone());
+        let service = router(app.clone(), None);
         let unauthorized = service
             .clone()
             .oneshot(
@@ -464,12 +581,224 @@ mod tests {
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    async fn signed_gitlab_webhooks_update_bound_tasks_idempotently_and_replay() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team(
+                "Platform",
+                "product,delivery,backend,rust,llm-platform,security,quality,observability,operations",
+                "admin",
+            )
+            .unwrap();
+        let human = app
+            .register_principal(
+                "Leader",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery,backend,rust,llm-platform,security,quality,observability,operations",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare a launch brief",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let task_id = flow.tasks[0].id.clone();
+        app.approve_flow(&flow.id, &human.name).unwrap();
+
+        let open_body = merge_request_webhook("opened", "abc123");
+        let GitLabWebhookEvent::Update(binding) =
+            parse_webhook_event(&open_body, Utc::now() - ChronoDuration::seconds(10)).unwrap()
+        else {
+            panic!("expected merge request update");
+        };
+        let binding = *binding;
+        app.sync_external_artifacts(&task_id, &human.name, vec![binding.artifact])
+            .unwrap();
+
+        let signing_key = b"test signing key";
+        let signing_token = format!("whsec_{}", BASE64_STANDARD.encode(signing_key));
+        let auth = GitLabWebhookAuth::new(Some(&signing_token), None)
+            .unwrap()
+            .unwrap();
+        let app = Arc::new(Mutex::new(app));
+        let service = router(app.clone(), Some(auth));
+        let timestamp = Utc::now().timestamp();
+        let merged_body = merge_request_webhook("merged", "def456");
+
+        let merged = service
+            .clone()
+            .oneshot(signed_webhook_request(
+                "Merge Request Hook",
+                "delivery-1",
+                timestamp,
+                signing_key,
+                &merged_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(merged.status(), StatusCode::OK);
+        let body = to_bytes(merged.into_body(), usize::MAX).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["status"], "accepted");
+        let sequence_after_merge = app.lock().await.state().last_sequence;
+
+        let duplicate = service
+            .clone()
+            .oneshot(signed_webhook_request(
+                "Merge Request Hook",
+                "delivery-1",
+                timestamp,
+                signing_key,
+                &merged_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let body = to_bytes(duplicate.into_body(), usize::MAX).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["status"], "duplicate");
+        assert_eq!(app.lock().await.state().last_sequence, sequence_after_merge);
+
+        let pipeline_body = serde_json::to_vec(&json!({
+            "object_kind": "pipeline",
+            "project": {"id": 7, "path_with_namespace": "platform/gateway"},
+            "object_attributes": {
+                "id": 99, "name": "MR pipeline", "ref": "feature/gateway",
+                "sha": "def456", "status": "success",
+                "url": "https://gitlab.test/platform/gateway/-/pipelines/99"
+            },
+            "merge_request": {"iid": 42}
+        }))
+        .unwrap();
+        let pipeline = service
+            .clone()
+            .oneshot(signed_webhook_request(
+                "Pipeline Hook",
+                "delivery-2",
+                timestamp,
+                signing_key,
+                &pipeline_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pipeline.status(), StatusCode::OK);
+
+        let stale_body = merge_request_webhook("closed", "old123");
+        let stale = service
+            .clone()
+            .oneshot(signed_webhook_request(
+                "Merge Request Hook",
+                "delivery-3",
+                timestamp - 30,
+                signing_key,
+                &stale_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK);
+        let body = to_bytes(stale.into_body(), usize::MAX).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["status"], "stale");
+
+        let invalid = service
+            .oneshot(signed_webhook_request(
+                "Pipeline Hook",
+                "delivery-4",
+                timestamp,
+                b"wrong key",
+                &pipeline_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+
+        let state = app.lock().await;
+        let task = state.state().find_task(&task_id).unwrap().1;
+        assert!(task.external_artifacts.iter().any(|artifact| {
+            artifact.kind == "merge_request" && artifact.status == "merged" && artifact.verified
+        }));
+        assert!(task.external_artifacts.iter().any(|artifact| {
+            artifact.kind == "pipeline" && artifact.status == "success" && artifact.verified
+        }));
+        assert_eq!(state.state().external_deliveries.len(), 3);
+        drop(state);
+        drop(app);
+
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        assert_eq!(replayed.state().external_deliveries.len(), 3);
+        assert!(
+            replayed
+                .state()
+                .find_task(&task_id)
+                .unwrap()
+                .1
+                .external_artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "pipeline" && artifact.verified)
+        );
+    }
+
     fn authenticated_request(method: &str, uri: &str, token: &str) -> Request<Body> {
         Request::builder()
             .method(method)
             .uri(uri)
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
+            .unwrap()
+    }
+
+    fn merge_request_webhook(state: &str, revision: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "object_kind": "merge_request",
+            "project": {"id": 7, "path_with_namespace": "platform/gateway"},
+            "object_attributes": {
+                "iid": 42,
+                "title": "Ship gateway",
+                "state": state,
+                "draft": false,
+                "url": "https://gitlab.test/platform/gateway/-/merge_requests/42",
+                "last_commit": {"id": revision}
+            }
+        }))
+        .unwrap()
+    }
+
+    fn signed_webhook_request(
+        event: &str,
+        delivery_id: &str,
+        timestamp: i64,
+        key: &[u8],
+        body: &[u8],
+    ) -> Request<Body> {
+        let timestamp = timestamp.to_string();
+        let mut message = format!("{delivery_id}.{timestamp}.").into_bytes();
+        message.extend_from_slice(body);
+        let mut mac = TestHmacSha256::new_from_slice(key).expect("HMAC accepts keys of any size");
+        mac.update(&message);
+        let signature = format!("v1,{}", BASE64_STANDARD.encode(mac.finalize().into_bytes()));
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/connectors/gitlab/webhook")
+            .header("content-type", "application/json")
+            .header("x-gitlab-event", event)
+            .header("webhook-id", delivery_id)
+            .header("webhook-timestamp", timestamp)
+            .header("webhook-signature", signature)
+            .body(Body::from(body.to_vec()))
             .unwrap()
     }
 }

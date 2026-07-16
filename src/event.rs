@@ -90,6 +90,13 @@ pub enum DomainEvent {
         task_id: String,
         artifact: ExternalArtifact,
     },
+    ExternalDeliveryProcessed {
+        provider: String,
+        delivery_id: String,
+        binding_key: String,
+        occurred_at: DateTime<Utc>,
+        processed_at: DateTime<Utc>,
+    },
     TaskSubmitted {
         flow_id: String,
         task_id: String,
@@ -177,6 +184,7 @@ impl DomainEvent {
             Self::TaskBlocked { .. } => "task.blocked",
             Self::EvidenceAdded { .. } => "task.evidence_added",
             Self::ExternalArtifactSynced { .. } => "task.external_artifact_synced",
+            Self::ExternalDeliveryProcessed { .. } => "external.delivery_processed",
             Self::TaskSubmitted { .. } => "task.submitted",
             Self::TaskCompleted { .. } => "task.completed",
             Self::TrackingAttentionRaised { .. } => "tracking.attention_raised",
@@ -220,7 +228,8 @@ impl DomainEvent {
             | Self::TeamCreated { .. }
             | Self::PrincipalRegistered { .. }
             | Self::ApiCredentialIssued { .. }
-            | Self::ApiCredentialRevoked { .. } => None,
+            | Self::ApiCredentialRevoked { .. }
+            | Self::ExternalDeliveryProcessed { .. } => None,
         }
     }
 }
