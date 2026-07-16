@@ -6,6 +6,7 @@ use manbaflow::domain::{
     ExecutorConfig, ExecutorKind, ExecutorMode, Flow, PrincipalKind, Task, TrackingAttention,
     TrackingEscalation,
 };
+use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
 use manbaflow::{MambaApp, Result};
 use serde::Serialize;
@@ -88,6 +89,11 @@ enum Command {
         #[command(subcommand)]
         command: TrackCommand,
     },
+    /// 连接 GitLab 项目并同步 MR/Pipeline 交付物
+    Gitlab {
+        #[command(subcommand)]
+        command: GitLabCommand,
+    },
     /// 从 Flow Ledger 查看完整事件时间线
     Timeline { flow: String },
     /// 检查本机执行终端
@@ -168,6 +174,30 @@ enum CredentialCommand {
         credential: String,
         #[arg(long, default_value = "admin")]
         by: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GitLabCommand {
+    /// 验证 GitLab 项目和 Token 权限
+    Check {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// 把 Merge Request 和最新 Pipeline 同步到任务黑匣子
+    Sync {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        mr: u64,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 
@@ -613,7 +643,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Task { command } => match command {
             TaskCommand::Show { task } => {
                 let (_, task) = app.state().find_task(&task)?;
-                output(task, cli.json, task_summary(task));
+                output(task, cli.json, task_details(task));
             }
             TaskCommand::Accept { task, by } => {
                 let task = app.accept_task(&task, &by)?;
@@ -777,6 +807,61 @@ async fn run(cli: Cli) -> Result<()> {
                     &escalation,
                     cli.json,
                     format!("{} 已收到呼叫 {}", by, escalation.id),
+                );
+            }
+        },
+        Command::Gitlab { command } => match command {
+            GitLabCommand::Check { project, url } => {
+                let client = GitLabClient::from_env(url.as_deref())?;
+                let project = client.check_project(&project).await?;
+                let text = format!(
+                    "GitLab ready: {} (project {})\n{}",
+                    project.path_with_namespace, project.id, project.web_url
+                );
+                output(&project, cli.json, text);
+            }
+            GitLabCommand::Sync {
+                task,
+                project,
+                mr,
+                by,
+                url,
+            } => {
+                app.authorize_task_actor(&task, &by)?;
+                let client = GitLabClient::from_env(url.as_deref())?;
+                let snapshot = client.merge_request_snapshot(&project, mr).await?;
+                let changed =
+                    app.sync_external_artifacts(&task, &by, snapshot.artifacts.clone())?;
+                let artifact_lines = snapshot
+                    .artifacts
+                    .iter()
+                    .map(|artifact| {
+                        format!(
+                            "{} #{}\t{}\t{}",
+                            artifact.kind,
+                            artifact.external_id,
+                            artifact.status,
+                            if artifact.verified {
+                                "verified"
+                            } else {
+                                "pending"
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let text = format!(
+                    "{} / MR !{} 已同步到 {}，{} 个快照发生变化\n{}",
+                    snapshot.project.path_with_namespace,
+                    snapshot.merge_request_iid,
+                    task,
+                    changed.len(),
+                    artifact_lines
+                );
+                output(
+                    &json!({"snapshot": snapshot, "changed": changed}),
+                    cli.json,
+                    text,
                 );
             }
         },
@@ -971,6 +1056,29 @@ fn task_summary(task: &Task) -> String {
         "{}\t{:?}\t{}\t{}\tP50 {:.1}h/P80 {:.1}h",
         task.id, task.status, owner, task.title, task.estimate.p50_hours, task.estimate.p80_hours
     )
+}
+
+fn task_details(task: &Task) -> String {
+    let mut lines = vec![task_summary(task)];
+    if !task.external_artifacts.is_empty() {
+        lines.push("\n外部交付物:".into());
+        lines.extend(task.external_artifacts.iter().map(|artifact| {
+            format!(
+                "{}:{} #{}\t{}\t{}\n{}",
+                artifact.provider,
+                artifact.kind,
+                artifact.external_id,
+                artifact.status,
+                if artifact.verified {
+                    "verified"
+                } else {
+                    "pending"
+                },
+                artifact.url
+            )
+        }));
+    }
+    lines.join("\n")
 }
 
 fn tracking_attention_line(attention: &TrackingAttention) -> String {

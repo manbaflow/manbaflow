@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    ApiCredential, AttentionKind, Demand, Estimate, Evidence, ExecutionRecord, Flow, Organization,
-    Principal, Team, TrackingAttention, TrackingEscalation,
+    ApiCredential, AttentionKind, Demand, Estimate, Evidence, ExecutionRecord, ExternalArtifact,
+    Flow, Organization, Principal, Team, TrackingAttention, TrackingEscalation,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -84,6 +84,11 @@ pub enum DomainEvent {
         flow_id: String,
         task_id: String,
         evidence: Evidence,
+    },
+    ExternalArtifactSynced {
+        flow_id: String,
+        task_id: String,
+        artifact: ExternalArtifact,
     },
     TaskSubmitted {
         flow_id: String,
@@ -171,6 +176,7 @@ impl DomainEvent {
             Self::TaskHeartbeat { .. } => "task.heartbeat",
             Self::TaskBlocked { .. } => "task.blocked",
             Self::EvidenceAdded { .. } => "task.evidence_added",
+            Self::ExternalArtifactSynced { .. } => "task.external_artifact_synced",
             Self::TaskSubmitted { .. } => "task.submitted",
             Self::TaskCompleted { .. } => "task.completed",
             Self::TrackingAttentionRaised { .. } => "tracking.attention_raised",
@@ -198,6 +204,7 @@ impl DomainEvent {
             | Self::TaskHeartbeat { flow_id, .. }
             | Self::TaskBlocked { flow_id, .. }
             | Self::EvidenceAdded { flow_id, .. }
+            | Self::ExternalArtifactSynced { flow_id, .. }
             | Self::TaskSubmitted { flow_id, .. }
             | Self::TaskCompleted { flow_id, .. }
             | Self::TrackingAttentionResolved { flow_id, .. }

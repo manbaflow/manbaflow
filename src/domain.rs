@@ -192,6 +192,36 @@ pub struct Evidence {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalArtifact {
+    pub id: String,
+    pub provider: String,
+    pub kind: String,
+    pub project: String,
+    pub external_id: String,
+    pub title: String,
+    pub url: String,
+    pub status: String,
+    pub revision: Option<String>,
+    pub verified: bool,
+    pub synced_at: DateTime<Utc>,
+}
+
+impl ExternalArtifact {
+    pub fn same_snapshot(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.provider == other.provider
+            && self.kind == other.kind
+            && self.project == other.project
+            && self.external_id == other.external_id
+            && self.title == other.title
+            && self.url == other.url
+            && self.status == other.status
+            && self.revision == other.revision
+            && self.verified == other.verified
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: String,
@@ -208,6 +238,8 @@ pub struct Task {
     pub blocker: Option<String>,
     pub last_heartbeat: Option<DateTime<Utc>>,
     pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub external_artifacts: Vec<ExternalArtifact>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

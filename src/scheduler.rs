@@ -157,6 +157,7 @@ pub fn schedule(
             blocker: None,
             last_heartbeat: None,
             evidence: Vec::new(),
+            external_artifacts: Vec::new(),
         })
         .collect::<Vec<_>>();
     let p50_finish = tasks

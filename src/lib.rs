@@ -3,6 +3,7 @@ pub mod domain;
 pub mod error;
 pub mod event;
 pub mod executor;
+pub mod gitlab;
 pub mod ids;
 pub mod matcher;
 pub mod planner;

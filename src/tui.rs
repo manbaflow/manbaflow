@@ -1757,6 +1757,11 @@ fn render_task_detail(frame: &mut Frame, task: Option<&Task>, area: Rect) {
             Span::styled(copilots, Style::new().fg(CYAN)),
             Span::styled("    Evidence  ", Style::new().fg(MUTED)),
             Span::styled(task.evidence.len().to_string(), Style::new().fg(GREEN)),
+            Span::styled("    Artifacts  ", Style::new().fg(MUTED)),
+            Span::styled(
+                task.external_artifacts.len().to_string(),
+                Style::new().fg(CYAN),
+            ),
         ]),
     ];
     if let Some(blocker) = &task.blocker {
@@ -1765,6 +1770,25 @@ fn render_task_detail(frame: &mut Frame, task: Option<&Task>, area: Rect) {
             Span::styled(blocker.clone(), Style::new().fg(RED)),
         ]));
     }
+    lines.extend(
+        task.external_artifacts
+            .iter()
+            .rev()
+            .take(3)
+            .map(|artifact| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{}:{}  ", artifact.provider, artifact.kind),
+                        Style::new().fg(CYAN),
+                    ),
+                    Span::styled(
+                        format!("#{} {}  ", artifact.external_id, artifact.status),
+                        Style::new().fg(if artifact.verified { GREEN } else { ORANGE }),
+                    ),
+                    Span::styled(compact_summary(&artifact.title, 42), Style::new().fg(MUTED)),
+                ])
+            }),
+    );
     lines.extend(task.acceptance_criteria.iter().map(|criterion| {
         Line::from(vec![
             Span::styled("□ ", Style::new().fg(GOLD)),

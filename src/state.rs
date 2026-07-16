@@ -162,6 +162,21 @@ impl OrganizationState {
                     .evidence
                     .push(evidence.clone());
             }
+            DomainEvent::ExternalArtifactSynced {
+                flow_id,
+                task_id,
+                artifact,
+            } => {
+                let artifacts = &mut self.task_mut(flow_id, task_id)?.external_artifacts;
+                if let Some(existing) = artifacts
+                    .iter_mut()
+                    .find(|existing| existing.id == artifact.id)
+                {
+                    *existing = artifact.clone();
+                } else {
+                    artifacts.push(artifact.clone());
+                }
+            }
             DomainEvent::TaskSubmitted {
                 flow_id,
                 task_id,

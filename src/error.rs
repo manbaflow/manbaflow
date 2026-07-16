@@ -48,6 +48,9 @@ pub enum MambaError {
 
     #[error("workspace does not exist or is not a directory: {0}")]
     InvalidWorkspace(PathBuf),
+
+    #[error("external connector error: {0}")]
+    ExternalConnector(String),
 }
 
 pub type Result<T> = std::result::Result<T, MambaError>;
