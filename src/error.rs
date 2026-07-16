@@ -28,6 +28,9 @@ pub enum MambaError {
     #[error("validation failed: {0}")]
     Validation(String),
 
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("no eligible assignee for task `{0}`")]
     NoEligibleAssignee(String),
 

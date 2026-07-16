@@ -3,11 +3,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::domain::{
-    AttentionSeverity, Demand, Evidence, ExecutionRecord, ExecutorConfig, ExecutorMode, Flow,
-    FlowStatus, Organization, Principal, PrincipalKind, TargetKind, Task, TaskStatus, Team,
-    TrackingAttention, TrackingEscalation, TrackingScan,
+    ApiCredential, AttentionSeverity, Demand, Evidence, ExecutionRecord, ExecutorConfig,
+    ExecutorMode, Flow, FlowStatus, IssuedCredential, Organization, Principal, PrincipalKind,
+    TargetKind, Task, TaskStatus, Team, TrackingAttention, TrackingEscalation, TrackingScan,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -190,6 +192,115 @@ impl MambaApp {
         Ok(principal)
     }
 
+    pub fn issue_api_credential(
+        &mut self,
+        target: &str,
+        label: &str,
+        actor: &str,
+    ) -> Result<IssuedCredential> {
+        self.state.organization()?;
+        let principal = self.state.principal(target)?.clone();
+        let label = label.trim();
+        if label.is_empty() || label.chars().count() > 80 {
+            return Err(MambaError::Validation(
+                "credential label must contain 1 to 80 characters".into(),
+            ));
+        }
+        let token = format!("mmb_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_hash = credential_hash(&token);
+        let credential = ApiCredential {
+            id: new_id("CRED"),
+            principal_id: principal.id,
+            label: label.to_string(),
+            created_at: Utc::now(),
+            revoked_at: None,
+        };
+        self.store.insert_credential(
+            &credential.id,
+            &credential.principal_id,
+            &token_hash,
+            credential.created_at,
+        )?;
+        if let Err(error) = self.commit(
+            actor,
+            vec![DomainEvent::ApiCredentialIssued {
+                credential: credential.clone(),
+            }],
+        ) {
+            let _ = self.store.delete_credential(&credential.id);
+            return Err(error);
+        }
+        Ok(IssuedCredential { credential, token })
+    }
+
+    pub fn revoke_api_credential(
+        &mut self,
+        credential_id: &str,
+        actor: &str,
+    ) -> Result<ApiCredential> {
+        let credential = self
+            .state
+            .credentials
+            .get(credential_id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "API credential",
+                id: credential_id.to_string(),
+            })?
+            .clone();
+        if !credential.is_active() {
+            return Err(MambaError::InvalidTransition(format!(
+                "API credential {} is already revoked",
+                credential.id
+            )));
+        }
+        let revoked_at = Utc::now();
+        self.commit(
+            actor,
+            vec![DomainEvent::ApiCredentialRevoked {
+                credential_id: credential.id.clone(),
+                principal_id: credential.principal_id.clone(),
+                revoked_at,
+            }],
+        )?;
+        self.store.revoke_credential(&credential.id, revoked_at)?;
+        Ok(self
+            .state
+            .credentials
+            .get(credential_id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "API credential",
+                id: credential_id.to_string(),
+            })?
+            .clone())
+    }
+
+    pub fn authenticate_api_token(&self, token: &str) -> Result<Option<Principal>> {
+        if token.len() != 68
+            || !token.starts_with("mmb_")
+            || !token[4..].bytes().all(|value| value.is_ascii_hexdigit())
+        {
+            return Ok(None);
+        }
+        let token_hash = credential_hash(token);
+        let Some((credential_id, principal_id)) =
+            self.store.authenticate_credential(&token_hash)?
+        else {
+            return Ok(None);
+        };
+        let Some(credential) = self.state.credentials.get(&credential_id) else {
+            return Ok(None);
+        };
+        if !credential.is_active() || credential.principal_id != principal_id {
+            return Ok(None);
+        }
+        Ok(self
+            .state
+            .principals
+            .get(&principal_id)
+            .filter(|principal| principal.active)
+            .cloned())
+    }
+
     pub async fn create_demand(
         &mut self,
         summary: &str,
@@ -209,7 +320,7 @@ impl MambaApp {
         }
         let requester = self.state.principal(requester)?;
         if requester.kind != PrincipalKind::Human {
-            return Err(MambaError::Validation(
+            return Err(MambaError::PermissionDenied(
                 "a demand requester must be a registered human".into(),
             ));
         }
@@ -276,11 +387,17 @@ impl MambaApp {
     pub fn approve_flow(&mut self, flow_id: &str, approved_by: &str) -> Result<Flow> {
         let approver = self.state.principal(approved_by)?;
         if approver.kind != PrincipalKind::Human {
-            return Err(MambaError::Validation(
+            return Err(MambaError::PermissionDenied(
                 "flow approval requires a registered human".into(),
             ));
         }
         let flow = self.state.flow(flow_id)?.clone();
+        if flow.demand.requester != approver.name && flow.demand.requester != approver.id {
+            return Err(MambaError::PermissionDenied(format!(
+                "only demand requester {} can approve flow {}",
+                flow.demand.requester, flow.id
+            )));
+        }
         if flow.status != FlowStatus::Draft {
             return Err(MambaError::InvalidTransition(format!(
                 "flow {} is {:?}, expected draft",
@@ -591,7 +708,7 @@ impl MambaApp {
     ) -> Result<TrackingEscalation> {
         let principal = self.state.principal(actor)?;
         if principal.kind != PrincipalKind::Human {
-            return Err(MambaError::Validation(
+            return Err(MambaError::PermissionDenied(
                 "tracking escalation acknowledgement requires a human".into(),
             ));
         }
@@ -605,7 +722,7 @@ impl MambaApp {
             })?
             .clone();
         if escalation.recipient_id != principal.id {
-            return Err(MambaError::Validation(format!(
+            return Err(MambaError::PermissionDenied(format!(
                 "{} is not the recipient of escalation {}",
                 principal.name, escalation.id
             )));
@@ -842,11 +959,17 @@ impl MambaApp {
     pub fn complete_task(&mut self, task_id: &str, actor: &str) -> Result<Task> {
         let principal = self.state.principal(actor)?;
         if principal.kind != PrincipalKind::Human {
-            return Err(MambaError::Validation(
+            return Err(MambaError::PermissionDenied(
                 "task completion requires a registered human".into(),
             ));
         }
         let (flow, task) = self.task_snapshot(task_id)?;
+        if flow.demand.requester != principal.name && flow.demand.requester != principal.id {
+            return Err(MambaError::PermissionDenied(format!(
+                "only demand requester {} can complete task {}",
+                flow.demand.requester, task.id
+            )));
+        }
         ensure_status(&task, &[TaskStatus::Submitted])?;
         let at = Utc::now();
         let mut events = vec![DomainEvent::TaskCompleted {
@@ -1074,7 +1197,7 @@ impl MambaApp {
         if allowed {
             Ok(())
         } else {
-            Err(MambaError::Validation(format!(
+            Err(MambaError::PermissionDenied(format!(
                 "{} is not assigned to task {}",
                 principal.name, task.id
             )))
@@ -1143,6 +1266,10 @@ fn round_hours(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
+fn credential_hash(token: &str) -> Vec<u8> {
+    Sha256::digest(token.as_bytes()).to_vec()
+}
+
 fn task_prompt(flow: &Flow, task: &Task, mode: &ExecutorMode, requested_by: &str) -> String {
     let action = match mode {
         ExecutorMode::Plan => {
@@ -1178,6 +1305,79 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn api_credentials_authenticate_replay_and_revoke() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app.create_team("Ops", "operations", "admin").unwrap();
+        let human = app
+            .register_principal(
+                "Leader",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "operations",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let issued = app
+            .issue_api_credential(&human.id, "laptop", "admin")
+            .unwrap();
+        assert_eq!(
+            app.authenticate_api_token(&issued.token)
+                .unwrap()
+                .unwrap()
+                .id,
+            human.id
+        );
+        assert!(
+            !serde_json::to_string(&app.state().credentials)
+                .unwrap()
+                .contains(&issued.token)
+        );
+        drop(app);
+
+        let mut replayed = MambaApp::open(&data_dir).unwrap();
+        assert_eq!(
+            replayed
+                .authenticate_api_token(&issued.token)
+                .unwrap()
+                .unwrap()
+                .id,
+            human.id
+        );
+        replayed
+            .revoke_api_credential(&issued.credential.id, "admin")
+            .unwrap();
+        assert!(
+            replayed
+                .authenticate_api_token(&issued.token)
+                .unwrap()
+                .is_none()
+        );
+        drop(replayed);
+
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        assert!(
+            replayed
+                .authenticate_api_token(&issued.token)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !replayed
+                .state()
+                .credentials
+                .get(&issued.credential.id)
+                .unwrap()
+                .is_active()
+        );
+    }
 
     #[tokio::test]
     async fn organization_flow_replays_after_human_acceptance() {
@@ -1227,7 +1427,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, MambaError::Validation(_)));
+        assert!(matches!(error, MambaError::PermissionDenied(_)));
         let flow = app
             .create_demand(
                 "Prepare a launch brief",
@@ -1347,7 +1547,7 @@ mod tests {
         let error = app
             .acknowledge_escalation(&escalation_id, &observer.name)
             .unwrap_err();
-        assert!(matches!(error, MambaError::Validation(_)));
+        assert!(matches!(error, MambaError::PermissionDenied(_)));
         let acknowledged = app
             .acknowledge_escalation(&escalation_id, &human.name)
             .unwrap();

@@ -36,11 +36,21 @@ impl EventStore {
             );
             CREATE INDEX IF NOT EXISTS idx_events_flow ON events(flow_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, sequence);
+            CREATE TABLE IF NOT EXISTS api_credentials (
+                id           TEXT PRIMARY KEY,
+                principal_id TEXT NOT NULL,
+                token_hash   BLOB NOT NULL UNIQUE,
+                created_at   TEXT NOT NULL,
+                revoked_at   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_credentials_principal
+                ON api_credentials(principal_id, revoked_at);
             CREATE TABLE IF NOT EXISTS metadata (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', '1');
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '2')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
             ",
         )?;
         Ok(Self { connection, path })
@@ -103,6 +113,55 @@ impl EventStore {
             "SELECT sequence, id, organization_id, flow_id, actor, kind, payload, occurred_at FROM events WHERE flow_id = ?1 ORDER BY sequence",
             [flow_id],
         )
+    }
+
+    pub fn insert_credential(
+        &mut self,
+        id: &str,
+        principal_id: &str,
+        token_hash: &[u8],
+        created_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO api_credentials(id, principal_id, token_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, principal_id, token_hash, created_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_credential(&mut self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM api_credentials WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn revoke_credential(&mut self, id: &str, revoked_at: DateTime<Utc>) -> Result<()> {
+        let updated = self.connection.execute(
+            "UPDATE api_credentials SET revoked_at = ?2
+             WHERE id = ?1 AND revoked_at IS NULL",
+            params![id, revoked_at.to_rfc3339()],
+        )?;
+        if updated == 0 {
+            return Err(MambaError::NotFound {
+                entity: "active API credential",
+                id: id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn authenticate_credential(&self, token_hash: &[u8]) -> Result<Option<(String, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, principal_id FROM api_credentials
+             WHERE token_hash = ?1 AND revoked_at IS NULL",
+        )?;
+        let mut rows = statement.query(params![token_hash])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
     }
 
     fn load_where<const N: usize>(

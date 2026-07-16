@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -35,6 +36,17 @@ enum Command {
         actor: Option<String>,
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
+    },
+    /// 启动支持远程 Inbox 的 Human-Agent Control Plane
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        bind: SocketAddr,
+        #[arg(long, default_value_t = 30)]
+        tracker_interval: u64,
+        #[arg(long, default_value_t = 24)]
+        stale_hours: u64,
+        #[arg(long, default_value_t = 4)]
+        escalate_after_hours: u64,
     },
     /// 初始化和查看组织塔台
     Org {
@@ -126,6 +138,37 @@ enum PrincipalCommand {
     Add(PrincipalAdd),
     /// 列出所有 Human 和 Agent
     List,
+    /// 管理远程 API Bearer Token
+    Token {
+        #[command(subcommand)]
+        command: CredentialCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredentialCommand {
+    /// 为 Principal 签发只显示一次的 Token
+    Issue {
+        #[arg(long = "for")]
+        target: String,
+        #[arg(long, default_value = "remote client")]
+        label: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
+    /// 查看 Token 元数据，不显示 Secret
+    List {
+        #[arg(long = "for")]
+        target: String,
+        #[arg(long)]
+        all: bool,
+    },
+    /// 撤销 Token
+    Revoke {
+        credential: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
 }
 
 #[derive(Args)]
@@ -364,6 +407,24 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
         }
+        Command::Serve {
+            bind,
+            tracker_interval,
+            stale_hours,
+            escalate_after_hours,
+        } => {
+            println!("MambaFlow control plane listening on http://{bind}");
+            manbaflow::server::run(
+                app,
+                manbaflow::server::ServerOptions {
+                    bind,
+                    tracker_interval_seconds: tracker_interval,
+                    stale_after_hours: stale_hours,
+                    escalate_after_hours,
+                },
+            )
+            .await?;
+        }
         Command::Org { command } => match command {
             OrgCommand::Init { name, by } => {
                 let org = app.init_organization(&name, &by)?;
@@ -464,6 +525,51 @@ async fn run(cli: Cli) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
+            PrincipalCommand::Token { command } => match command {
+                CredentialCommand::Issue { target, label, by } => {
+                    let issued = app.issue_api_credential(&target, &label, &by)?;
+                    output(
+                        &issued,
+                        cli.json,
+                        format!(
+                            "{}\nToken 只显示一次：{}",
+                            issued.credential.id, issued.token
+                        ),
+                    );
+                }
+                CredentialCommand::List { target, all } => {
+                    let principal = app.state().principal(&target)?;
+                    let credentials = app
+                        .state()
+                        .credentials
+                        .values()
+                        .filter(|credential| credential.principal_id == principal.id)
+                        .filter(|credential| all || credential.is_active())
+                        .collect::<Vec<_>>();
+                    let text = credentials
+                        .iter()
+                        .map(|credential| {
+                            format!(
+                                "{}\t{}\t{}\t{}",
+                                credential.id,
+                                if credential.is_active() {
+                                    "active"
+                                } else {
+                                    "revoked"
+                                },
+                                credential.label,
+                                credential.created_at
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    output(&credentials, cli.json, text);
+                }
+                CredentialCommand::Revoke { credential, by } => {
+                    let credential = app.revoke_api_credential(&credential, &by)?;
+                    output(&credential, cli.json, format!("{} 已撤销", credential.id));
+                }
+            },
         },
         Command::Demand { command } => match command {
             DemandCommand::Create {

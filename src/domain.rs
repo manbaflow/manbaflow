@@ -65,6 +65,27 @@ pub struct Principal {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiCredential {
+    pub id: String,
+    pub principal_id: String,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl ApiCredential {
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssuedCredential {
+    pub credential: ApiCredential,
+    pub token: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Demand {
     pub id: String,

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::domain::{
-    ExecutionRecord, Flow, FlowStatus, Organization, Principal, TaskStatus, Team,
+    ApiCredential, ExecutionRecord, Flow, FlowStatus, Organization, Principal, TaskStatus, Team,
     TrackingAttention, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
@@ -12,6 +12,7 @@ pub struct OrganizationState {
     pub organization: Option<Organization>,
     pub teams: BTreeMap<String, Team>,
     pub principals: BTreeMap<String, Principal>,
+    pub credentials: BTreeMap<String, ApiCredential>,
     pub flows: BTreeMap<String, Flow>,
     pub executions: BTreeMap<String, ExecutionRecord>,
     pub attentions: BTreeMap<String, TrackingAttention>,
@@ -49,6 +50,30 @@ impl OrganizationState {
             DomainEvent::PrincipalRegistered { principal } => {
                 self.principals
                     .insert(principal.id.clone(), principal.clone());
+            }
+            DomainEvent::ApiCredentialIssued { credential } => {
+                self.principal(&credential.principal_id)?;
+                self.credentials
+                    .insert(credential.id.clone(), credential.clone());
+            }
+            DomainEvent::ApiCredentialRevoked {
+                credential_id,
+                principal_id,
+                revoked_at,
+            } => {
+                let credential = self.credentials.get_mut(credential_id).ok_or_else(|| {
+                    MambaError::NotFound {
+                        entity: "API credential",
+                        id: credential_id.clone(),
+                    }
+                })?;
+                if credential.principal_id != *principal_id {
+                    return Err(MambaError::Validation(format!(
+                        "API credential {} does not belong to principal {}",
+                        credential_id, principal_id
+                    )));
+                }
+                credential.revoked_at = Some(*revoked_at);
             }
             DomainEvent::DemandCreated { .. } => {}
             DomainEvent::PlanGenerated { flow } => {

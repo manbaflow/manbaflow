@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    AttentionKind, Demand, Estimate, Evidence, ExecutionRecord, Flow, Organization, Principal,
-    Team, TrackingAttention, TrackingEscalation,
+    ApiCredential, AttentionKind, Demand, Estimate, Evidence, ExecutionRecord, Flow, Organization,
+    Principal, Team, TrackingAttention, TrackingEscalation,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -17,6 +17,14 @@ pub enum DomainEvent {
     },
     PrincipalRegistered {
         principal: Principal,
+    },
+    ApiCredentialIssued {
+        credential: ApiCredential,
+    },
+    ApiCredentialRevoked {
+        credential_id: String,
+        principal_id: String,
+        revoked_at: DateTime<Utc>,
     },
     DemandCreated {
         demand: Demand,
@@ -150,6 +158,8 @@ impl DomainEvent {
             Self::OrganizationInitialized { .. } => "organization.initialized",
             Self::TeamCreated { .. } => "team.created",
             Self::PrincipalRegistered { .. } => "principal.registered",
+            Self::ApiCredentialIssued { .. } => "api_credential.issued",
+            Self::ApiCredentialRevoked { .. } => "api_credential.revoked",
             Self::DemandCreated { .. } => "demand.created",
             Self::PlanGenerated { .. } => "plan.generated",
             Self::FlowApproved { .. } => "flow.approved",
@@ -201,7 +211,9 @@ impl DomainEvent {
             Self::ExecutorFinished { record } => Some(&record.flow_id),
             Self::OrganizationInitialized { .. }
             | Self::TeamCreated { .. }
-            | Self::PrincipalRegistered { .. } => None,
+            | Self::PrincipalRegistered { .. }
+            | Self::ApiCredentialIssued { .. }
+            | Self::ApiCredentialRevoked { .. } => None,
         }
     }
 }
