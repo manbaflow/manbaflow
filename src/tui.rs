@@ -1,10 +1,15 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::io::stdout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -39,9 +44,32 @@ pub struct TuiOptions {
     pub actor: Option<String>,
 }
 
+struct MouseCaptureGuard;
+
+impl MouseCaptureGuard {
+    fn enable() -> std::io::Result<Self> {
+        execute!(stdout(), EnableMouseCapture)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        let _ = execute!(stdout(), DisableMouseCapture);
+    }
+}
+
 pub async fn run(app: &mut MambaApp, options: TuiOptions) -> Result<()> {
     let mut terminal = ratatui::init();
+    let mouse_capture = match MouseCaptureGuard::enable() {
+        Ok(guard) => guard,
+        Err(error) => {
+            ratatui::restore();
+            return Err(error.into());
+        }
+    };
     let result = run_loop(app, &mut terminal, options).await;
+    drop(mouse_capture);
     ratatui::restore();
     result
 }
@@ -59,6 +87,11 @@ async fn run_loop(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if state.handle_key(app, key).await? {
+                        return Ok(());
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if state.handle_mouse(app, mouse).await? {
                         return Ok(());
                     }
                 }
@@ -100,6 +133,40 @@ impl View {
     fn index(self) -> usize {
         Self::ALL.iter().position(|view| *view == self).unwrap_or(0)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseAction {
+    NewDemand,
+    ApproveOrAccept,
+    Advance,
+    Plan,
+    Execute,
+    Evidence,
+    Block,
+    Complete,
+    CycleActor,
+    Help,
+    Quit,
+    ConfirmModal,
+    CancelModal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HitTarget {
+    Tab(View),
+    Flow(usize),
+    Task(usize),
+    Inbox(usize),
+    Principal(usize),
+    Timeline(usize),
+    Action(MouseAction),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HitRegion {
+    area: Rect,
+    target: HitTarget,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +224,7 @@ struct UiState {
     flight_tx: mpsc::UnboundedSender<FlightResult>,
     flight_rx: mpsc::UnboundedReceiver<FlightResult>,
     last_flight_reload: Instant,
+    hit_regions: Vec<HitRegion>,
 }
 
 impl UiState {
@@ -189,6 +257,7 @@ impl UiState {
             flight_tx,
             flight_rx,
             last_flight_reload: Instant::now(),
+            hit_regions: Vec::new(),
         };
         state.refresh_timeline(app);
         state
@@ -268,6 +337,128 @@ impl UiState {
             _ => {}
         }
         Ok(false)
+    }
+
+    async fn handle_mouse(&mut self, app: &mut MambaApp, mouse: MouseEvent) -> Result<bool> {
+        if self.show_help {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.show_help = false;
+            }
+            return Ok(false);
+        }
+
+        let target = self.target_at(mouse.column, mouse.row);
+        if self.modal.is_some() {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                match target {
+                    Some(HitTarget::Action(MouseAction::ConfirmModal)) => {
+                        self.submit_modal(app).await;
+                    }
+                    Some(HitTarget::Action(MouseAction::CancelModal)) => self.modal = None,
+                    _ => {}
+                }
+            }
+            return Ok(false);
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => match target {
+                Some(HitTarget::Tab(view)) => self.switch_view(app, view),
+                Some(HitTarget::Flow(index)) => {
+                    self.flow_index = index;
+                    self.task_index = 0;
+                    self.focus_tasks = false;
+                    self.refresh_timeline(app);
+                }
+                Some(HitTarget::Task(index)) => {
+                    self.task_index = index;
+                    self.focus_tasks = true;
+                }
+                Some(HitTarget::Inbox(index)) => self.inbox_index = index,
+                Some(HitTarget::Principal(index)) => self.roster_index = index,
+                Some(HitTarget::Timeline(index)) => self.timeline_index = index,
+                Some(HitTarget::Action(action)) => {
+                    return self.handle_mouse_action(app, action).await;
+                }
+                None => {}
+            },
+            MouseEventKind::ScrollUp => {
+                self.focus_from_target(target);
+                self.move_selection(app, -1);
+            }
+            MouseEventKind::ScrollDown => {
+                self.focus_from_target(target);
+                self.move_selection(app, 1);
+            }
+            MouseEventKind::ScrollLeft => match self.view {
+                View::Flows => self.focus_tasks = false,
+                View::Timeline => {
+                    self.flow_index = shifted(self.flow_index, flow_ids(app).len(), -1);
+                    self.refresh_timeline(app);
+                }
+                _ => {}
+            },
+            MouseEventKind::ScrollRight => match self.view {
+                View::Flows => self.focus_tasks = true,
+                View::Timeline => {
+                    self.flow_index = shifted(self.flow_index, flow_ids(app).len(), 1);
+                    self.refresh_timeline(app);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    async fn handle_mouse_action(
+        &mut self,
+        app: &mut MambaApp,
+        action: MouseAction,
+    ) -> Result<bool> {
+        match action {
+            MouseAction::NewDemand => {
+                self.modal = Some(InputModal {
+                    purpose: InputPurpose::Demand,
+                    value: String::new(),
+                });
+            }
+            MouseAction::ApproveOrAccept => self.approve_or_accept(app),
+            MouseAction::Advance => self.advance_task(app),
+            MouseAction::Plan => self.open_run_confirmation(app, ExecutorMode::Plan),
+            MouseAction::Execute => self.open_run_confirmation(app, ExecutorMode::Execute),
+            MouseAction::Evidence => self.open_task_input(app, true),
+            MouseAction::Block => self.open_task_input(app, false),
+            MouseAction::Complete => self.complete_task(app),
+            MouseAction::CycleActor => self.cycle_actor(app),
+            MouseAction::Help => self.show_help = true,
+            MouseAction::Quit => return Ok(self.request_quit()),
+            MouseAction::ConfirmModal => self.submit_modal(app).await,
+            MouseAction::CancelModal => self.modal = None,
+        }
+        Ok(false)
+    }
+
+    fn focus_from_target(&mut self, target: Option<HitTarget>) {
+        match target {
+            Some(HitTarget::Flow(_)) => self.focus_tasks = false,
+            Some(HitTarget::Task(_)) => self.focus_tasks = true,
+            _ => {}
+        }
+    }
+
+    fn target_at(&self, column: u16, row: u16) -> Option<HitTarget> {
+        self.hit_regions
+            .iter()
+            .rev()
+            .find(|region| rect_contains(region.area, column, row))
+            .map(|region| region.target)
+    }
+
+    fn register_hit(&mut self, area: Rect, target: HitTarget) {
+        if area.width > 0 && area.height > 0 {
+            self.hit_regions.push(HitRegion { area, target });
+        }
     }
 
     async fn handle_modal_key(&mut self, app: &mut MambaApp, key: KeyEvent) -> Result<bool> {
@@ -721,6 +912,7 @@ impl UiState {
 }
 
 fn render(frame: &mut Frame, app: &MambaApp, state: &mut UiState) {
+    state.hit_regions.clear();
     frame.render_widget(Block::default().style(Style::new().bg(BG)), frame.area());
     let [header, tabs, content, status, help] = Layout::vertical([
         Constraint::Length(3),
@@ -745,12 +937,12 @@ fn render(frame: &mut Frame, app: &MambaApp, state: &mut UiState) {
 
     if state.show_help {
         render_help_modal(frame);
-    } else if let Some(modal) = &state.modal {
-        render_input_modal(frame, modal);
+    } else if let Some(modal) = state.modal.clone() {
+        render_input_modal(frame, &modal, state);
     }
 }
 
-fn render_header(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect) {
+fn render_header(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
     let organization = app
         .state()
         .organization
@@ -764,6 +956,7 @@ fn render_header(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect)
         Constraint::Length(22),
     ])
     .areas(area);
+    state.register_hit(context, HitTarget::Action(MouseAction::CycleActor));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" MAMBA", Style::new().fg(GOLD).bold()),
@@ -816,12 +1009,26 @@ fn render_header(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect)
     );
 }
 
-fn render_tabs(frame: &mut Frame, state: &UiState, area: Rect) {
+fn render_tabs(frame: &mut Frame, state: &mut UiState, area: Rect) {
     let titles = View::ALL
         .iter()
         .enumerate()
         .map(|(index, view)| format!(" {} {} ", index + 1, view.title()))
         .collect::<Vec<_>>();
+    let mut x = area.x;
+    for (index, title) in titles.iter().enumerate() {
+        let width = Line::from(title.as_str()).width() as u16;
+        state.register_hit(
+            Rect::new(
+                x,
+                area.y,
+                width.min(area.right().saturating_sub(x)),
+                area.height,
+            ),
+            HitTarget::Tab(View::ALL[index]),
+        );
+        x = x.saturating_add(width).saturating_add(3);
+    }
     let tabs = Tabs::new(titles)
         .select(state.view.index())
         .style(Style::new().fg(MUTED).bg(BG))
@@ -943,6 +1150,7 @@ fn render_flow_table(
     .block(panel_block("FLOW BOARD", focused));
     let mut table_state = TableState::default();
     table_state.select((!ids.is_empty()).then_some(state.flow_index));
+    register_table_rows(area, state.flow_index, ids.len(), HitTarget::Flow, state);
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
@@ -1118,6 +1326,7 @@ fn render_flow_selector(
     .block(panel_block("FLOW SELECTOR", focused));
     let mut table_state = TableState::default();
     table_state.select((!ids.is_empty()).then_some(state.flow_index));
+    register_table_rows(area, state.flow_index, ids.len(), HitTarget::Flow, state);
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
@@ -1149,6 +1358,7 @@ fn render_tasks(frame: &mut Frame, state: &mut UiState, app: &MambaApp, area: Re
     .block(panel_block("FLIGHT MANIFESTS", focused));
     let mut table_state = TableState::default();
     table_state.select((!tasks.is_empty()).then_some(state.task_index));
+    register_table_rows(area, state.task_index, tasks.len(), HitTarget::Task, state);
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
@@ -1190,6 +1400,13 @@ fn render_inbox(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Re
     .block(panel_block(&title, true));
     let mut table_state = TableState::default();
     table_state.select((!items.is_empty()).then_some(state.inbox_index));
+    register_table_rows(
+        table_area,
+        state.inbox_index,
+        items.len(),
+        HitTarget::Inbox,
+        state,
+    );
     frame.render_stateful_widget(table, table_area, &mut table_state);
     render_task_detail(
         frame,
@@ -1356,6 +1573,13 @@ fn render_roster(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
     .block(panel_block("ROSTER / 轮换阵容", true));
     let mut table_state = TableState::default();
     table_state.select((!principals_vec.is_empty()).then_some(state.roster_index));
+    register_table_rows(
+        principals,
+        state.roster_index,
+        principals_vec.len(),
+        HitTarget::Principal,
+        state,
+    );
     frame.render_stateful_widget(table, principals, &mut table_state);
 }
 
@@ -1401,6 +1625,13 @@ fn render_timeline(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area:
         .repeat_highlight_symbol(true);
     let mut list_state = ListState::default();
     list_state.select((!state.timeline.is_empty()).then_some(state.timeline_index));
+    register_list_rows(
+        ledger_area,
+        state.timeline_index,
+        state.timeline.len(),
+        HitTarget::Timeline,
+        state,
+    );
     frame.render_stateful_widget(list, ledger_area, &mut list_state);
     render_flights(frame, app, state, flights_area);
 }
@@ -1516,24 +1747,65 @@ fn render_status(frame: &mut Frame, state: &UiState, area: Rect) {
     );
 }
 
-fn render_shortcuts(frame: &mut Frame, state: &UiState, area: Rect) {
-    let context = match state.view {
-        View::Overview => "n 新需求  a 批准",
-        View::Flows => "h/l 切面板  a 接单  s 推进  p 规划  x 执行",
-        View::Inbox => "a 接单  s 推进  p 规划  x 执行  e 证据  c 验收",
-        View::Roster => "u 切换球权",
-        View::Timeline => "h/l 切 Flow  j/k 浏览事件",
+fn render_shortcuts(frame: &mut Frame, state: &mut UiState, area: Rect) {
+    let actions: &[(&str, MouseAction)] = match state.view {
+        View::Overview => &[
+            ("新需求", MouseAction::NewDemand),
+            ("批准", MouseAction::ApproveOrAccept),
+        ],
+        View::Flows => &[
+            ("批准/接单", MouseAction::ApproveOrAccept),
+            ("推进", MouseAction::Advance),
+            ("规划", MouseAction::Plan),
+            ("执行", MouseAction::Execute),
+        ],
+        View::Inbox => &[
+            ("接单", MouseAction::ApproveOrAccept),
+            ("推进", MouseAction::Advance),
+            ("规划", MouseAction::Plan),
+            ("执行", MouseAction::Execute),
+            ("证据", MouseAction::Evidence),
+            ("阻塞", MouseAction::Block),
+            ("验收", MouseAction::Complete),
+        ],
+        View::Roster => &[("切换球权", MouseAction::CycleActor)],
+        View::Timeline => &[],
     };
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (label, action) in actions
+        .iter()
+        .copied()
+        .chain([("帮助", MouseAction::Help), ("退出", MouseAction::Quit)])
+    {
+        let text = format!(" {label} ");
+        let width = Line::from(text.as_str()).width() as u16;
+        let available = area.right().saturating_sub(x);
+        if available < width {
+            break;
+        }
+        state.register_hit(
+            Rect::new(x, area.y, width, area.height),
+            HitTarget::Action(action),
+        );
+        spans.push(Span::styled(
+            text,
+            Style::new().fg(action_color(action)).bg(PANEL_ALT).bold(),
+        ));
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(width).saturating_add(1);
+    }
+    spans.push(Span::styled(
+        "  点击操作 · 滚轮移动 · ? 完整帮助",
+        Style::new().fg(MUTED),
+    ));
     frame.render_widget(
-        Paragraph::new(format!(
-            " {context}    1-5/Tab 切视图  j/k 移动  r 重放  ? 帮助  q 退出"
-        ))
-        .style(Style::new().fg(MUTED).bg(PANEL)),
+        Paragraph::new(Line::from(spans)).style(Style::new().bg(PANEL)),
         area,
     );
 }
 
-fn render_input_modal(frame: &mut Frame, modal: &InputModal) {
+fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState) {
     let area = centered(frame.area(), 72, 9);
     frame.render_widget(Clear, area);
     let (title, prompt, color) = match &modal.purpose {
@@ -1584,19 +1856,34 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal) {
             ),
         input,
     );
+    let [confirm, cancel] = Layout::horizontal([Constraint::Ratio(1, 2); 2])
+        .spacing(1)
+        .areas(footer);
+    state.register_hit(confirm, HitTarget::Action(MouseAction::ConfirmModal));
+    state.register_hit(cancel, HitTarget::Action(MouseAction::CancelModal));
     frame.render_widget(
-        Paragraph::new("Enter 确认    Esc 取消").style(Style::new().fg(MUTED)),
-        footer,
+        Paragraph::new("[ 确认 / Enter ]")
+            .style(Style::new().fg(BG).bg(color).bold())
+            .alignment(Alignment::Center),
+        confirm,
+    );
+    frame.render_widget(
+        Paragraph::new("[ 取消 / Esc ]")
+            .style(Style::new().fg(TEXT).bg(PANEL_ALT))
+            .alignment(Alignment::Center),
+        cancel,
     );
 }
 
 fn render_help_modal(frame: &mut Frame) {
-    let area = centered(frame.area(), 78, 25);
+    let area = centered(frame.area(), 78, 27);
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::styled("塔台操作手册", Style::new().fg(GOLD).bold()),
         Line::raw(""),
         help_line("1-5 / Tab", "切换总览、Flow、Inbox、阵容与时间线"),
+        help_line("鼠标点击", "选择标签、表格行、球权与底栏操作"),
+        help_line("鼠标滚轮", "移动指针所在列表的当前选择"),
         help_line("j / k", "移动当前列表选择"),
         help_line("h / l", "在 Flow 列表与任务列表之间切换球权"),
         help_line("h / l (时间线)", "切换正在审计的 Flow"),
@@ -1613,10 +1900,10 @@ fn render_help_modal(frame: &mut Frame) {
         help_line("q / Ctrl-C", "安全退出塔台"),
         Line::raw(""),
         Line::styled(
-            "执行终端仍通过 task run 显式起飞；TUI 不会静默授予 workspace-write。",
+            "TUI 与 task run 共用放行协议；没有 MAMBA 确认就不会授予 workspace-write。",
             Style::new().fg(CYAN),
         ),
-        Line::styled("按 ?、Esc 或 q 返回", Style::new().fg(MUTED)),
+        Line::styled("点击任意位置，或按 ?、Esc、q 返回", Style::new().fg(MUTED)),
     ];
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
@@ -1666,6 +1953,79 @@ fn panel_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
 
 fn dim_border() -> Style {
     Style::new().fg(Color::Rgb(48, 51, 57))
+}
+
+fn register_table_rows(
+    area: Rect,
+    selected: usize,
+    count: usize,
+    target: fn(usize) -> HitTarget,
+    state: &mut UiState,
+) {
+    let visible = area.height.saturating_sub(4) as usize;
+    if visible == 0 || count == 0 {
+        return;
+    }
+    let offset = selected
+        .min(count - 1)
+        .saturating_add(1)
+        .saturating_sub(visible);
+    for (visual_row, index) in (offset..count).take(visible).enumerate() {
+        state.register_hit(
+            Rect::new(
+                area.x.saturating_add(1),
+                area.y.saturating_add(3 + visual_row as u16),
+                area.width.saturating_sub(2),
+                1,
+            ),
+            target(index),
+        );
+    }
+}
+
+fn register_list_rows(
+    area: Rect,
+    selected: usize,
+    count: usize,
+    target: fn(usize) -> HitTarget,
+    state: &mut UiState,
+) {
+    let visible = area.height.saturating_sub(2) as usize;
+    if visible == 0 || count == 0 {
+        return;
+    }
+    let offset = selected
+        .min(count - 1)
+        .saturating_add(1)
+        .saturating_sub(visible);
+    for (visual_row, index) in (offset..count).take(visible).enumerate() {
+        state.register_hit(
+            Rect::new(
+                area.x.saturating_add(1),
+                area.y.saturating_add(1 + visual_row as u16),
+                area.width.saturating_sub(2),
+                1,
+            ),
+            target(index),
+        );
+    }
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn action_color(action: MouseAction) -> Color {
+    match action {
+        MouseAction::NewDemand | MouseAction::ApproveOrAccept => GOLD,
+        MouseAction::Advance | MouseAction::Plan => CYAN,
+        MouseAction::Execute => ORANGE,
+        MouseAction::Evidence | MouseAction::Complete => GREEN,
+        MouseAction::Block | MouseAction::Quit => RED,
+        MouseAction::CycleActor | MouseAction::Help => PURPLE,
+        MouseAction::ConfirmModal => GREEN,
+        MouseAction::CancelModal => MUTED,
+    }
 }
 
 fn flow_ids(app: &MambaApp) -> Vec<String> {
@@ -1884,6 +2244,71 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("FLOW LEDGER"));
         assert!(content.contains("FLIGHT DECK"));
+
+        let flows_tab = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Tab(View::Flows))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(flows_tab))
+            .await
+            .unwrap();
+        assert_eq!(state.view, View::Flows);
+
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let first_task = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Task(0))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(first_task))
+            .await
+            .unwrap();
+        assert!(state.focus_tasks);
+        state
+            .handle_mouse(&mut app, mouse_scroll(first_task, false))
+            .await
+            .unwrap();
+        assert_eq!(state.task_index, 1);
+
+        state.view = View::Overview;
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let new_demand = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::NewDemand))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(new_demand))
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.modal.as_ref().map(|modal| &modal.purpose),
+            Some(InputPurpose::Demand)
+        ));
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let cancel = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::CancelModal))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(cancel))
+            .await
+            .unwrap();
+        assert!(state.modal.is_none());
     }
 
     #[cfg(unix)]
@@ -2027,5 +2452,27 @@ printf '%s\n' '{"thread_id":"fake-thread"}'
         assert_eq!(shifted(1, 3, 1), 2);
         assert_eq!(shifted(2, 3, 1), 2);
         assert_eq!(shifted(5, 0, -1), 0);
+    }
+
+    fn mouse_down(area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn mouse_scroll(area: Rect, up: bool) -> MouseEvent {
+        MouseEvent {
+            kind: if up {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            },
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 }

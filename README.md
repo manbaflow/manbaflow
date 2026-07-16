@@ -488,6 +488,7 @@ Claude Code / Codex 副驾；它只写入 `.mambaflow/`，不会启动模型：
 
 | 按键 | 操作 |
 | --- | --- |
+| 鼠标点击 / 滚轮 | 切换视图、选择表格行、触发底栏操作、滚动当前列表 |
 | `1`–`5` / `Tab` | 切换总览、Flow、Inbox、阵容和时间线 |
 | `j` / `k` | 移动当前列表选择 |
 | `h` / `l` | 在 Flow Selector 和任务列表之间切换 |
@@ -499,6 +500,9 @@ Claude Code / Codex 副驾；它只写入 `.mambaflow/`，不会启动模型：
 | `e` / `b` / `c` | 添加 Evidence、报告阻塞、Human 最终验收 |
 | `r` | 从 Flow Ledger 重建界面状态 |
 | `?` / `q` | 打开帮助、退出塔台 |
+
+点击顶部当前球权可以轮换 Human；弹窗中的确认和取消也支持鼠标。TUI 启动时启用 Crossterm 鼠标捕获，
+正常退出或发生错误时都会关闭捕获并恢复终端，因此不会把 shell 留在无法选择文本的状态。
 
 建议截图时将终端设为至少 120×36、字体 15–16px，进入总览或 Flow 页后隐藏其他窗口。macOS 可以按
 `Command + Shift + 4`，再按空格选择终端窗口。
@@ -615,6 +619,7 @@ Claude Code 使用[非交互 JSON 输出](https://code.claude.com/docs/en/headle
 - SQLite append-only Flow Ledger，CLI 每次启动都从同一事件流重建状态；
 - Ratatui 塔台总览、Flow 工作台、个人 Inbox、阵容和黑匣子时间线；
 - TUI 后台 Flight、`PASS` / `MAMBA` 放行确认、实时状态回放与 Flight Deck；
+- 基于实时布局 HitMap 的标签、表格、操作带、弹窗点击与滚轮支持；
 - Claude Code / Codex 只读规划与显式执行适配器，以及每次执行的 Black Box。
 
 目前没有自动改派、超时升级、工作日历、租户级 RBAC、动态恢复树、远程 Worker、生产级沙箱、
