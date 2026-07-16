@@ -217,7 +217,7 @@ impl MambaApp {
             .join(&flow_id)
             .join("planner.json");
         let plan = generate_plan(
-            planner.clone(),
+            planner,
             summary,
             &self.state,
             workspace,

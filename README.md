@@ -11,7 +11,7 @@ Todo、阻塞、证据与交付结果，直到通过验收。
 
 > [!IMPORTANT]
 > MambaFlow 目前处于 **v0 / Preflight**。仓库已经包含可运行的 Ratatui 塔台、`mamba` 自动化命令、
-> SQLite Flow Ledger、本地规划器和 Claude Code / Codex 执行终端适配器，但还没有生产级身份系统、
+> SQLite Flow Ledger、本地或 Claude Code / Codex PRD 规划器和执行终端适配器，但还没有生产级身份系统、
 > 远程 Worker、沙箱或 Web Console。请先在测试仓库和非敏感数据上使用。
 
 ## 一句话定位
@@ -493,7 +493,7 @@ Claude Code / Codex 副驾；它只写入 `.mambaflow/`，不会启动模型：
 | `j` / `k` | 移动当前列表选择 |
 | `h` / `l` | 在 Flow Selector 和任务列表之间切换 |
 | `u` | 在已注册 Human 之间切换球权 |
-| `n` | 输入管理需求并生成 PRD、任务 DAG、匹配和工期 |
+| `n` | 输入管理需求，选择 Local / Claude Code / Codex 生成 PRD、任务 DAG、匹配和工期 |
 | `a` | 批准 Flow 或接受 Assignment |
 | `s` | 根据当前状态接单、开工或提交验收 |
 | `p` / `x` | 调用已分配终端进行只读规划 / Human 授权执行 |
@@ -501,8 +501,10 @@ Claude Code / Codex 副驾；它只写入 `.mambaflow/`，不会启动模型：
 | `r` | 从 Flow Ledger 重建界面状态 |
 | `?` / `q` | 打开帮助、退出塔台 |
 
-点击顶部当前球权可以轮换 Human；弹窗中的确认和取消也支持鼠标。TUI 启动时启用 Crossterm 鼠标捕获，
-正常退出或发生错误时都会关闭捕获并恢复终端，因此不会把 shell 留在无法选择文本的状态。
+点击顶部当前球权可以轮换 Human；新需求弹窗中的规划器、确认和取消都支持鼠标，键盘 `Tab` 也可以
+轮换规划器。模型规划在后台执行，Flight Deck 会显示 `PLANNING`，完成后从 Flow Ledger 重建状态并
+自动定位到新 Flow。TUI 启动时启用 Crossterm 鼠标捕获，正常退出或发生错误时都会关闭捕获并恢复
+终端，因此不会把 shell 留在无法选择文本的状态。
 
 建议截图时将终端设为至少 120×36、字体 15–16px，进入总览或 Flow 页后隐藏其他窗口。macOS 可以按
 `Command + Shift + 4`，再按空格选择终端窗口。
@@ -603,6 +605,11 @@ Claude Code 使用[非交互 JSON 输出](https://code.claude.com/docs/en/headle
   --requester "工程师 A" --planner codex
 ```
 
+TUI 中按 `n` 后可直接选择同样的三个规划器。Claude Code / Codex 规划会复用组织中已注册同类终端的
+自定义命令和模型配置；认证由本机已经登录的 CLI 负责，MambaFlow 当前不保存 Anthropic 或 OpenAI
+API Key，也还没有直连 Provider API 的适配层。未安装或未登录对应 CLI 时，模型规划会失败并在状态栏
+给出原因，本地规划器不调用模型。
+
 原始 stdout、stderr、退出码、时间和终端摘要写入
 `.mambaflow/runs/<FLOW-ID>/<RUN-ID>.json`。安全落地和坠机都进入同一条 Flow Ledger；即使终端未安装
 或超时，也会留下可检查的失败黑匣子。v0 还没有 worktree/container 隔离，所以 `execute` 会直接
@@ -618,6 +625,7 @@ Claude Code 使用[非交互 JSON 输出](https://code.claude.com/docs/en/headle
 - Task 的依赖门禁、Heartbeat、阻塞、Evidence、提交和 Human 最终验收；
 - SQLite append-only Flow Ledger，CLI 每次启动都从同一事件流重建状态；
 - Ratatui 塔台总览、Flow 工作台、个人 Inbox、阵容和黑匣子时间线；
+- TUI 内可选 Local / Claude Code / Codex 的后台 PRD 规划与 Flow Ledger 自动回放；
 - TUI 后台 Flight、`PASS` / `MAMBA` 放行确认、实时状态回放与 Flight Deck；
 - 基于实时布局 HitMap 的标签、表格、操作带、弹窗点击与滚轮支持；
 - Claude Code / Codex 只读规划与显式执行适配器，以及每次执行的 Black Box。
@@ -667,6 +675,7 @@ MambaFlow 不是 DeerFlow 的 fork。DeerFlow 可以成为某种 Agent Execution
 - [x] SQLite Flow Ledger、事件回放、能力匹配与基础排期
 - [x] Claude Code / Codex 执行终端
 - [x] Ratatui 组织塔台与 Human Inbox
+- [x] Ratatui 后台模型规划与鼠标操作
 - [ ] RFC-0001：Tenant、Org、Principal 与 Authority 模型
 - [ ] RFC-0002：FlowRun、Task DAG 与事件协议
 - [ ] RFC-0003：WorkRequest、Inbox、Handoff 与 Approval Gate

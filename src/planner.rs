@@ -9,7 +9,7 @@ use crate::executor::{ExecutionRequest, TerminalExecutor};
 use crate::ids::normalize_capability;
 use crate::state::OrganizationState;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlannerKind {
     Local,
@@ -43,13 +43,27 @@ pub async fn generate_plan(
                 PlannerKind::Codex => ExecutorKind::Codex,
                 PlannerKind::Local => unreachable!(),
             };
+            let executor = state
+                .principals
+                .values()
+                .filter(|principal| principal.active)
+                .filter_map(|principal| {
+                    principal
+                        .executor
+                        .as_ref()
+                        .map(|config| (principal, config))
+                })
+                .filter(|(_, config)| config.kind == kind)
+                .min_by(|(left, _), (right, _)| left.name.cmp(&right.name));
+            let command = executor.and_then(|(_, config)| config.command.clone());
+            let model = executor.and_then(|(_, config)| config.model.clone());
             let prompt = planner_prompt(demand, state);
             let schema = serde_json::to_value(schema_for!(PlanDraft))?;
             let output = TerminalExecutor::run(ExecutionRequest {
                 kind,
-                command: None,
+                command,
                 workspace: workspace.to_path_buf(),
-                model: None,
+                model,
                 mode: ExecutorMode::Plan,
                 prompt,
                 output_schema: Some(schema),

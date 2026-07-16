@@ -81,6 +81,7 @@ async fn run_loop(
 ) -> Result<()> {
     let mut state = UiState::new(app, options);
     loop {
+        state.poll_planning(app);
         state.poll_flights(app);
         terminal.draw(|frame| render(frame, app, &mut state))?;
         if event::poll(Duration::from_millis(180))? {
@@ -150,6 +151,7 @@ enum MouseAction {
     Quit,
     ConfirmModal,
     CancelModal,
+    SelectPlanner(PlannerKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,6 +207,25 @@ struct LandedFlight {
     log_path: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+struct ActivePlanning {
+    planner: PlannerKind,
+    actor: String,
+    summary: String,
+    started_at: chrono::DateTime<Local>,
+}
+
+#[derive(Debug)]
+struct PlanningResult {
+    outcome: std::result::Result<PlannedFlow, String>,
+}
+
+#[derive(Debug)]
+struct PlannedFlow {
+    flow_id: String,
+    title: String,
+}
+
 struct UiState {
     view: View,
     flow_index: usize,
@@ -225,11 +246,16 @@ struct UiState {
     flight_rx: mpsc::UnboundedReceiver<FlightResult>,
     last_flight_reload: Instant,
     hit_regions: Vec<HitRegion>,
+    demand_planner: PlannerKind,
+    active_planning: Option<ActivePlanning>,
+    planning_tx: mpsc::UnboundedSender<PlanningResult>,
+    planning_rx: mpsc::UnboundedReceiver<PlanningResult>,
 }
 
 impl UiState {
     fn new(app: &MambaApp, options: TuiOptions) -> Self {
         let (flight_tx, flight_rx) = mpsc::unbounded_channel();
+        let (planning_tx, planning_rx) = mpsc::unbounded_channel();
         let humans = human_ids(app);
         let actor_id = options
             .actor
@@ -258,6 +284,10 @@ impl UiState {
             flight_rx,
             last_flight_reload: Instant::now(),
             hit_regions: Vec::new(),
+            demand_planner: PlannerKind::Local,
+            active_planning: None,
+            planning_tx,
+            planning_rx,
         };
         state.refresh_timeline(app);
         state
@@ -321,12 +351,7 @@ impl UiState {
                 }
                 Err(error) => self.failure(error),
             },
-            KeyCode::Char('n') => {
-                self.modal = Some(InputModal {
-                    purpose: InputPurpose::Demand,
-                    value: String::new(),
-                });
-            }
+            KeyCode::Char('n') => self.open_demand_modal(),
             KeyCode::Char('a') => self.approve_or_accept(app),
             KeyCode::Char('s') => self.advance_task(app),
             KeyCode::Char('c') => self.complete_task(app),
@@ -355,6 +380,9 @@ impl UiState {
                         self.submit_modal(app).await;
                     }
                     Some(HitTarget::Action(MouseAction::CancelModal)) => self.modal = None,
+                    Some(HitTarget::Action(MouseAction::SelectPlanner(planner))) => {
+                        self.demand_planner = planner;
+                    }
                     _ => {}
                 }
             }
@@ -417,12 +445,7 @@ impl UiState {
         action: MouseAction,
     ) -> Result<bool> {
         match action {
-            MouseAction::NewDemand => {
-                self.modal = Some(InputModal {
-                    purpose: InputPurpose::Demand,
-                    value: String::new(),
-                });
-            }
+            MouseAction::NewDemand => self.open_demand_modal(),
             MouseAction::ApproveOrAccept => self.approve_or_accept(app),
             MouseAction::Advance => self.advance_task(app),
             MouseAction::Plan => self.open_run_confirmation(app, ExecutorMode::Plan),
@@ -435,6 +458,7 @@ impl UiState {
             MouseAction::Quit => return Ok(self.request_quit()),
             MouseAction::ConfirmModal => self.submit_modal(app).await,
             MouseAction::CancelModal => self.modal = None,
+            MouseAction::SelectPlanner(planner) => self.demand_planner = planner,
         }
         Ok(false)
     }
@@ -464,6 +488,14 @@ impl UiState {
     async fn handle_modal_key(&mut self, app: &mut MambaApp, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Esc => self.modal = None,
+            KeyCode::Tab
+                if self
+                    .modal
+                    .as_ref()
+                    .is_some_and(|modal| matches!(&modal.purpose, InputPurpose::Demand)) =>
+            {
+                self.demand_planner = next_planner(self.demand_planner);
+            }
             KeyCode::Backspace => {
                 if let Some(modal) = &mut self.modal {
                     modal.value.pop();
@@ -496,6 +528,11 @@ impl UiState {
             return;
         };
 
+        if matches!(&modal.purpose, InputPurpose::Demand) {
+            self.launch_planning(app, value.to_string(), actor);
+            return;
+        }
+
         if let InputPurpose::Run { task_id, mode } = &modal.purpose {
             let expected = confirmation_token(mode);
             if value != expected {
@@ -509,10 +546,7 @@ impl UiState {
         }
 
         let result = match modal.purpose {
-            InputPurpose::Demand => app
-                .create_demand(value, &actor, PlannerKind::Local, &self.workspace, 300)
-                .await
-                .map(|flow| format!("{} 已生成：{}", flow.id, flow.prd.title)),
+            InputPurpose::Demand => unreachable!(),
             InputPurpose::Evidence { task_id } => app
                 .add_evidence(
                     &task_id,
@@ -670,7 +704,108 @@ impl UiState {
         self.finish_action(app, result);
     }
 
+    fn open_demand_modal(&mut self) {
+        if self.active_planning.is_some() {
+            self.failure(MambaError::Validation(
+                "已有 PRD 规划任务运行中，请等待规划结果".to_string(),
+            ));
+            return;
+        }
+        self.modal = Some(InputModal {
+            purpose: InputPurpose::Demand,
+            value: String::new(),
+        });
+    }
+
+    fn launch_planning(&mut self, app: &MambaApp, summary: String, actor: String) {
+        if self.active_planning.is_some() {
+            self.failure(MambaError::Validation(
+                "已有 PRD 规划任务运行中".to_string(),
+            ));
+            return;
+        }
+        let planner = self.demand_planner;
+        self.active_planning = Some(ActivePlanning {
+            planner,
+            actor: actor.clone(),
+            summary: summary.clone(),
+            started_at: Local::now(),
+        });
+        self.success(format!(
+            "{} 正在生成 PRD 与任务 DAG",
+            planner_label(planner)
+        ));
+
+        let data_dir = app.data_dir().to_path_buf();
+        let workspace = self.workspace.clone();
+        let tx = self.planning_tx.clone();
+        tokio::spawn(async move {
+            let outcome = async {
+                let mut worker = MambaApp::open(data_dir).map_err(|error| error.to_string())?;
+                worker
+                    .create_demand(&summary, &actor, planner, &workspace, 300)
+                    .await
+                    .map(|flow| PlannedFlow {
+                        flow_id: flow.id,
+                        title: flow.prd.title,
+                    })
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            let _ = tx.send(PlanningResult { outcome });
+        });
+    }
+
+    fn poll_planning(&mut self, app: &mut MambaApp) {
+        while let Ok(result) = self.planning_rx.try_recv() {
+            self.active_planning = None;
+            if let Err(error) = app.reload() {
+                self.failure(error);
+                continue;
+            }
+            match result.outcome {
+                Ok(flow) => {
+                    self.flow_index = flow_ids(app)
+                        .iter()
+                        .position(|flow_id| flow_id == &flow.flow_id)
+                        .unwrap_or(0);
+                    self.task_index = 0;
+                    self.refresh_timeline(app);
+                    self.success(format!("{} 已生成：{}", flow.flow_id, flow.title));
+                }
+                Err(error) => {
+                    self.failure(MambaError::Validation(format!("PRD 规划失败：{error}")))
+                }
+            }
+        }
+    }
+
     fn open_task_input(&mut self, app: &MambaApp, evidence: bool) {
+        let Some((_, task)) = self.selected_task_context(app) else {
+            self.failure(MambaError::Validation("没有选中的任务".to_string()));
+            return;
+        };
+        self.modal = Some(InputModal {
+            purpose: if evidence {
+                InputPurpose::Evidence {
+                    task_id: task.id.clone(),
+                }
+            } else {
+                InputPurpose::Block {
+                    task_id: task.id.clone(),
+                }
+            },
+            value: String::new(),
+        });
+    }
+
+    fn open_run_confirmation(&mut self, app: &MambaApp, mode: ExecutorMode) {
+        if !self.active_flights.is_empty() {
+            self.failure(MambaError::Validation(
+                "当前已有航班在空中；v0 空域一次只允许一个执行终端".to_string(),
+            ));
+            return;
+        }
         let Some((_, task)) = self.selected_task_context(app) else {
             self.failure(MambaError::Validation("没有选中的任务".to_string()));
             return;
@@ -708,31 +843,6 @@ impl UiState {
             ));
             return;
         }
-        self.modal = Some(InputModal {
-            purpose: if evidence {
-                InputPurpose::Evidence {
-                    task_id: task.id.clone(),
-                }
-            } else {
-                InputPurpose::Block {
-                    task_id: task.id.clone(),
-                }
-            },
-            value: String::new(),
-        });
-    }
-
-    fn open_run_confirmation(&mut self, app: &MambaApp, mode: ExecutorMode) {
-        if !self.active_flights.is_empty() {
-            self.failure(MambaError::Validation(
-                "当前已有航班在空中；v0 空域一次只允许一个执行终端".to_string(),
-            ));
-            return;
-        }
-        let Some((_, task)) = self.selected_task_context(app) else {
-            self.failure(MambaError::Validation("没有选中的任务".to_string()));
-            return;
-        };
         self.modal = Some(InputModal {
             purpose: InputPurpose::Run {
                 task_id: task.id.clone(),
@@ -827,11 +937,11 @@ impl UiState {
     }
 
     fn request_quit(&mut self) -> bool {
-        if self.active_flights.is_empty() {
+        if self.active_flights.is_empty() && self.active_planning.is_none() {
             true
         } else {
             self.failure(MambaError::Validation(
-                "仍有航班在空中；请等待安全落地或坠机记录写入黑匣子".to_string(),
+                "仍有规划或执行任务运行中；请等待结果写入 Flow Ledger".to_string(),
             ));
             false
         }
@@ -984,6 +1094,21 @@ fn render_header(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
                         GREEN
                     } else {
                         ORANGE
+                    })
+                    .bold(),
+            ),
+            Span::styled("  /  规划 ", Style::new().fg(MUTED)),
+            Span::styled(
+                if state.active_planning.is_some() {
+                    "1"
+                } else {
+                    "0"
+                },
+                Style::new()
+                    .fg(if state.active_planning.is_some() {
+                        ORANGE
+                    } else {
+                        GREEN
                     })
                     .bold(),
             ),
@@ -1638,27 +1763,52 @@ fn render_timeline(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area:
 
 fn render_flights(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect) {
     let selected_flow = state.selected_flow(app).map(|flow| flow.id.as_str());
-    let mut items = state
-        .active_flights
-        .values()
-        .filter(|flight| selected_flow.is_none_or(|flow_id| flight.flow_id == flow_id))
-        .map(|flight| {
-            ListItem::new(Text::from(vec![
-                Line::from(vec![
-                    Span::styled("● AIRBORNE ", Style::new().fg(ORANGE).bold()),
-                    Span::styled(executor_mode_label(&flight.mode), Style::new().fg(CYAN)),
-                ]),
-                Line::from(vec![
-                    Span::styled(format!("  {}  ", flight.task_id), Style::new().fg(TEXT)),
-                    Span::styled(flight.actor.clone(), Style::new().fg(MUTED)),
-                ]),
-                Line::styled(
-                    format!("  takeoff {}", flight.started_at.format("%H:%M:%S")),
-                    Style::new().fg(MUTED),
+    let mut items = Vec::new();
+    if let Some(planning) = &state.active_planning {
+        items.push(ListItem::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled("◈ PLANNING ", Style::new().fg(ORANGE).bold()),
+                Span::styled(
+                    planner_label(planning.planner),
+                    Style::new().fg(planner_color(planning.planner)),
                 ),
-            ]))
-        })
-        .collect::<Vec<_>>();
+            ]),
+            Line::styled(
+                format!("  {}", compact_summary(&planning.summary, 30)),
+                Style::new().fg(TEXT),
+            ),
+            Line::styled(
+                format!(
+                    "  {} · {}",
+                    planning.actor,
+                    planning.started_at.format("%H:%M:%S")
+                ),
+                Style::new().fg(MUTED),
+            ),
+        ])));
+    }
+    items.extend(
+        state
+            .active_flights
+            .values()
+            .filter(|flight| selected_flow.is_none_or(|flow_id| flight.flow_id == flow_id))
+            .map(|flight| {
+                ListItem::new(Text::from(vec![
+                    Line::from(vec![
+                        Span::styled("● AIRBORNE ", Style::new().fg(ORANGE).bold()),
+                        Span::styled(executor_mode_label(&flight.mode), Style::new().fg(CYAN)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(format!("  {}  ", flight.task_id), Style::new().fg(TEXT)),
+                        Span::styled(flight.actor.clone(), Style::new().fg(MUTED)),
+                    ]),
+                    Line::styled(
+                        format!("  takeoff {}", flight.started_at.format("%H:%M:%S")),
+                        Style::new().fg(MUTED),
+                    ),
+                ]))
+            }),
+    );
 
     let mut records = app
         .state()
@@ -1806,10 +1956,15 @@ fn render_shortcuts(frame: &mut Frame, state: &mut UiState, area: Rect) {
 }
 
 fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState) {
-    let area = centered(frame.area(), 72, 9);
+    let is_demand = matches!(&modal.purpose, InputPurpose::Demand);
+    let area = centered(frame.area(), 72, if is_demand { 11 } else { 9 });
     frame.render_widget(Clear, area);
     let (title, prompt, color) = match &modal.purpose {
-        InputPurpose::Demand => ("NEW DEMAND / 管理需求", "描述本周需要完成的目标", GOLD),
+        InputPurpose::Demand => (
+            "NEW DEMAND / 管理需求",
+            "描述目标；Tab 或鼠标选择 PRD 规划器",
+            GOLD,
+        ),
         InputPurpose::Evidence { .. } => ("EVIDENCE / 交付证据", "输入证据摘要", GREEN),
         InputPurpose::Block { .. } => ("BLOCK / 请求协防", "输入阻塞原因", RED),
         InputPurpose::Run { mode, .. } => (
@@ -1826,13 +1981,26 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
             },
         ),
     };
-    let [hint, input, footer] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(3),
-        Constraint::Length(2),
-    ])
-    .margin(1)
-    .areas(area);
+    let (hint, planner_area, input, footer) = if is_demand {
+        let [hint, planner, input, footer] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .margin(1)
+        .areas(area);
+        (hint, Some(planner), input, footer)
+    } else {
+        let [hint, input, footer] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .margin(1)
+        .areas(area);
+        (hint, None, input, footer)
+    };
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -1845,6 +2013,9 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
         area,
     );
     frame.render_widget(Paragraph::new(prompt).style(Style::new().fg(MUTED)), hint);
+    if let Some(planner_area) = planner_area {
+        render_planner_selector(frame, planner_area, state);
+    }
     let visible = format!("{}█", modal.value);
     frame.render_widget(
         Paragraph::new(visible)
@@ -1875,6 +2046,34 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
     );
 }
 
+fn render_planner_selector(frame: &mut Frame, area: Rect, state: &mut UiState) {
+    let planners = [
+        (PlannerKind::Local, "LOCAL"),
+        (PlannerKind::ClaudeCode, "CLAUDE CODE"),
+        (PlannerKind::Codex, "CODEX"),
+    ];
+    let areas = Layout::horizontal([Constraint::Ratio(1, 3); 3])
+        .spacing(1)
+        .split(area);
+    for (index, (planner, label)) in planners.into_iter().enumerate() {
+        let selected = state.demand_planner == planner;
+        state.register_hit(
+            areas[index],
+            HitTarget::Action(MouseAction::SelectPlanner(planner)),
+        );
+        frame.render_widget(
+            Paragraph::new(format!("[ {label} ]"))
+                .alignment(Alignment::Center)
+                .style(if selected {
+                    Style::new().fg(BG).bg(planner_color(planner)).bold()
+                } else {
+                    Style::new().fg(MUTED).bg(PANEL_ALT)
+                }),
+            areas[index],
+        );
+    }
+}
+
 fn render_help_modal(frame: &mut Frame) {
     let area = centered(frame.area(), 78, 27);
     frame.render_widget(Clear, area);
@@ -1888,7 +2087,7 @@ fn render_help_modal(frame: &mut Frame) {
         help_line("h / l", "在 Flow 列表与任务列表之间切换球权"),
         help_line("h / l (时间线)", "切换正在审计的 Flow"),
         help_line("u", "切换当前 Human 操作人"),
-        help_line("n", "提出新需求，本地规划器生成 PRD 与 DAG"),
+        help_line("n", "提出新需求，选择 Local / Claude Code / Codex 规划"),
         help_line("a", "批准 Flow，或接受当前 Assignment"),
         help_line("s", "按状态接单、开工或提交验收"),
         help_line("e", "为当前任务补充 Evidence"),
@@ -2025,6 +2224,7 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::CycleActor | MouseAction::Help => PURPLE,
         MouseAction::ConfirmModal => GREEN,
         MouseAction::CancelModal => MUTED,
+        MouseAction::SelectPlanner(planner) => planner_color(planner),
     }
 }
 
@@ -2058,6 +2258,30 @@ fn task_has_executor(app: &MambaApp, task: &Task) -> bool {
                     .any(|copilot| copilot.id == principal.id)
                 || principal.owner_id.as_deref() == Some(assignment.owner.id.as_str()))
     })
+}
+
+fn next_planner(planner: PlannerKind) -> PlannerKind {
+    match planner {
+        PlannerKind::Local => PlannerKind::ClaudeCode,
+        PlannerKind::ClaudeCode => PlannerKind::Codex,
+        PlannerKind::Codex => PlannerKind::Local,
+    }
+}
+
+fn planner_label(planner: PlannerKind) -> &'static str {
+    match planner {
+        PlannerKind::Local => "LOCAL",
+        PlannerKind::ClaudeCode => "CLAUDE CODE",
+        PlannerKind::Codex => "CODEX",
+    }
+}
+
+fn planner_color(planner: PlannerKind) -> Color {
+    match planner {
+        PlannerKind::Local => GOLD,
+        PlannerKind::ClaudeCode => PURPLE,
+        PlannerKind::Codex => CYAN,
+    }
 }
 
 fn confirmation_token(mode: &ExecutorMode) -> &'static str {
@@ -2298,6 +2522,19 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &app, &mut state))
             .unwrap();
+        let codex_planner = state
+            .hit_regions
+            .iter()
+            .find(|region| {
+                region.target == HitTarget::Action(MouseAction::SelectPlanner(PlannerKind::Codex))
+            })
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(codex_planner))
+            .await
+            .unwrap();
+        assert_eq!(state.demand_planner, PlannerKind::Codex);
         let cancel = state
             .hit_regions
             .iter()
@@ -2309,6 +2546,93 @@ mod tests {
             .await
             .unwrap();
         assert!(state.modal.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_runs_in_background_and_creates_structured_flow() {
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("fake-codex-planner");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+result=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    result="$1"
+  fi
+  shift
+done
+printf '%s' '{"prd":{"title":"Model planned launch","summary":"Ship the launch","goals":["ship"],"non_goals":[],"acceptance_criteria":["approved"]},"tasks":[{"key":"approve-launch","title":"Approve launch","description":"Review and approve the launch plan.","required_capabilities":["product"],"depends_on":[],"effort_hours":2.0,"requires_human":true,"acceptance_criteria":["launch approved"]}]}' > "$result"
+printf '%s\n' '{"thread_id":"fake-planner"}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Mamba Labs", "admin").unwrap();
+        let team = app.create_team("Product", "product", "admin").unwrap();
+        let human = app
+            .register_principal(
+                "牢大",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        app.register_principal(
+            "Codex 规划副驾",
+            PrincipalKind::Agent,
+            Some(&team.id),
+            Some(&human.id),
+            "product",
+            100,
+            Some(ExecutorConfig {
+                kind: ExecutorKind::Codex,
+                workspace: directory.path().to_path_buf(),
+                model: None,
+                command: Some(executable),
+            }),
+            "admin",
+        )
+        .unwrap();
+
+        let mut state = UiState::new(
+            &app,
+            TuiOptions {
+                workspace: directory.path().to_path_buf(),
+                actor: Some(human.name.clone()),
+            },
+        );
+        state.demand_planner = PlannerKind::Codex;
+        state.open_demand_modal();
+        state.modal.as_mut().unwrap().value = "Ship the launch".to_string();
+        state.submit_modal(&mut app).await;
+        assert!(state.active_planning.is_some());
+
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            state.poll_planning(&mut app);
+            if state.active_planning.is_none() {
+                break;
+            }
+        }
+
+        assert!(state.active_planning.is_none());
+        assert_eq!(app.state().flows.len(), 1);
+        let flow = app.state().flows.values().next().unwrap();
+        assert_eq!(flow.planner, "codex");
+        assert_eq!(flow.prd.title, "Model planned launch");
+        assert_eq!(flow.tasks.len(), 1);
+        assert!(state.message.contains("已生成"));
     }
 
     #[cfg(unix)]
