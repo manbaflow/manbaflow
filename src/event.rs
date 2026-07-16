@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    Demand, Estimate, Evidence, ExecutionRecord, Flow, Organization, Principal, Team,
+    AttentionKind, Demand, Estimate, Evidence, ExecutionRecord, Flow, Organization, Principal,
+    Team, TrackingAttention,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -88,6 +89,17 @@ pub enum DomainEvent {
         completed_by: String,
         at: DateTime<Utc>,
     },
+    TrackingAttentionRaised {
+        attention: TrackingAttention,
+    },
+    TrackingAttentionResolved {
+        flow_id: String,
+        task_id: String,
+        attention_id: String,
+        kind: AttentionKind,
+        resolved_at: DateTime<Utc>,
+        reason: String,
+    },
     ExecutorStarted {
         flow_id: String,
         task_id: String,
@@ -134,6 +146,8 @@ impl DomainEvent {
             Self::EvidenceAdded { .. } => "task.evidence_added",
             Self::TaskSubmitted { .. } => "task.submitted",
             Self::TaskCompleted { .. } => "task.completed",
+            Self::TrackingAttentionRaised { .. } => "tracking.attention_raised",
+            Self::TrackingAttentionResolved { .. } => "tracking.attention_resolved",
             Self::ExecutorStarted { .. } => "executor.started",
             Self::ExecutorFinished { .. } => "executor.finished",
             Self::ExecutorFailed { .. } => "executor.failed",
@@ -156,9 +170,11 @@ impl DomainEvent {
             | Self::EvidenceAdded { flow_id, .. }
             | Self::TaskSubmitted { flow_id, .. }
             | Self::TaskCompleted { flow_id, .. }
+            | Self::TrackingAttentionResolved { flow_id, .. }
             | Self::ExecutorStarted { flow_id, .. }
             | Self::ExecutorFailed { flow_id, .. }
             | Self::FlowCompleted { flow_id, .. } => Some(flow_id),
+            Self::TrackingAttentionRaised { attention } => Some(&attention.flow_id),
             Self::ExecutorFinished { record } => Some(&record.flow_id),
             Self::OrganizationInitialized { .. }
             | Self::TeamCreated { .. }

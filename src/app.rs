@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::domain::{
     Demand, Evidence, ExecutionRecord, ExecutorConfig, ExecutorMode, Flow, FlowStatus,
-    Organization, Principal, PrincipalKind, TargetKind, Task, TaskStatus, Team,
+    Organization, Principal, PrincipalKind, TargetKind, Task, TaskStatus, Team, TrackingAttention,
+    TrackingScan,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -17,6 +18,7 @@ use crate::planner::{PlannerKind, generate_plan};
 use crate::scheduler::schedule;
 use crate::state::OrganizationState;
 use crate::store::EventStore;
+use crate::tracker;
 
 pub struct MambaApp {
     data_dir: PathBuf,
@@ -328,6 +330,123 @@ impl MambaApp {
             })
             .collect();
         Ok(items)
+    }
+
+    pub fn scan_tracking(&mut self, stale_after_hours: u64, actor: &str) -> Result<TrackingScan> {
+        self.scan_tracking_at(Utc::now(), stale_after_hours, actor)
+    }
+
+    fn scan_tracking_at(
+        &mut self,
+        now: DateTime<Utc>,
+        stale_after_hours: u64,
+        actor: &str,
+    ) -> Result<TrackingScan> {
+        self.state.organization()?;
+        if stale_after_hours == 0 {
+            return Err(MambaError::Validation(
+                "stale-after hours must be greater than zero".into(),
+            ));
+        }
+        let stale_after = i64::try_from(stale_after_hours)
+            .ok()
+            .and_then(Duration::try_hours)
+            .ok_or_else(|| MambaError::Validation("stale-after hours is too large".into()))?;
+        let findings = tracker::evaluate(&self.state, now, stale_after);
+        let desired = findings
+            .into_iter()
+            .map(|finding| {
+                (
+                    (
+                        finding.flow_id.clone(),
+                        finding.task_id.clone(),
+                        finding.kind,
+                    ),
+                    finding,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let current = self
+            .state
+            .active_attentions()
+            .map(|attention| {
+                (
+                    (
+                        attention.flow_id.clone(),
+                        attention.task_id.clone(),
+                        attention.kind,
+                    ),
+                    attention.id.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut events = Vec::new();
+        let mut resolved_ids = Vec::new();
+        for (key, attention_id) in &current {
+            if !desired.contains_key(key) {
+                resolved_ids.push(attention_id.clone());
+                events.push(DomainEvent::TrackingAttentionResolved {
+                    flow_id: key.0.clone(),
+                    task_id: key.1.clone(),
+                    attention_id: attention_id.clone(),
+                    kind: key.2,
+                    resolved_at: now,
+                    reason: "condition cleared by tracker scan".into(),
+                });
+            }
+        }
+
+        let mut raised_ids = Vec::new();
+        for (key, finding) in desired {
+            if !current.contains_key(&key) {
+                let attention = TrackingAttention {
+                    id: new_id("ATTN"),
+                    flow_id: finding.flow_id,
+                    task_id: finding.task_id,
+                    kind: finding.kind,
+                    severity: finding.severity,
+                    summary: finding.summary,
+                    raised_at: now,
+                    resolved_at: None,
+                };
+                raised_ids.push(attention.id.clone());
+                events.push(DomainEvent::TrackingAttentionRaised { attention });
+            }
+        }
+
+        if !events.is_empty() {
+            self.commit(actor, events)?;
+        }
+
+        let collect = |ids: &[String]| {
+            ids.iter()
+                .filter_map(|id| self.state.attentions.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        let mut active = self.state.active_attentions().cloned().collect::<Vec<_>>();
+        active.sort_by(|left, right| {
+            right
+                .severity
+                .cmp(&left.severity)
+                .then_with(|| left.raised_at.cmp(&right.raised_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let scanned_tasks = self
+            .state
+            .flows
+            .values()
+            .filter(|flow| matches!(flow.status, FlowStatus::Approved | FlowStatus::Active))
+            .flat_map(|flow| &flow.tasks)
+            .filter(|task| !task.status.is_terminal())
+            .count();
+        Ok(TrackingScan {
+            scanned_at: now,
+            scanned_tasks,
+            raised: collect(&raised_ids),
+            resolved: collect(&resolved_ids),
+            active,
+        })
     }
 
     pub fn accept_task(&mut self, task_id: &str, actor: &str) -> Result<Task> {
@@ -949,5 +1068,146 @@ mod tests {
             TaskStatus::Completed
         );
         assert!(replayed.timeline(&flow.id).unwrap().len() >= 10);
+    }
+
+    #[tokio::test]
+    async fn tracking_scan_is_idempotent_resolves_and_replays() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Delivery", "product,delivery", "admin")
+            .unwrap();
+        let human = app
+            .register_principal(
+                "Leader",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare a launch brief",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let first_task = flow.tasks[0].id.clone();
+        app.approve_flow(&flow.id, &human.name).unwrap();
+        app.accept_task(&first_task, &human.name).unwrap();
+        app.start_task(&first_task, &human.name).unwrap();
+        app.block_task(&first_task, &human.name, "waiting for access")
+            .unwrap();
+
+        let now = Utc::now();
+        let blocked = app.scan_tracking_at(now, 24, "tower").unwrap();
+        assert_eq!(blocked.raised.len(), 1);
+        assert_eq!(
+            blocked.raised[0].kind,
+            crate::domain::AttentionKind::Blocked
+        );
+        assert_eq!(blocked.active.len(), 1);
+
+        let duplicate = app.scan_tracking_at(now, 24, "tower").unwrap();
+        assert!(duplicate.raised.is_empty());
+        assert!(duplicate.resolved.is_empty());
+        assert_eq!(duplicate.active[0].id, blocked.active[0].id);
+
+        app.start_task(&first_task, &human.name).unwrap();
+        let cleared = app.scan_tracking_at(Utc::now(), 24, "tower").unwrap();
+        assert!(cleared.raised.is_empty());
+        assert_eq!(cleared.resolved.len(), 1);
+        assert!(cleared.active.is_empty());
+
+        let future = flow.p80_finish + Duration::hours(48);
+        let at_risk = app.scan_tracking_at(future, 24, "tower").unwrap();
+        assert!(
+            at_risk
+                .active
+                .iter()
+                .any(|attention| attention.kind == crate::domain::AttentionKind::StaleHeartbeat)
+        );
+        assert!(at_risk.active.iter().any(|attention| {
+            attention.kind == crate::domain::AttentionKind::AcceptanceWaiting
+        }));
+        assert!(
+            at_risk
+                .active
+                .iter()
+                .any(|attention| attention.kind == crate::domain::AttentionKind::Overdue)
+        );
+        let mut active_ids = at_risk
+            .active
+            .iter()
+            .map(|attention| attention.id.clone())
+            .collect::<Vec<_>>();
+        active_ids.sort();
+
+        drop(app);
+        let mut replayed = MambaApp::open(&data_dir).unwrap();
+        let mut replayed_ids = replayed
+            .state()
+            .active_attentions()
+            .map(|attention| attention.id.clone())
+            .collect::<Vec<_>>();
+        replayed_ids.sort();
+        assert_eq!(replayed_ids, active_ids);
+        assert!(
+            replayed
+                .state()
+                .attentions
+                .values()
+                .any(
+                    |attention| attention.kind == crate::domain::AttentionKind::Blocked
+                        && !attention.is_active()
+                )
+        );
+
+        let recovered = replayed.scan_tracking_at(Utc::now(), 24, "tower").unwrap();
+        assert_eq!(recovered.resolved.len(), active_ids.len());
+        assert!(recovered.active.is_empty());
+
+        replayed
+            .add_evidence(
+                &first_task,
+                &human.name,
+                "document",
+                "docs/release.md",
+                "release evidence",
+            )
+            .unwrap();
+        replayed.submit_task(&first_task, &human.name).unwrap();
+        let awaiting_review = replayed
+            .scan_tracking_at(Utc::now() + Duration::hours(25), 24, "tower")
+            .unwrap();
+        assert!(
+            awaiting_review
+                .active
+                .iter()
+                .any(|attention| { attention.kind == crate::domain::AttentionKind::ReviewWaiting })
+        );
+        replayed.complete_task(&first_task, &human.name).unwrap();
+        let reviewed = replayed.scan_tracking_at(Utc::now(), 24, "tower").unwrap();
+        assert!(reviewed.active.is_empty());
+        drop(replayed);
+
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        assert_eq!(replayed.state().active_attentions().count(), 0);
+        assert!(
+            replayed
+                .timeline(&flow.id)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "tracking.attention_resolved")
+        );
     }
 }

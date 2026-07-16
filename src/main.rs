@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use manbaflow::domain::{ExecutorConfig, ExecutorKind, ExecutorMode, Flow, PrincipalKind, Task};
+use manbaflow::domain::{
+    ExecutorConfig, ExecutorKind, ExecutorMode, Flow, PrincipalKind, Task, TrackingAttention,
+};
 use manbaflow::planner::PlannerKind;
 use manbaflow::{MambaApp, Result};
 use serde::Serialize;
@@ -67,6 +69,11 @@ enum Command {
     Inbox {
         #[arg(long = "for")]
         target: String,
+    },
+    /// 扫描 Todo 风险并查看塔台 Attention
+    Track {
+        #[command(subcommand)]
+        command: TrackCommand,
     },
     /// 从 Flow Ledger 查看完整事件时间线
     Timeline { flow: String },
@@ -270,6 +277,24 @@ enum ExecutorCommand {
         kind: ExecutorKindArg,
         #[arg(long)]
         executable: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrackCommand {
+    /// 扫描未接单、失联、阻塞、待验收和超期任务
+    Scan {
+        #[arg(long, default_value_t = 24)]
+        stale_hours: u64,
+        #[arg(long, default_value = "tower://local")]
+        by: String,
+    },
+    /// 查看活动提醒；使用 --all 包含已解除记录
+    List {
+        #[arg(long)]
+        flow: Option<String>,
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -565,6 +590,52 @@ async fn run(cli: Cli) -> Result<()> {
                 .join("\n");
             output(&value, cli.json, text);
         }
+        Command::Track { command } => match command {
+            TrackCommand::Scan { stale_hours, by } => {
+                let scan = app.scan_tracking(stale_hours, &by)?;
+                let text = format!(
+                    "塔台扫描 {} 个 Todo：新增 {}，解除 {}，活动 {}\n{}",
+                    scan.scanned_tasks,
+                    scan.raised.len(),
+                    scan.resolved.len(),
+                    scan.active.len(),
+                    scan.active
+                        .iter()
+                        .map(tracking_attention_line)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                output(&scan, cli.json, text.trim_end().to_string());
+            }
+            TrackCommand::List { flow, all } => {
+                if let Some(flow_id) = &flow {
+                    app.state().flow(flow_id)?;
+                }
+                let mut attentions = app
+                    .state()
+                    .attentions
+                    .values()
+                    .filter(|attention| all || attention.is_active())
+                    .filter(|attention| {
+                        flow.as_deref()
+                            .is_none_or(|flow_id| attention.flow_id == flow_id)
+                    })
+                    .collect::<Vec<_>>();
+                attentions.sort_by(|left, right| {
+                    right
+                        .severity
+                        .cmp(&left.severity)
+                        .then_with(|| right.raised_at.cmp(&left.raised_at))
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                let text = attentions
+                    .iter()
+                    .map(|attention| tracking_attention_line(attention))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                output(&attentions, cli.json, text);
+            }
+        },
         Command::Timeline { flow } => {
             let events = app.timeline(&flow)?;
             let text = events
@@ -755,6 +826,23 @@ fn task_summary(task: &Task) -> String {
     format!(
         "{}\t{:?}\t{}\t{}\tP50 {:.1}h/P80 {:.1}h",
         task.id, task.status, owner, task.title, task.estimate.p50_hours, task.estimate.p80_hours
+    )
+}
+
+fn tracking_attention_line(attention: &TrackingAttention) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        attention.id,
+        if attention.is_active() {
+            "active"
+        } else {
+            "resolved"
+        },
+        attention.severity,
+        attention.kind,
+        attention.flow_id,
+        attention.task_id,
+        attention.summary
     )
 }
 

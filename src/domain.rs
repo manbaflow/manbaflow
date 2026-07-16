@@ -229,6 +229,71 @@ impl Flow {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    AcceptanceWaiting,
+    StaleHeartbeat,
+    Blocked,
+    ReviewWaiting,
+    Overdue,
+}
+
+impl std::fmt::Display for AttentionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AcceptanceWaiting => write!(f, "acceptance_waiting"),
+            Self::StaleHeartbeat => write!(f, "stale_heartbeat"),
+            Self::Blocked => write!(f, "blocked"),
+            Self::ReviewWaiting => write!(f, "review_waiting"),
+            Self::Overdue => write!(f, "overdue"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionSeverity {
+    Warning,
+    Critical,
+}
+
+impl std::fmt::Display for AttentionSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Warning => write!(f, "warning"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackingAttention {
+    pub id: String,
+    pub flow_id: String,
+    pub task_id: String,
+    pub kind: AttentionKind,
+    pub severity: AttentionSeverity,
+    pub summary: String,
+    pub raised_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+impl TrackingAttention {
+    pub fn is_active(&self) -> bool {
+        self.resolved_at.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackingScan {
+    pub scanned_at: DateTime<Utc>,
+    pub scanned_tasks: usize,
+    pub raised: Vec<TrackingAttention>,
+    pub resolved: Vec<TrackingAttention>,
+    pub active: Vec<TrackingAttention>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorMode {

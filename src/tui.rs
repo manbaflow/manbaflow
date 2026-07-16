@@ -81,6 +81,7 @@ async fn run_loop(
 ) -> Result<()> {
     let mut state = UiState::new(app, options);
     loop {
+        state.poll_tracking(app);
         state.poll_planning(app);
         state.poll_flights(app);
         terminal.draw(|frame| render(frame, app, &mut state))?;
@@ -146,6 +147,7 @@ enum MouseAction {
     Evidence,
     Block,
     Complete,
+    ScanTracker,
     CycleActor,
     Help,
     Quit,
@@ -250,6 +252,7 @@ struct UiState {
     active_planning: Option<ActivePlanning>,
     planning_tx: mpsc::UnboundedSender<PlanningResult>,
     planning_rx: mpsc::UnboundedReceiver<PlanningResult>,
+    last_tracking_scan: Option<Instant>,
 }
 
 impl UiState {
@@ -288,6 +291,7 @@ impl UiState {
             active_planning: None,
             planning_tx,
             planning_rx,
+            last_tracking_scan: None,
         };
         state.refresh_timeline(app);
         state
@@ -359,6 +363,7 @@ impl UiState {
             KeyCode::Char('b') => self.open_task_input(app, false),
             KeyCode::Char('p') => self.open_run_confirmation(app, ExecutorMode::Plan),
             KeyCode::Char('x') => self.open_run_confirmation(app, ExecutorMode::Execute),
+            KeyCode::Char('t') => self.scan_tracker(app, true),
             _ => {}
         }
         Ok(false)
@@ -453,6 +458,7 @@ impl UiState {
             MouseAction::Evidence => self.open_task_input(app, true),
             MouseAction::Block => self.open_task_input(app, false),
             MouseAction::Complete => self.complete_task(app),
+            MouseAction::ScanTracker => self.scan_tracker(app, true),
             MouseAction::CycleActor => self.cycle_actor(app),
             MouseAction::Help => self.show_help = true,
             MouseAction::Quit => return Ok(self.request_quit()),
@@ -777,6 +783,38 @@ impl UiState {
                     self.failure(MambaError::Validation(format!("PRD 规划失败：{error}")))
                 }
             }
+        }
+    }
+
+    fn poll_tracking(&mut self, app: &mut MambaApp) {
+        if app.state().organization.is_none() {
+            return;
+        }
+        if self
+            .last_tracking_scan
+            .is_some_and(|last_scan| last_scan.elapsed() < Duration::from_secs(30))
+        {
+            return;
+        }
+        self.scan_tracker(app, false);
+    }
+
+    fn scan_tracker(&mut self, app: &mut MambaApp, announce: bool) {
+        self.last_tracking_scan = Some(Instant::now());
+        match app.scan_tracking(24, "tower://local") {
+            Ok(scan) if !scan.raised.is_empty() => self.success(format!(
+                "Tower Tracker 新增 {} 项 Attention，当前共 {} 项",
+                scan.raised.len(),
+                scan.active.len()
+            )),
+            Ok(scan) if announce || !scan.resolved.is_empty() => self.success(format!(
+                "Tower Tracker 已扫描 {} 个 Todo：解除 {}，活动 {}",
+                scan.scanned_tasks,
+                scan.resolved.len(),
+                scan.active.len()
+            )),
+            Ok(_) => {}
+            Err(error) => self.failure(error),
         }
     }
 
@@ -1180,11 +1218,7 @@ fn render_overview(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area:
         .iter()
         .filter(|flow| matches!(flow.status, FlowStatus::Approved | FlowStatus::Active))
         .count();
-    let blocked = flows
-        .iter()
-        .flat_map(|flow| &flow.tasks)
-        .filter(|task| task.status == TaskStatus::Blocked)
-        .count();
+    let attentions = app.state().active_attentions().count();
     let landed = flows
         .iter()
         .flat_map(|flow| &flow.tasks)
@@ -1192,7 +1226,7 @@ fn render_overview(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area:
         .count();
     render_metric(frame, metric_areas[0], "TOTAL FLOWS", flows.len(), GOLD);
     render_metric(frame, metric_areas[1], "AIRBORNE", active, CYAN);
-    render_metric(frame, metric_areas[2], "BLOCKED", blocked, RED);
+    render_metric(frame, metric_areas[2], "ATTENTION", attentions, RED);
     render_metric(frame, metric_areas[3], "LANDED", landed, GREEN);
 
     if area.width >= 92 {
@@ -1201,14 +1235,14 @@ fn render_overview(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area:
                 .spacing(1)
                 .areas(main);
         render_flow_table(frame, app, state, left, true);
-        render_tower_brief(frame, state.selected_flow(app), right);
+        render_tower_brief(frame, app, state.selected_flow(app), right);
     } else {
         let [top, bottom] =
             Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)])
                 .spacing(1)
                 .areas(main);
         render_flow_table(frame, app, state, top, true);
-        render_tower_brief(frame, state.selected_flow(app), bottom);
+        render_tower_brief(frame, app, state.selected_flow(app), bottom);
     }
 }
 
@@ -1279,7 +1313,7 @@ fn render_flow_table(
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
-fn render_tower_brief(frame: &mut Frame, flow: Option<&Flow>, area: Rect) {
+fn render_tower_brief(frame: &mut Frame, app: &MambaApp, flow: Option<&Flow>, area: Rect) {
     let Some(flow) = flow else {
         frame.render_widget(
             Paragraph::new("按 n 提出第一个需求。")
@@ -1290,11 +1324,18 @@ fn render_tower_brief(frame: &mut Frame, flow: Option<&Flow>, area: Rect) {
         );
         return;
     };
-    let blocked = flow
-        .tasks
-        .iter()
-        .filter(|task| task.status == TaskStatus::Blocked)
-        .count();
+    let mut attentions = app
+        .state()
+        .active_attentions()
+        .filter(|attention| attention.flow_id == flow.id)
+        .collect::<Vec<_>>();
+    attentions.sort_by(|left, right| {
+        right
+            .severity
+            .cmp(&left.severity)
+            .then_with(|| left.raised_at.cmp(&right.raised_at))
+    });
+    let attention_count = attentions.len();
     let completed = flow
         .tasks
         .iter()
@@ -1320,12 +1361,16 @@ fn render_tower_brief(frame: &mut Frame, flow: Option<&Flow>, area: Rect) {
         Line::from(vec![
             Span::styled("风险  ", Style::new().fg(MUTED)),
             Span::styled(
-                if blocked == 0 {
+                if attention_count == 0 {
                     "空域正常".to_string()
                 } else {
-                    format!("{blocked} 个阻塞")
+                    format!(
+                        "{} 项 · {}",
+                        attention_count,
+                        compact_summary(&attentions[0].summary, 30)
+                    )
                 },
-                Style::new().fg(if blocked == 0 { GREEN } else { RED }),
+                Style::new().fg(if attention_count == 0 { GREEN } else { RED }),
             ),
         ]),
     ];
@@ -1902,6 +1947,7 @@ fn render_shortcuts(frame: &mut Frame, state: &mut UiState, area: Rect) {
         View::Overview => &[
             ("新需求", MouseAction::NewDemand),
             ("批准", MouseAction::ApproveOrAccept),
+            ("巡航", MouseAction::ScanTracker),
         ],
         View::Flows => &[
             ("批准/接单", MouseAction::ApproveOrAccept),
@@ -2088,6 +2134,7 @@ fn render_help_modal(frame: &mut Frame) {
         help_line("h / l (时间线)", "切换正在审计的 Flow"),
         help_line("u", "切换当前 Human 操作人"),
         help_line("n", "提出新需求，选择 Local / Claude Code / Codex 规划"),
+        help_line("t", "立即巡航扫描 Todo 风险；后台每 30 秒自动扫描"),
         help_line("a", "批准 Flow，或接受当前 Assignment"),
         help_line("s", "按状态接单、开工或提交验收"),
         help_line("e", "为当前任务补充 Evidence"),
@@ -2221,6 +2268,7 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::Execute => ORANGE,
         MouseAction::Evidence | MouseAction::Complete => GREEN,
         MouseAction::Block | MouseAction::Quit => RED,
+        MouseAction::ScanTracker => ORANGE,
         MouseAction::CycleActor | MouseAction::Help => PURPLE,
         MouseAction::ConfirmModal => GREEN,
         MouseAction::CancelModal => MUTED,
@@ -2372,10 +2420,16 @@ fn task_status_style(status: &TaskStatus) -> Style {
 }
 
 fn event_style(kind: &str) -> Style {
-    let color = if kind.contains("failed") || kind.contains("blocked") || kind.contains("rejected")
+    let color = if kind.contains("failed")
+        || kind.contains("blocked")
+        || kind.contains("rejected")
+        || kind.contains("attention_raised")
     {
         RED
-    } else if kind.contains("completed") || kind.contains("finished") {
+    } else if kind.contains("completed")
+        || kind.contains("finished")
+        || kind.contains("attention_resolved")
+    {
         GREEN
     } else if kind.contains("approved") || kind.contains("accepted") {
         GOLD
@@ -2454,6 +2508,20 @@ mod tests {
         assert!(content.contains("Mamba Labs"));
         assert!(content.contains("Prepare launch brief"));
         assert!(content.contains("TOWER BRIEF"));
+        assert!(content.contains("ATTENTION"));
+
+        let scan_tracker = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::ScanTracker))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(scan_tracker))
+            .await
+            .unwrap();
+        assert!(state.last_tracking_scan.is_some());
+        assert!(state.message.contains("Tower Tracker"));
 
         state.view = View::Timeline;
         terminal

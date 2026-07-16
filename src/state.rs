@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::domain::{ExecutionRecord, Flow, FlowStatus, Organization, Principal, TaskStatus, Team};
+use crate::domain::{
+    ExecutionRecord, Flow, FlowStatus, Organization, Principal, TaskStatus, Team, TrackingAttention,
+};
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 
@@ -11,6 +13,7 @@ pub struct OrganizationState {
     pub principals: BTreeMap<String, Principal>,
     pub flows: BTreeMap<String, Flow>,
     pub executions: BTreeMap<String, ExecutionRecord>,
+    pub attentions: BTreeMap<String, TrackingAttention>,
     pub last_sequence: i64,
 }
 
@@ -153,6 +156,42 @@ impl OrganizationState {
                 task.blocker = None;
                 task.last_heartbeat = Some(*at);
             }
+            DomainEvent::TrackingAttentionRaised { attention } => {
+                self.flow(&attention.flow_id)?
+                    .task(&attention.task_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "task",
+                        id: attention.task_id.clone(),
+                    })?;
+                self.attentions
+                    .insert(attention.id.clone(), attention.clone());
+            }
+            DomainEvent::TrackingAttentionResolved {
+                flow_id,
+                task_id,
+                attention_id,
+                kind,
+                resolved_at,
+                ..
+            } => {
+                let attention =
+                    self.attentions
+                        .get_mut(attention_id)
+                        .ok_or_else(|| MambaError::NotFound {
+                            entity: "tracking attention",
+                            id: attention_id.clone(),
+                        })?;
+                if attention.flow_id != *flow_id
+                    || attention.task_id != *task_id
+                    || attention.kind != *kind
+                {
+                    return Err(MambaError::Validation(format!(
+                        "tracking attention {} resolution does not match its source",
+                        attention_id
+                    )));
+                }
+                attention.resolved_at = Some(*resolved_at);
+            }
             DomainEvent::ExecutorStarted { .. } | DomainEvent::ExecutorFailed { .. } => {}
             DomainEvent::ExecutorFinished { record } => {
                 self.executions.insert(record.id.clone(), record.clone());
@@ -224,6 +263,12 @@ impl OrganizationState {
                 entity: "task",
                 id: task_id.to_string(),
             })
+    }
+
+    pub fn active_attentions(&self) -> impl Iterator<Item = &TrackingAttention> {
+        self.attentions
+            .values()
+            .filter(|attention| attention.is_active())
     }
 
     fn task_mut(&mut self, flow_id: &str, task_id: &str) -> Result<&mut crate::domain::Task> {
