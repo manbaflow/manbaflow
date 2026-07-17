@@ -32,7 +32,8 @@ rm -rf .mambaflow-showcase
 
 装载后停留在 `总览 OVERVIEW`。第一屏同时显示 Active Flows、Task Progress、At Risk、Waiting Human、
 Open Flights、Flow Health 和 Action Queue。重点说明：管理员看到的是整个组织的交付状态和下一步动作，
-不是某个 Agent 的聊天记录。
+不是某个 Agent 的聊天记录。`OUTBOX` 同时显示等待投递或失败的企业通知；没有配置 Endpoint 时保持为零。
+配置 Endpoint 后，底部 `投递通知` 可以现场触发一次非阻塞投递，落地或坠机结果会回到同一条时间线。
 
 当前三条 Flow 分别是：
 

@@ -109,6 +109,47 @@ pub struct WorkCalendar {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationEndpoint {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub event_kinds: Vec<String>,
+    pub secret_env: String,
+    pub active: bool,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub disabled_by: Option<String>,
+    pub disabled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationStatus {
+    Pending,
+    Delivered,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NotificationDelivery {
+    pub id: String,
+    pub organization_id: String,
+    pub endpoint_id: String,
+    pub source_event_kind: String,
+    pub flow_id: Option<String>,
+    pub actor: String,
+    pub payload: serde_json::Value,
+    pub status: NotificationStatus,
+    pub attempts: u32,
+    pub queued_at: DateTime<Utc>,
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+    pub response_status: Option<u16>,
+    pub last_error: Option<String>,
+}
+
 impl WorkCalendar {
     pub fn always_available(principal_id: String, created_at: DateTime<Utc>) -> Self {
         Self {

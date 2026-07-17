@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{FlightLeaseStatus, FlowStatus, TaskStatus};
+use crate::domain::{FlightLeaseStatus, FlowStatus, NotificationStatus, TaskStatus};
 use crate::state::OrganizationState;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub struct DashboardMetrics {
     pub awaiting_human: usize,
     pub active_attentions: usize,
     pub open_flights: usize,
+    pub pending_notifications: usize,
+    pub failed_notifications: usize,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -299,6 +301,16 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
             awaiting_human,
             active_attentions: state.active_attentions().count(),
             open_flights,
+            pending_notifications: state
+                .notification_deliveries
+                .values()
+                .filter(|delivery| delivery.status == NotificationStatus::Pending)
+                .count(),
+            failed_notifications: state
+                .notification_deliveries
+                .values()
+                .filter(|delivery| delivery.status == NotificationStatus::Failed)
+                .count(),
         },
         flows,
         action_items,

@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     ApiCredential, Assignment, AttentionKind, AvailabilityBlock, Demand, Estimate, Evidence,
     ExecutionRecord, ExternalArtifact, FlightLease, Flow, FlowChangeRequest, FlowMessage,
-    FlowScheduleRevision, MessageAcknowledgement, Organization, PrdDraft, Principal,
-    RemoteFlightReport, Task, Team, TrackingAttention, TrackingEscalation, WorkCalendar,
+    FlowScheduleRevision, MessageAcknowledgement, NotificationDelivery, NotificationEndpoint,
+    Organization, PrdDraft, Principal, RemoteFlightReport, Task, Team, TrackingAttention,
+    TrackingEscalation, WorkCalendar,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -31,6 +32,30 @@ pub enum DomainEvent {
         block_id: String,
         cancelled_by: String,
         cancelled_at: DateTime<Utc>,
+    },
+    NotificationEndpointRegistered {
+        endpoint: NotificationEndpoint,
+    },
+    NotificationEndpointDisabled {
+        endpoint_id: String,
+        disabled_by: String,
+        disabled_at: DateTime<Utc>,
+    },
+    NotificationQueued {
+        delivery: Box<NotificationDelivery>,
+    },
+    NotificationDelivered {
+        delivery_id: String,
+        flow_id: Option<String>,
+        response_status: u16,
+        delivered_at: DateTime<Utc>,
+    },
+    NotificationFailed {
+        delivery_id: String,
+        flow_id: Option<String>,
+        response_status: Option<u16>,
+        error: String,
+        attempted_at: DateTime<Utc>,
     },
     ApiCredentialIssued {
         credential: ApiCredential,
@@ -252,6 +277,11 @@ impl DomainEvent {
             Self::WorkCalendarConfigured { .. } => "calendar.configured",
             Self::TimeOffAdded { .. } => "calendar.time_off_added",
             Self::TimeOffCancelled { .. } => "calendar.time_off_cancelled",
+            Self::NotificationEndpointRegistered { .. } => "notification.endpoint_registered",
+            Self::NotificationEndpointDisabled { .. } => "notification.endpoint_disabled",
+            Self::NotificationQueued { .. } => "notification.queued",
+            Self::NotificationDelivered { .. } => "notification.delivered",
+            Self::NotificationFailed { .. } => "notification.failed",
             Self::ApiCredentialIssued { .. } => "api_credential.issued",
             Self::ApiCredentialRevoked { .. } => "api_credential.revoked",
             Self::DemandCreated { .. } => "demand.created",
@@ -323,6 +353,9 @@ impl DomainEvent {
             | Self::RemoteFlightRevoked { flow_id, .. }
             | Self::RemoteFlightFinished { flow_id, .. }
             | Self::FlowCompleted { flow_id, .. } => Some(flow_id),
+            Self::NotificationQueued { delivery } => delivery.flow_id.as_deref(),
+            Self::NotificationDelivered { flow_id, .. }
+            | Self::NotificationFailed { flow_id, .. } => flow_id.as_deref(),
             Self::TrackingAttentionRaised { attention } => Some(&attention.flow_id),
             Self::TrackingEscalationRaised { escalation } => Some(&escalation.flow_id),
             Self::FlowMessagePosted { message } => Some(&message.flow_id),
@@ -335,6 +368,8 @@ impl DomainEvent {
             | Self::WorkCalendarConfigured { .. }
             | Self::TimeOffAdded { .. }
             | Self::TimeOffCancelled { .. }
+            | Self::NotificationEndpointRegistered { .. }
+            | Self::NotificationEndpointDisabled { .. }
             | Self::ApiCredentialIssued { .. }
             | Self::ApiCredentialRevoked { .. }
             | Self::ExternalDeliveryProcessed { .. } => None,

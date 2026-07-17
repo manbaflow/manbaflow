@@ -89,6 +89,7 @@ async fn run_loop(
         state.poll_tracking(app);
         state.poll_planning(app);
         state.poll_flights(app);
+        state.poll_notification_outbox(app);
         terminal.draw(|frame| render(frame, app, &mut state))?;
         if event::poll(Duration::from_millis(180))? {
             match event::read()? {
@@ -159,6 +160,7 @@ enum MouseAction {
     RequestChange,
     RejectChange,
     ScanTracker,
+    DispatchNotifications,
     AcknowledgeEscalation,
     CycleActor,
     Quit,
@@ -269,6 +271,13 @@ struct PlannedFlow {
     title: String,
 }
 
+#[derive(Debug)]
+struct NotificationResult {
+    delivery_id: String,
+    attempt: crate::notification::NotificationAttempt,
+    manual: bool,
+}
+
 struct UiState {
     view: View,
     flow_index: usize,
@@ -293,12 +302,17 @@ struct UiState {
     planning_tx: mpsc::UnboundedSender<PlanningResult>,
     planning_rx: mpsc::UnboundedReceiver<PlanningResult>,
     last_tracking_scan: Option<Instant>,
+    notification_tx: mpsc::UnboundedSender<NotificationResult>,
+    notification_rx: mpsc::UnboundedReceiver<NotificationResult>,
+    active_notification: Option<String>,
+    last_notification_dispatch: Instant,
 }
 
 impl UiState {
     fn new(app: &MambaApp, options: TuiOptions) -> Self {
         let (flight_tx, flight_rx) = mpsc::unbounded_channel();
         let (planning_tx, planning_rx) = mpsc::unbounded_channel();
+        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
         let humans = human_ids(app);
         let flow_index = initial_flow_index(app);
         let actor_id = options
@@ -332,6 +346,10 @@ impl UiState {
             planning_tx,
             planning_rx,
             last_tracking_scan: None,
+            notification_tx,
+            notification_rx,
+            active_notification: None,
+            last_notification_dispatch: Instant::now() - Duration::from_secs(15),
         };
         state.refresh_timeline(app);
         state
@@ -445,6 +463,7 @@ impl UiState {
             MouseAction::RequestChange => self.open_flow_change_input(app),
             MouseAction::RejectChange => self.open_reject_change_input(app),
             MouseAction::ScanTracker => self.scan_tracker(app, true),
+            MouseAction::DispatchNotifications => self.dispatch_notification_now(app),
             MouseAction::AcknowledgeEscalation => self.acknowledge_next_inbox(app),
             MouseAction::CycleActor => self.cycle_actor(app),
             MouseAction::Quit => return Ok(self.request_quit()),
@@ -929,6 +948,67 @@ impl UiState {
             }
             Err(error) => self.failure(error),
         }
+    }
+
+    fn poll_notification_outbox(&mut self, app: &mut MambaApp) {
+        while let Ok(result) = self.notification_rx.try_recv() {
+            self.active_notification = None;
+            let delivered = result.attempt.delivered;
+            match app.record_notification_attempt(
+                &result.delivery_id,
+                result.attempt,
+                "tower://tui-notification-dispatcher",
+            ) {
+                Ok(delivery) if result.manual || !delivered => {
+                    if delivered {
+                        self.success(format!("{} 通知安全落地", delivery.id));
+                    } else {
+                        self.failure(MambaError::Validation(format!(
+                            "{} 通知坠机：{}",
+                            delivery.id,
+                            delivery.last_error.as_deref().unwrap_or("未知错误")
+                        )));
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => self.failure(error),
+            }
+            self.last_notification_dispatch = Instant::now() - Duration::from_secs(15);
+            self.refresh_timeline(app);
+        }
+        if self.active_notification.is_none()
+            && self.last_notification_dispatch.elapsed() >= Duration::from_secs(15)
+        {
+            self.launch_notification(app, false);
+        }
+    }
+
+    fn dispatch_notification_now(&mut self, app: &MambaApp) {
+        if self.active_notification.is_some() {
+            self.failure(MambaError::InvalidTransition("已有通知正在投递".into()));
+        } else if !self.launch_notification(app, true) {
+            self.success("Notification Outbox 当前没有待投递记录");
+        }
+    }
+
+    fn launch_notification(&mut self, app: &MambaApp, manual: bool) -> bool {
+        let Some((endpoint, delivery)) = app.notification_attempts(1, manual).into_iter().next()
+        else {
+            self.last_notification_dispatch = Instant::now();
+            return false;
+        };
+        self.active_notification = Some(delivery.id.clone());
+        self.last_notification_dispatch = Instant::now();
+        let sender = self.notification_tx.clone();
+        tokio::spawn(async move {
+            let attempt = crate::notification::deliver(&endpoint, &delivery).await;
+            let _ = sender.send(NotificationResult {
+                delivery_id: delivery.id,
+                attempt,
+                manual,
+            });
+        });
+        true
     }
 
     fn acknowledge_next_inbox(&mut self, app: &mut MambaApp) {
@@ -1517,7 +1597,7 @@ fn render_overview(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area:
     ])
     .spacing(1)
     .areas(area);
-    let metric_areas = Layout::horizontal([Constraint::Ratio(1, 5); 5])
+    let metric_areas = Layout::horizontal([Constraint::Ratio(1, 6); 6])
         .spacing(1)
         .split(metrics);
     let dashboard = build_dashboard(app.state());
@@ -1563,6 +1643,20 @@ fn render_overview(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area:
         "OPEN FLIGHTS",
         (dashboard.metrics.open_flights + state.active_flights.len()).to_string(),
         GOLD,
+    );
+    let outbox = dashboard.metrics.pending_notifications + dashboard.metrics.failed_notifications;
+    render_metric(
+        frame,
+        metric_areas[5],
+        "OUTBOX",
+        outbox.to_string(),
+        if dashboard.metrics.failed_notifications > 0 {
+            RED
+        } else if outbox > 0 {
+            ORANGE
+        } else {
+            GREEN
+        },
     );
 
     if compact {
@@ -2684,6 +2778,7 @@ fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
             ("变更", MouseAction::RequestChange),
             ("批准", MouseAction::ApproveOrAccept),
             ("巡航", MouseAction::ScanTracker),
+            ("投递通知", MouseAction::DispatchNotifications),
         ],
         View::Flows => vec![
             ("批准/接单", MouseAction::ApproveOrAccept),
@@ -3062,6 +3157,7 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::RejectChange => RED,
         MouseAction::Block | MouseAction::Quit => RED,
         MouseAction::ScanTracker => ORANGE,
+        MouseAction::DispatchNotifications => CYAN,
         MouseAction::AcknowledgeEscalation => GOLD,
         MouseAction::CycleActor => PURPLE,
         MouseAction::ConfirmModal => GREEN,
@@ -3276,10 +3372,11 @@ fn event_style(kind: &str) -> Style {
     } else if kind.contains("completed")
         || kind.contains("finished")
         || kind.contains("landed")
+        || kind.contains("delivered")
         || kind.contains("attention_resolved")
     {
         GREEN
-    } else if kind.contains("approved") || kind.contains("accepted") {
+    } else if kind.contains("approved") || kind.contains("accepted") || kind.contains("queued") {
         GOLD
     } else if kind.contains("executor") || kind.contains("started") {
         CYAN
@@ -3544,6 +3641,7 @@ mod tests {
         assert!(content.contains("TASK PROGRESS"));
         assert!(content.contains("WAITING HUMAN"));
         assert!(content.contains("ACTION QUEUE"));
+        assert!(content.contains("OUTBOX"));
         assert!(content.contains("LLM Gateway v0"));
         assert!(content.contains("BLOCKED"));
 
@@ -3562,6 +3660,9 @@ mod tests {
         assert!(compact_content.contains("FLOW BOARD"));
         assert!(compact_content.contains("ACTION QUEUE"));
         assert!(compact_content.contains("BLOCKED"), "{compact_content}");
+        assert!(state.hit_regions.iter().any(|region| {
+            region.target == HitTarget::Action(MouseAction::DispatchNotifications)
+        }));
 
         state.view = View::Timeline;
         state.refresh_timeline(&app);

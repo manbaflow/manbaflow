@@ -7,7 +7,8 @@ use manbaflow::calendar::{parse_workdays, summary as calendar_summary};
 use manbaflow::dashboard::DashboardSnapshot;
 use manbaflow::domain::{
     ExecutorConfig, ExecutorKind, ExecutorMode, Flow, FlowChangeRequest, FlowMessage,
-    FlowMessageKind, PrincipalKind, Task, TrackingAttention, TrackingEscalation, WorkCalendar,
+    FlowMessageKind, NotificationDelivery, NotificationEndpoint, NotificationStatus, PrincipalKind,
+    Task, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
@@ -53,6 +54,8 @@ enum Command {
         stale_hours: u64,
         #[arg(long, default_value_t = 4)]
         escalate_after_hours: u64,
+        #[arg(long, default_value_t = 15)]
+        notification_interval: u64,
     },
     /// 初始化和查看组织塔台
     Org {
@@ -108,6 +111,11 @@ enum Command {
     Gitlab {
         #[command(subcommand)]
         command: GitLabCommand,
+    },
+    /// 管理企业消息 Webhook 和可靠通知 Outbox
+    Notification {
+        #[command(subcommand)]
+        command: NotificationCommand,
     },
     /// 在同事工作站运行 Personal Agent 航班
     Worker {
@@ -271,6 +279,52 @@ enum GitLabCommand {
         by: String,
         #[arg(long)]
         url: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotificationCommand {
+    /// 注册一个使用环境变量密钥签名的 Webhook Endpoint
+    EndpointAdd {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        url: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "work_request.sent,flow_message.posted,task.blocked,task.submitted,tracking.escalation_raised,flow_change.proposed,flow_change.applied,flow_change.rejected,remote_flight.crashed,flow.completed"
+        )]
+        events: Vec<String>,
+        #[arg(long)]
+        secret_env: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
+    /// 查看 Webhook Endpoint
+    EndpointList {
+        #[arg(long)]
+        all: bool,
+    },
+    /// 停用 Endpoint；已经落地的 Outbox 记录仍保留
+    EndpointDisable {
+        endpoint: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
+    /// 查看通知投递记录
+    Deliveries {
+        #[arg(long)]
+        all: bool,
+    },
+    /// 立即投递 Outbox；force 会忽略失败退避时间
+    Dispatch {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value = "tower://cli-notification-dispatcher")]
+        by: String,
     },
 }
 
@@ -667,6 +721,7 @@ async fn run(cli: Cli) -> Result<()> {
             tracker_interval,
             stale_hours,
             escalate_after_hours,
+            notification_interval,
         } => {
             manbaflow::server::run(
                 app,
@@ -675,6 +730,7 @@ async fn run(cli: Cli) -> Result<()> {
                     tracker_interval_seconds: tracker_interval,
                     stale_after_hours: stale_hours,
                     escalate_after_hours,
+                    notification_interval_seconds: notification_interval,
                 },
             )
             .await?;
@@ -1325,6 +1381,73 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
         },
+        Command::Notification { command } => match command {
+            NotificationCommand::EndpointAdd {
+                name,
+                url,
+                events,
+                secret_env,
+                by,
+            } => {
+                let endpoint =
+                    app.register_notification_endpoint(&name, &url, &events, &secret_env, &by)?;
+                output(&endpoint, cli.json, notification_endpoint_text(&endpoint));
+            }
+            NotificationCommand::EndpointList { all } => {
+                let mut endpoints = app
+                    .state()
+                    .notification_endpoints
+                    .values()
+                    .filter(|endpoint| all || endpoint.active)
+                    .collect::<Vec<_>>();
+                endpoints.sort_by_key(|endpoint| endpoint.created_at);
+                let text = endpoints
+                    .iter()
+                    .map(|endpoint| notification_endpoint_text(endpoint))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                output(&endpoints, cli.json, text);
+            }
+            NotificationCommand::EndpointDisable { endpoint, by } => {
+                let endpoint = app.disable_notification_endpoint(&endpoint, &by)?;
+                output(
+                    &endpoint,
+                    cli.json,
+                    format!("{} 已停用，Outbox 历史保留", endpoint.id),
+                );
+            }
+            NotificationCommand::Deliveries { all } => {
+                let mut deliveries = app
+                    .state()
+                    .notification_deliveries
+                    .values()
+                    .filter(|delivery| {
+                        all || matches!(
+                            delivery.status,
+                            NotificationStatus::Pending | NotificationStatus::Failed
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                deliveries.sort_by_key(|delivery| std::cmp::Reverse(delivery.queued_at));
+                let text = deliveries
+                    .iter()
+                    .map(|delivery| notification_delivery_text(delivery))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                output(&deliveries, cli.json, text);
+            }
+            NotificationCommand::Dispatch { limit, force, by } => {
+                let summary = app.dispatch_notifications(limit, force, &by).await?;
+                output(
+                    &summary,
+                    cli.json,
+                    format!(
+                        "Outbox 投递 {} · LANDED {} · CRASHED {}",
+                        summary.attempted, summary.delivered, summary.failed
+                    ),
+                );
+            }
+        },
         Command::Worker { command } => match command {
             WorkerCommand::Once(args) => {
                 let worker = remote_worker(args, app.data_dir())?;
@@ -1571,6 +1694,38 @@ fn calendar_text(calendar: &WorkCalendar) -> String {
     lines.join("\n")
 }
 
+fn notification_endpoint_text(endpoint: &NotificationEndpoint) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\tsecret=${}\t{}",
+        endpoint.id,
+        if endpoint.active {
+            "ACTIVE"
+        } else {
+            "DISABLED"
+        },
+        endpoint.name,
+        endpoint.url,
+        endpoint.secret_env,
+        endpoint.event_kinds.join(",")
+    )
+}
+
+fn notification_delivery_text(delivery: &NotificationDelivery) -> String {
+    format!(
+        "{}\t{:?}\t{}\t{}\tattempts={}{}",
+        delivery.id,
+        delivery.status,
+        delivery.source_event_kind,
+        delivery.flow_id.as_deref().unwrap_or("organization"),
+        delivery.attempts,
+        delivery
+            .last_error
+            .as_ref()
+            .map(|error| format!("\t{error}"))
+            .unwrap_or_default()
+    )
+}
+
 fn parse_datetime(value: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
@@ -1695,7 +1850,7 @@ fn task_details(task: &Task) -> String {
 fn dashboard_text(dashboard: &DashboardSnapshot) -> String {
     let metrics = &dashboard.metrics;
     let mut lines = vec![format!(
-        "管理看板  Flow {}/{} active · Task {}/{} landed · Risk {} · Review {} · Flight {}",
+        "管理看板  Flow {}/{} active · Task {}/{} landed · Risk {} · Review {} · Flight {} · Outbox {}/{} failed",
         metrics.active_flows,
         metrics.total_flows,
         metrics.completed_tasks,
@@ -1703,6 +1858,8 @@ fn dashboard_text(dashboard: &DashboardSnapshot) -> String {
         metrics.at_risk_tasks,
         metrics.awaiting_human,
         metrics.open_flights,
+        metrics.pending_notifications,
+        metrics.failed_notifications,
     )];
     lines.push("\nFLOW BOARD".into());
     lines.extend(dashboard.flows.iter().map(|flow| {

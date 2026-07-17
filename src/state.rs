@@ -4,8 +4,9 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     ApiCredential, ExecutionRecord, FlightLease, FlightLeaseStatus, Flow, FlowChangeRequest,
-    FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, Organization, Principal,
-    TargetKind, TaskStatus, Team, TrackingAttention, TrackingEscalation, WorkCalendar,
+    FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, NotificationDelivery,
+    NotificationEndpoint, NotificationStatus, Organization, Principal, TargetKind, TaskStatus,
+    Team, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -16,6 +17,8 @@ pub struct OrganizationState {
     pub teams: BTreeMap<String, Team>,
     pub principals: BTreeMap<String, Principal>,
     pub calendars: BTreeMap<String, WorkCalendar>,
+    pub notification_endpoints: BTreeMap<String, NotificationEndpoint>,
+    pub notification_deliveries: BTreeMap<String, NotificationDelivery>,
     pub credentials: BTreeMap<String, ApiCredential>,
     pub external_deliveries: BTreeMap<String, DateTime<Utc>>,
     pub external_binding_clocks: BTreeMap<String, DateTime<Utc>>,
@@ -119,6 +122,107 @@ impl OrganizationState {
                 }
                 block.cancelled_by = Some(cancelled_by.clone());
                 block.cancelled_at = Some(*cancelled_at);
+            }
+            DomainEvent::NotificationEndpointRegistered { endpoint } => {
+                if self.notification_endpoints.contains_key(&endpoint.id) {
+                    return Err(MambaError::Validation(format!(
+                        "notification endpoint already exists: {}",
+                        endpoint.id
+                    )));
+                }
+                self.notification_endpoints
+                    .insert(endpoint.id.clone(), endpoint.clone());
+            }
+            DomainEvent::NotificationEndpointDisabled {
+                endpoint_id,
+                disabled_by,
+                disabled_at,
+            } => {
+                let endpoint = self
+                    .notification_endpoints
+                    .get_mut(endpoint_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "notification endpoint",
+                        id: endpoint_id.clone(),
+                    })?;
+                if !endpoint.active {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "notification endpoint {endpoint_id} is already disabled"
+                    )));
+                }
+                endpoint.active = false;
+                endpoint.disabled_by = Some(disabled_by.clone());
+                endpoint.disabled_at = Some(*disabled_at);
+                for delivery in self
+                    .notification_deliveries
+                    .values_mut()
+                    .filter(|delivery| delivery.endpoint_id == *endpoint_id)
+                    .filter(|delivery| delivery.status != NotificationStatus::Delivered)
+                {
+                    delivery.status = NotificationStatus::Cancelled;
+                    delivery.last_error = Some("notification endpoint disabled".into());
+                }
+            }
+            DomainEvent::NotificationQueued { delivery } => {
+                let endpoint = self
+                    .notification_endpoints
+                    .get(&delivery.endpoint_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "notification endpoint",
+                        id: delivery.endpoint_id.clone(),
+                    })?;
+                if !endpoint.active || self.notification_deliveries.contains_key(&delivery.id) {
+                    return Err(MambaError::Validation(format!(
+                        "notification delivery {} cannot be queued",
+                        delivery.id
+                    )));
+                }
+                self.notification_deliveries
+                    .insert(delivery.id.clone(), delivery.as_ref().clone());
+            }
+            DomainEvent::NotificationDelivered {
+                delivery_id,
+                response_status,
+                delivered_at,
+                ..
+            } => {
+                let delivery = self.notification_delivery_mut(delivery_id)?;
+                if matches!(
+                    delivery.status,
+                    NotificationStatus::Delivered | NotificationStatus::Cancelled
+                ) {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "notification delivery {delivery_id} is already delivered"
+                    )));
+                }
+                delivery.status = NotificationStatus::Delivered;
+                delivery.attempts += 1;
+                delivery.last_attempt_at = Some(*delivered_at);
+                delivery.delivered_at = Some(*delivered_at);
+                delivery.response_status = Some(*response_status);
+                delivery.last_error = None;
+            }
+            DomainEvent::NotificationFailed {
+                delivery_id,
+                response_status,
+                error,
+                attempted_at,
+                ..
+            } => {
+                let delivery = self.notification_delivery_mut(delivery_id)?;
+                if matches!(
+                    delivery.status,
+                    NotificationStatus::Delivered | NotificationStatus::Cancelled
+                ) {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "delivered notification {delivery_id} cannot fail"
+                    )));
+                }
+                delivery.status = NotificationStatus::Failed;
+                delivery.attempts += 1;
+                delivery.last_attempt_at = Some(*attempted_at);
+                delivery.response_status = *response_status;
+                delivery.last_error = Some(error.clone());
             }
             DomainEvent::ApiCredentialIssued { credential } => {
                 self.principal(&credential.principal_id)?;
@@ -631,6 +735,15 @@ impl OrganizationState {
             .ok_or_else(|| MambaError::NotFound {
                 entity: "work calendar",
                 id: principal.id.clone(),
+            })
+    }
+
+    fn notification_delivery_mut(&mut self, id: &str) -> Result<&mut NotificationDelivery> {
+        self.notification_deliveries
+            .get_mut(id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "notification delivery",
+                id: id.to_string(),
             })
     }
 

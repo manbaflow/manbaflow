@@ -8,6 +8,7 @@ pub mod executor;
 pub mod gitlab;
 pub mod ids;
 pub mod matcher;
+pub mod notification;
 pub mod planner;
 pub mod scheduler;
 pub mod server;

@@ -19,11 +19,13 @@ use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
     AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, Flow,
-    FlowChangeRequest, FlowMessage, FlowMessageKind, MessageInboxItem, Principal, PrincipalKind,
-    RemoteFlightReport, Task, TrackingEscalation, WorkCalendar, Workday,
+    FlowChangeRequest, FlowMessage, FlowMessageKind, MessageInboxItem, NotificationDelivery,
+    NotificationEndpoint, Principal, PrincipalKind, RemoteFlightReport, Task, TrackingEscalation,
+    WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
+use crate::notification::NotificationDispatchSummary;
 use crate::planner::PlannerKind;
 
 #[derive(Clone, Debug)]
@@ -32,6 +34,7 @@ pub struct ServerOptions {
     pub tracker_interval_seconds: u64,
     pub stale_after_hours: u64,
     pub escalate_after_hours: u64,
+    pub notification_interval_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -153,7 +156,21 @@ struct TimeOffInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct DispatchNotificationsInput {
+    #[serde(default = "default_notification_dispatch_limit")]
+    limit: usize,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct MessageInboxQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct NotificationListQuery {
     #[serde(default)]
     all: bool,
 }
@@ -202,6 +219,11 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
             "tracker interval must be greater than zero".into(),
         ));
     }
+    if options.notification_interval_seconds == 0 {
+        return Err(MambaError::Validation(
+            "notification interval must be greater than zero".into(),
+        ));
+    }
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
     let listener = TcpListener::bind(options.bind).await?;
     println!(
@@ -213,6 +235,7 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
     }
     let app = Arc::new(Mutex::new(app));
     spawn_tracker(app.clone(), &options);
+    spawn_notification_dispatcher(app.clone(), &options);
     axum::serve(listener, router(app, gitlab_webhook_auth))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -229,6 +252,18 @@ fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAu
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/inbox", get(inbox))
         .route("/api/v1/messages", get(message_inbox))
+        .route(
+            "/api/v1/notifications/endpoints",
+            get(notification_endpoints),
+        )
+        .route(
+            "/api/v1/notifications/deliveries",
+            get(notification_deliveries),
+        )
+        .route(
+            "/api/v1/notifications/dispatch",
+            post(dispatch_notifications),
+        )
         .route("/api/v1/messages/{id}/ack", post(acknowledge_message))
         .route("/api/v1/escalations", get(escalations))
         .route("/api/v1/escalations/{id}/ack", post(ack_escalation))
@@ -289,6 +324,24 @@ fn spawn_tracker(app: Arc<Mutex<MambaApp>>, options: &ServerOptions) {
                     "tower://server",
                 );
             }
+        }
+    });
+}
+
+fn spawn_notification_dispatcher(app: Arc<Mutex<MambaApp>>, options: &ServerOptions) {
+    let interval_seconds = options.notification_interval_seconds;
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(interval_seconds));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let _ = deliver_notification_batch(
+                &app,
+                50,
+                false,
+                "tower://server-notification-dispatcher",
+            )
+            .await;
         }
     });
 }
@@ -403,6 +456,67 @@ async fn message_inbox(
     let app = state.app.lock().await;
     let principal = authenticate(&app, &headers)?;
     Ok(Json(app.message_inbox(&principal.id, query.all)?))
+}
+
+async fn notification_endpoints(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<NotificationListQuery>,
+) -> ApiResult<Json<Vec<NotificationEndpoint>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    ensure_notification_admin(&principal)?;
+    let mut endpoints = app
+        .state()
+        .notification_endpoints
+        .values()
+        .filter(|endpoint| query.all || endpoint.active)
+        .cloned()
+        .collect::<Vec<_>>();
+    endpoints.sort_by_key(|endpoint| endpoint.created_at);
+    Ok(Json(endpoints))
+}
+
+async fn notification_deliveries(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<NotificationListQuery>,
+) -> ApiResult<Json<Vec<NotificationDelivery>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    ensure_notification_admin(&principal)?;
+    let mut deliveries = app
+        .state()
+        .notification_deliveries
+        .values()
+        .filter(|delivery| {
+            query.all
+                || matches!(
+                    delivery.status,
+                    crate::domain::NotificationStatus::Pending
+                        | crate::domain::NotificationStatus::Failed
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    deliveries.sort_by_key(|delivery| std::cmp::Reverse(delivery.queued_at));
+    Ok(Json(deliveries))
+}
+
+async fn dispatch_notifications(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<DispatchNotificationsInput>,
+) -> ApiResult<Json<NotificationDispatchSummary>> {
+    let actor = {
+        let app = state.app.lock().await;
+        let principal = authenticate(&app, &headers)?;
+        ensure_notification_admin(&principal)?;
+        principal.name
+    };
+    Ok(Json(
+        deliver_notification_batch(&state.app, input.limit, input.force, &actor).await?,
+    ))
 }
 
 async fn flow_messages(
@@ -813,6 +927,44 @@ async fn mutate<T>(
     Ok(Json(action(&mut app, &principal.name)?))
 }
 
+async fn deliver_notification_batch(
+    app: &Arc<Mutex<MambaApp>>,
+    limit: usize,
+    force_failed: bool,
+    actor: &str,
+) -> Result<NotificationDispatchSummary> {
+    if limit == 0 || limit > 1_000 {
+        return Err(MambaError::Validation(
+            "notification dispatch limit must be between 1 and 1000".into(),
+        ));
+    }
+    let attempts = app.lock().await.notification_attempts(limit, force_failed);
+    let mut summary = NotificationDispatchSummary::default();
+    for (endpoint, delivery) in attempts {
+        let attempt = crate::notification::deliver(&endpoint, &delivery).await;
+        summary.attempted += 1;
+        if attempt.delivered {
+            summary.delivered += 1;
+        } else {
+            summary.failed += 1;
+        }
+        app.lock()
+            .await
+            .record_notification_attempt(&delivery.id, attempt, actor)?;
+    }
+    Ok(summary)
+}
+
+fn ensure_notification_admin(principal: &Principal) -> Result<()> {
+    if principal.kind == PrincipalKind::Human {
+        Ok(())
+    } else {
+        Err(MambaError::PermissionDenied(
+            "notification administration requires a Human principal".into(),
+        ))
+    }
+}
+
 fn authenticate(app: &MambaApp, headers: &HeaderMap) -> ApiResult<Principal> {
     let value = headers
         .get(header::AUTHORIZATION)
@@ -836,6 +988,10 @@ fn default_lease_ttl_seconds() -> u64 {
 
 fn default_requires_ack() -> bool {
     true
+}
+
+fn default_notification_dispatch_limit() -> usize {
+    50
 }
 
 #[cfg(test)]
@@ -1256,7 +1412,40 @@ mod tests {
             .issue_api_credential(&agent.id, "agent", "admin")
             .unwrap()
             .token;
+        let notification_endpoint = app
+            .register_notification_endpoint(
+                "operations",
+                "https://example.invalid/mamba",
+                &["task.blocked".into()],
+                "MAMBA_OPERATIONS_SECRET",
+                "admin",
+            )
+            .unwrap();
         let service = router(Arc::new(Mutex::new(app)), None);
+
+        let endpoints = service
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/notifications/endpoints",
+                &human_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(endpoints.status(), StatusCode::OK);
+        let body = to_bytes(endpoints.into_body(), usize::MAX).await.unwrap();
+        let endpoints: Vec<NotificationEndpoint> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(endpoints[0].id, notification_endpoint.id);
+        let agent_endpoints = service
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/notifications/endpoints",
+                &agent_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(agent_endpoints.status(), StatusCode::FORBIDDEN);
 
         let authorized = service
             .clone()

@@ -12,15 +12,17 @@ use crate::domain::{
     Estimate, Evidence, ExecutionRecord, ExecutorConfig, ExecutorKind, ExecutorMode,
     ExternalArtifact, FlightLease, FlightLeaseStatus, Flow, FlowChangeImpact, FlowChangeRequest,
     FlowChangeStatus, FlowMessage, FlowMessageKind, FlowScheduleRevision, FlowStatus,
-    IssuedCredential, MessageAcknowledgement, MessageInboxItem, Organization, Principal,
-    PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskDraft, TaskStatus, Team,
-    TrackingAttention, TrackingEscalation, TrackingScan, WorkCalendar, Workday,
+    IssuedCredential, MessageAcknowledgement, MessageInboxItem, NotificationDelivery,
+    NotificationEndpoint, NotificationStatus, Organization, Principal, PrincipalKind,
+    RemoteFlightReport, TargetKind, Task, TaskDraft, TaskStatus, Team, TrackingAttention,
+    TrackingEscalation, TrackingScan, WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
 use crate::ids::{new_id, normalize_capability, parse_capabilities};
 use crate::matcher::Matcher;
+use crate::notification::{NotificationAttempt, NotificationDispatchSummary};
 use crate::planner::{PlannerKind, generate_plan, generate_revision_plan};
 use crate::scheduler::{reschedule, schedule};
 use crate::state::OrganizationState;
@@ -365,6 +367,198 @@ impl MambaApp {
             .find(|block| block.id == block_id)
             .expect("cancelled block remains in calendar")
             .clone())
+    }
+
+    pub fn register_notification_endpoint(
+        &mut self,
+        name: &str,
+        url: &str,
+        event_kinds: &[String],
+        secret_env: &str,
+        actor: &str,
+    ) -> Result<NotificationEndpoint> {
+        let mut event_kinds = event_kinds
+            .iter()
+            .map(|kind| kind.trim().to_ascii_lowercase())
+            .filter(|kind| !kind.is_empty())
+            .collect::<Vec<_>>();
+        event_kinds.sort();
+        event_kinds.dedup();
+        if self
+            .state
+            .notification_endpoints
+            .values()
+            .any(|endpoint| endpoint.name.eq_ignore_ascii_case(name.trim()) && endpoint.active)
+        {
+            return Err(MambaError::Validation(format!(
+                "active notification endpoint already exists: {}",
+                name.trim()
+            )));
+        }
+        let endpoint = NotificationEndpoint {
+            id: new_id("NEND"),
+            name: name.trim().to_string(),
+            url: url.trim().to_string(),
+            event_kinds,
+            secret_env: secret_env.trim().to_string(),
+            active: true,
+            created_by: actor.to_string(),
+            created_at: Utc::now(),
+            disabled_by: None,
+            disabled_at: None,
+        };
+        crate::notification::validate_endpoint(&endpoint)?;
+        self.commit(
+            actor,
+            vec![DomainEvent::NotificationEndpointRegistered {
+                endpoint: endpoint.clone(),
+            }],
+        )?;
+        Ok(endpoint)
+    }
+
+    pub fn disable_notification_endpoint(
+        &mut self,
+        endpoint_id: &str,
+        actor: &str,
+    ) -> Result<NotificationEndpoint> {
+        let endpoint = self
+            .state
+            .notification_endpoints
+            .get(endpoint_id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "notification endpoint",
+                id: endpoint_id.to_string(),
+            })?;
+        if !endpoint.active {
+            return Err(MambaError::InvalidTransition(format!(
+                "notification endpoint {endpoint_id} is already disabled"
+            )));
+        }
+        self.commit(
+            actor,
+            vec![DomainEvent::NotificationEndpointDisabled {
+                endpoint_id: endpoint_id.to_string(),
+                disabled_by: actor.to_string(),
+                disabled_at: Utc::now(),
+            }],
+        )?;
+        Ok(self.state.notification_endpoints[endpoint_id].clone())
+    }
+
+    pub fn notification_attempts(
+        &self,
+        limit: usize,
+        force_failed: bool,
+    ) -> Vec<(NotificationEndpoint, NotificationDelivery)> {
+        let now = Utc::now();
+        let mut deliveries = self
+            .state
+            .notification_deliveries
+            .values()
+            .filter(|delivery| {
+                matches!(
+                    delivery.status,
+                    NotificationStatus::Pending | NotificationStatus::Failed
+                )
+            })
+            .filter(|delivery| {
+                force_failed
+                    || delivery.status == NotificationStatus::Pending
+                    || delivery.last_attempt_at.is_none_or(|attempted_at| {
+                        let exponent = delivery.attempts.min(8);
+                        let delay = Duration::seconds(15 * (1_i64 << exponent));
+                        attempted_at + delay <= now
+                    })
+            })
+            .filter_map(|delivery| {
+                let endpoint = self
+                    .state
+                    .notification_endpoints
+                    .get(&delivery.endpoint_id)?;
+                endpoint
+                    .active
+                    .then_some((endpoint.clone(), delivery.clone()))
+            })
+            .collect::<Vec<_>>();
+        deliveries.sort_by(|left, right| {
+            left.1
+                .queued_at
+                .cmp(&right.1.queued_at)
+                .then_with(|| left.1.id.cmp(&right.1.id))
+        });
+        deliveries.truncate(limit);
+        deliveries
+    }
+
+    pub fn record_notification_attempt(
+        &mut self,
+        delivery_id: &str,
+        attempt: NotificationAttempt,
+        actor: &str,
+    ) -> Result<NotificationDelivery> {
+        let delivery = self
+            .state
+            .notification_deliveries
+            .get(delivery_id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "notification delivery",
+                id: delivery_id.to_string(),
+            })?;
+        if matches!(
+            delivery.status,
+            NotificationStatus::Delivered | NotificationStatus::Cancelled
+        ) {
+            return Err(MambaError::InvalidTransition(format!(
+                "notification delivery {delivery_id} is already delivered"
+            )));
+        }
+        let event = if attempt.delivered {
+            DomainEvent::NotificationDelivered {
+                delivery_id: delivery_id.to_string(),
+                flow_id: delivery.flow_id.clone(),
+                response_status: attempt.response_status.unwrap_or(200),
+                delivered_at: attempt.attempted_at,
+            }
+        } else {
+            DomainEvent::NotificationFailed {
+                delivery_id: delivery_id.to_string(),
+                flow_id: delivery.flow_id.clone(),
+                response_status: attempt.response_status,
+                error: attempt
+                    .error
+                    .unwrap_or_else(|| "notification delivery failed".into()),
+                attempted_at: attempt.attempted_at,
+            }
+        };
+        self.commit(actor, vec![event])?;
+        Ok(self.state.notification_deliveries[delivery_id].clone())
+    }
+
+    pub async fn dispatch_notifications(
+        &mut self,
+        limit: usize,
+        force_failed: bool,
+        actor: &str,
+    ) -> Result<NotificationDispatchSummary> {
+        if limit == 0 || limit > 1_000 {
+            return Err(MambaError::Validation(
+                "notification dispatch limit must be between 1 and 1000".into(),
+            ));
+        }
+        let attempts = self.notification_attempts(limit, force_failed);
+        let mut summary = NotificationDispatchSummary::default();
+        for (endpoint, delivery) in attempts {
+            let attempt = crate::notification::deliver(&endpoint, &delivery).await;
+            summary.attempted += 1;
+            if attempt.delivered {
+                summary.delivered += 1;
+            } else {
+                summary.failed += 1;
+            }
+            self.record_notification_attempt(&delivery.id, attempt, actor)?;
+        }
+        Ok(summary)
     }
 
     pub fn issue_api_credential(
@@ -2831,8 +3025,11 @@ impl MambaApp {
         &mut self,
         organization_id: &str,
         actor: &str,
-        events: Vec<DomainEvent>,
+        mut events: Vec<DomainEvent>,
     ) -> Result<Vec<EventEnvelope>> {
+        let queued =
+            crate::notification::queue_events(&self.state, organization_id, actor, &events)?;
+        events.extend(queued);
         let envelopes = self.store.append_batch(organization_id, actor, &events)?;
         for envelope in &envelopes {
             self.state.apply(envelope)?;
@@ -3128,6 +3325,145 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn notification_outbox_is_atomic_retryable_and_replayable() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Delivery", "product,delivery", "admin")
+            .unwrap();
+        let human = app
+            .register_principal(
+                "Leader",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let endpoint = app
+            .register_notification_endpoint(
+                "operations",
+                "https://example.invalid/hooks/mamba",
+                &["task.blocked".into(), "flow_message.posted".into()],
+                "MAMBA_TEST_WEBHOOK_SECRET",
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare a launch plan",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        app.approve_flow(&flow.id, &human.name).unwrap();
+        let task = &flow.tasks[0];
+        app.accept_task(&task.id, &human.name).unwrap();
+        app.start_task(&task.id, &human.name).unwrap();
+        app.block_task(&task.id, &human.name, "waiting for access")
+            .unwrap();
+        assert_eq!(app.state().notification_deliveries.len(), 1);
+        let delivery = app
+            .state()
+            .notification_deliveries
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(delivery.source_event_kind, "task.blocked");
+        assert_eq!(delivery.flow_id.as_deref(), Some(flow.id.as_str()));
+
+        app.record_notification_attempt(
+            &delivery.id,
+            NotificationAttempt {
+                delivered: false,
+                response_status: Some(503),
+                error: Some("endpoint returned HTTP 503".into()),
+                attempted_at: Utc::now(),
+            },
+            "tower://test",
+        )
+        .unwrap();
+        assert_eq!(
+            app.state().notification_deliveries[&delivery.id].status,
+            NotificationStatus::Failed
+        );
+        assert!(app.notification_attempts(10, false).is_empty());
+        assert_eq!(app.notification_attempts(10, true).len(), 1);
+        app.record_notification_attempt(
+            &delivery.id,
+            NotificationAttempt {
+                delivered: true,
+                response_status: Some(204),
+                error: None,
+                attempted_at: Utc::now(),
+            },
+            "tower://test",
+        )
+        .unwrap();
+        assert_eq!(
+            app.state().notification_deliveries[&delivery.id].attempts,
+            2
+        );
+
+        app.post_flow_message(
+            &flow.id,
+            Some(&task.id),
+            &human.name,
+            FlowMessageKind::Update,
+            std::slice::from_ref(&human.name),
+            "still waiting",
+            false,
+        )
+        .unwrap();
+        assert_eq!(app.state().notification_deliveries.len(), 2);
+        let queued_message = app
+            .state()
+            .notification_deliveries
+            .values()
+            .find(|candidate| candidate.id != delivery.id)
+            .unwrap()
+            .id
+            .clone();
+        app.disable_notification_endpoint(&endpoint.id, "admin")
+            .unwrap();
+        assert_eq!(
+            app.state().notification_deliveries[&queued_message].status,
+            NotificationStatus::Cancelled
+        );
+        app.post_flow_message(
+            &flow.id,
+            Some(&task.id),
+            &human.name,
+            FlowMessageKind::Update,
+            std::slice::from_ref(&human.name),
+            "endpoint disabled",
+            false,
+        )
+        .unwrap();
+        assert_eq!(app.state().notification_deliveries.len(), 2);
+
+        drop(app);
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed_delivery = &replayed.state().notification_deliveries[&delivery.id];
+        assert_eq!(replayed_delivery.status, NotificationStatus::Delivered);
+        assert_eq!(replayed_delivery.attempts, 2);
+        assert_eq!(
+            replayed.state().notification_deliveries[&queued_message].status,
+            NotificationStatus::Cancelled
+        );
+        assert!(!replayed.state().notification_endpoints[&endpoint.id].active);
+    }
 
     #[tokio::test]
     async fn work_calendar_and_time_off_reschedule_active_flows_and_replay() {
