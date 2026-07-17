@@ -1,4 +1,5 @@
 pub mod app;
+pub mod dashboard;
 pub mod domain;
 pub mod error;
 pub mod event;
@@ -9,6 +10,7 @@ pub mod matcher;
 pub mod planner;
 pub mod scheduler;
 pub mod server;
+pub mod showcase;
 pub mod state;
 pub mod store;
 mod tracker;

@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::MambaApp;
+use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
     Evidence, ExecutorKind, FlightLease, Flow, Principal, PrincipalKind, RemoteFlightReport, Task,
     TrackingEscalation,
@@ -164,6 +165,7 @@ fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAu
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/me", get(me))
+        .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/inbox", get(inbox))
         .route("/api/v1/escalations", get(escalations))
         .route("/api/v1/escalations/{id}/ack", post(ack_escalation))
@@ -223,6 +225,15 @@ async fn health() -> Json<HealthResponse> {
 async fn me(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Json<Principal>> {
     let app = state.app.lock().await;
     Ok(Json(authenticate(&app, &headers)?))
+}
+
+async fn dashboard(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<DashboardSnapshot>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.admin_dashboard(&principal.id)?))
 }
 
 async fn inbox(
@@ -795,6 +806,7 @@ mod tests {
         assert_eq!(finished.status(), StatusCode::OK);
 
         let visible_to_requester = service
+            .clone()
             .oneshot(authenticated_request(
                 "GET",
                 "/api/v1/flight-leases",
@@ -808,6 +820,31 @@ mod tests {
         let leases: Vec<FlightLease> = serde_json::from_slice(&body).unwrap();
         assert_eq!(leases.len(), 1);
         assert!(leases[0].report.is_some());
+
+        let dashboard = service
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/dashboard",
+                &human_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dashboard.status(), StatusCode::OK);
+        let body = to_bytes(dashboard.into_body(), usize::MAX).await.unwrap();
+        let dashboard: DashboardSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(dashboard.metrics.total_flows, 1);
+        assert_eq!(dashboard.flights.len(), 1);
+
+        let agent_dashboard = service
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/dashboard",
+                &agent_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(agent_dashboard.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

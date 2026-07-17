@@ -6,6 +6,7 @@ use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::dashboard::{DashboardSnapshot, build_dashboard};
 use crate::domain::{
     ApiCredential, AttentionSeverity, Demand, Evidence, ExecutionRecord, ExecutorConfig,
     ExecutorKind, ExecutorMode, ExternalArtifact, FlightLease, FlightLeaseStatus, Flow, FlowStatus,
@@ -1083,6 +1084,16 @@ impl MambaApp {
     pub fn authorize_task_actor(&self, task_id: &str, actor: &str) -> Result<()> {
         let (_, task) = self.state.find_task(task_id)?;
         self.ensure_task_actor(task, actor)
+    }
+
+    pub fn admin_dashboard(&self, actor: &str) -> Result<DashboardSnapshot> {
+        let principal = self.state.principal(actor)?;
+        if principal.kind != PrincipalKind::Human {
+            return Err(MambaError::PermissionDenied(
+                "organization dashboard requires a human identity".into(),
+            ));
+        }
+        Ok(build_dashboard(&self.state))
     }
 
     pub fn authorize_remote_flight(

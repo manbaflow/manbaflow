@@ -1,3 +1,4 @@
 /target/
 .mambaflow/
+.mambaflow-showcase/
 *.log

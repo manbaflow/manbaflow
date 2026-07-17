@@ -2,12 +2,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use manbaflow::dashboard::DashboardSnapshot;
 use manbaflow::domain::{
     ExecutorConfig, ExecutorKind, ExecutorMode, Flow, PrincipalKind, Task, TrackingAttention,
     TrackingEscalation,
 };
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
+use manbaflow::showcase::seed_showcase;
 use manbaflow::worker::{RemoteWorker, WorkerOptions, WorkerOutcome, WorkerOutcomeStatus};
 use manbaflow::{MambaApp, Result};
 use serde::Serialize;
@@ -85,6 +87,11 @@ enum Command {
         #[arg(long = "for")]
         target: String,
     },
+    /// 查看管理员 Flow、风险、待办和航班看板
+    Dashboard {
+        #[arg(long = "as")]
+        actor: String,
+    },
     /// 扫描 Todo 风险并查看塔台 Attention
     Track {
         #[command(subcommand)]
@@ -111,6 +118,9 @@ enum Command {
     Demo {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
+        /// 同时生成三条可回放的管理员 Showcase Flow
+        #[arg(long)]
+        showcase: bool,
     },
 }
 
@@ -829,6 +839,10 @@ async fn run(cli: Cli) -> Result<()> {
                 .join("\n");
             output(&value, cli.json, text);
         }
+        Command::Dashboard { actor } => {
+            let dashboard = app.admin_dashboard(&actor)?;
+            output(&dashboard, cli.json, dashboard_text(&dashboard));
+        }
         Command::Track { command } => match command {
             TrackCommand::Scan {
                 stale_hours,
@@ -1019,12 +1033,20 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
         },
-        Command::Demo { workspace } => bootstrap_demo(&mut app, &workspace, cli.json)?,
+        Command::Demo {
+            workspace,
+            showcase,
+        } => bootstrap_demo(&mut app, &workspace, showcase, cli.json).await?,
     }
     Ok(())
 }
 
-fn bootstrap_demo(app: &mut MambaApp, workspace: &Path, json_output: bool) -> Result<()> {
+async fn bootstrap_demo(
+    app: &mut MambaApp,
+    workspace: &Path,
+    include_showcase: bool,
+    json_output: bool,
+) -> Result<()> {
     let workspace = absolute_path(workspace)?;
     let org = app.init_organization("Mamba Labs", "admin")?;
     let team = app.create_team(
@@ -1076,21 +1098,31 @@ fn bootstrap_demo(app: &mut MambaApp, workspace: &Path, json_output: bool) -> Re
         100,
         Some(ExecutorConfig {
             kind: ExecutorKind::ClaudeCode,
-            workspace,
+            workspace: workspace.clone(),
             model: None,
             command: None,
         }),
         "admin",
     )?;
+    let showcase = if include_showcase {
+        Some(seed_showcase(app, &workspace, &leader.name).await?)
+    } else {
+        None
+    };
     output(
         &json!({
             "organization": org,
             "team": team,
             "humans": [leader, engineer],
-            "agents": [codex, claude]
+            "agents": [codex, claude],
+            "showcase": showcase,
         }),
         json_output,
-        "演示阵容就位：牢大与佐巴扬带队，Codex 和 Claude Code 已进入轮换。".into(),
+        if include_showcase {
+            "演示塔台就位：3 条 Flow 已覆盖执行、阻塞、待验收、完成和远程 Flight Lease。".into()
+        } else {
+            "演示阵容就位：牢大与佐巴扬带队，Codex 和 Claude Code 已进入轮换。".into()
+        },
     );
     Ok(())
 }
@@ -1188,6 +1220,48 @@ fn task_details(task: &Task) -> String {
                     "pending"
                 },
                 artifact.url
+            )
+        }));
+    }
+    lines.join("\n")
+}
+
+fn dashboard_text(dashboard: &DashboardSnapshot) -> String {
+    let metrics = &dashboard.metrics;
+    let mut lines = vec![format!(
+        "管理看板  Flow {}/{} active · Task {}/{} landed · Risk {} · Review {} · Flight {}",
+        metrics.active_flows,
+        metrics.total_flows,
+        metrics.completed_tasks,
+        metrics.total_tasks,
+        metrics.at_risk_tasks,
+        metrics.awaiting_human,
+        metrics.open_flights,
+    )];
+    lines.push("\nFLOW BOARD".into());
+    lines.extend(dashboard.flows.iter().map(|flow| {
+        format!(
+            "{:?}\t{:>3}%\t{}\t{}\tP80 {}",
+            flow.health,
+            flow.progress_percent,
+            flow.id,
+            flow.title,
+            flow.p80_finish.format("%m-%d %H:%M UTC")
+        )
+    }));
+    lines.push("\nACTION QUEUE".into());
+    lines.extend(dashboard.action_items.iter().take(10).map(|action| {
+        format!(
+            "{:?}\t{}\t{}\t{}\t{}",
+            action.priority, action.owner, action.task_id, action.task_title, action.reason
+        )
+    }));
+    if !dashboard.flights.is_empty() {
+        lines.push("\nFLIGHT DECK".into());
+        lines.extend(dashboard.flights.iter().take(5).map(|flight| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                flight.status, flight.executor, flight.principal, flight.task_id, flight.id
             )
         }));
     }
