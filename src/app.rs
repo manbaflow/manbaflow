@@ -8,19 +8,19 @@ use uuid::Uuid;
 
 use crate::dashboard::{DashboardSnapshot, build_dashboard};
 use crate::domain::{
-    ApiCredential, Assignment, AssignmentTarget, AttentionSeverity, Demand, Evidence,
+    ApiCredential, Assignment, AssignmentTarget, AttentionSeverity, Demand, Estimate, Evidence,
     ExecutionRecord, ExecutorConfig, ExecutorKind, ExecutorMode, ExternalArtifact, FlightLease,
-    FlightLeaseStatus, Flow, FlowMessage, FlowMessageKind, FlowScheduleRevision, FlowStatus,
-    IssuedCredential, MessageAcknowledgement, MessageInboxItem, Organization, Principal,
-    PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskStatus, Team, TrackingAttention,
-    TrackingEscalation, TrackingScan,
+    FlightLeaseStatus, Flow, FlowChangeImpact, FlowChangeRequest, FlowChangeStatus, FlowMessage,
+    FlowMessageKind, FlowScheduleRevision, FlowStatus, IssuedCredential, MessageAcknowledgement,
+    MessageInboxItem, Organization, Principal, PrincipalKind, RemoteFlightReport, TargetKind, Task,
+    TaskDraft, TaskStatus, Team, TrackingAttention, TrackingEscalation, TrackingScan,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
 use crate::ids::{new_id, normalize_capability, parse_capabilities};
 use crate::matcher::Matcher;
-use crate::planner::{PlannerKind, generate_plan};
+use crate::planner::{PlannerKind, generate_plan, generate_revision_plan};
 use crate::scheduler::{reschedule, schedule};
 use crate::state::OrganizationState;
 use crate::store::EventStore;
@@ -1284,6 +1284,383 @@ impl MambaApp {
         Ok(self.state.flow(&flow.id)?.clone())
     }
 
+    pub async fn propose_flow_change(
+        &mut self,
+        flow_id: &str,
+        actor: &str,
+        summary: &str,
+        planner: PlannerKind,
+        workspace: &Path,
+        timeout_seconds: u64,
+    ) -> Result<FlowChangeRequest> {
+        let summary = summary.trim();
+        if summary.is_empty() || summary.chars().count() > 4_000 {
+            return Err(MambaError::Validation(
+                "flow change summary must contain 1 to 4000 characters".into(),
+            ));
+        }
+        if !workspace.is_dir() {
+            return Err(MambaError::InvalidWorkspace(workspace.to_path_buf()));
+        }
+        if self.state.flow_changes.values().any(|request| {
+            request.flow_id == flow_id && request.status == FlowChangeStatus::Proposed
+        }) {
+            return Err(MambaError::InvalidTransition(format!(
+                "flow {flow_id} already has a proposed change awaiting a decision"
+            )));
+        }
+        let requester = self.state.principal(actor)?.clone();
+        if requester.kind != PrincipalKind::Human {
+            return Err(MambaError::PermissionDenied(
+                "flow change requests require a human requester".into(),
+            ));
+        }
+        let flow = self.state.flow(flow_id)?.clone();
+        if flow.demand.requester != requester.id && flow.demand.requester != requester.name {
+            return Err(MambaError::PermissionDenied(format!(
+                "only demand requester {} can revise flow {}",
+                flow.demand.requester, flow.id
+            )));
+        }
+        if !matches!(flow.status, FlowStatus::Approved | FlowStatus::Active) {
+            return Err(MambaError::InvalidTransition(format!(
+                "flow {} is {:?}; only approved or active flows can be revised",
+                flow.id, flow.status
+            )));
+        }
+
+        let request_id = new_id("CHG");
+        let planner_log = self
+            .data_dir
+            .join("runs")
+            .join(&flow.id)
+            .join(format!("{request_id}-planner.json"));
+        let plan = generate_revision_plan(
+            planner,
+            &flow,
+            summary,
+            &self.state,
+            workspace,
+            planner_log,
+            timeout_seconds,
+        )
+        .await?;
+        let additions = validate_append_only_revision(&flow, &plan.tasks)?;
+        if additions.len() > 20 {
+            return Err(MambaError::Validation(
+                "one flow change can append at most 20 tasks".into(),
+            ));
+        }
+
+        let mut matcher = Matcher::new(&self.state);
+        let mut assignments = BTreeMap::new();
+        for draft in &additions {
+            assignments.insert(draft.key.clone(), matcher.match_task(draft)?);
+        }
+        let now = Utc::now();
+        let mut ids = flow
+            .tasks
+            .iter()
+            .map(|task| (task.key.clone(), task.id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for draft in &additions {
+            ids.insert(draft.key.clone(), new_id("TSK"));
+        }
+        let mut new_tasks = additions
+            .iter()
+            .map(|draft| {
+                let assignment = assignments
+                    .get(&draft.key)
+                    .cloned()
+                    .ok_or_else(|| MambaError::NoEligibleAssignee(draft.title.clone()))?;
+                let depends_on = draft
+                    .depends_on
+                    .iter()
+                    .map(|dependency| {
+                        ids.get(dependency).cloned().ok_or_else(|| {
+                            MambaError::Validation(format!(
+                                "new task {} depends on unknown task {dependency}",
+                                draft.key
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Task {
+                    id: ids[&draft.key].clone(),
+                    key: draft.key.clone(),
+                    title: draft.title.clone(),
+                    description: draft.description.clone(),
+                    required_capabilities: draft.required_capabilities.clone(),
+                    depends_on,
+                    requires_human: draft.requires_human,
+                    acceptance_criteria: draft.acceptance_criteria.clone(),
+                    assignment: Some(assignment),
+                    estimate: Estimate {
+                        effort_hours: draft.effort_hours,
+                        p50_hours: draft.effort_hours,
+                        p80_hours: draft.effort_hours * 1.4,
+                        confidence: "preview".into(),
+                        rationale: vec!["flow change preview".into()],
+                        earliest_start: now,
+                        p50_finish: now,
+                        p80_finish: now,
+                    },
+                    status: TaskStatus::Proposed,
+                    blocker: None,
+                    last_heartbeat: None,
+                    evidence: Vec::new(),
+                    external_artifacts: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut preview_flow = flow.clone();
+        preview_flow.tasks.extend(new_tasks.clone());
+        let baseline = reschedule(&flow, &self.state, now)?;
+        let scheduled = reschedule(&preview_flow, &self.state, now)?;
+        for task in &mut new_tasks {
+            task.estimate = scheduled.task_estimates[&task.id].clone();
+        }
+        let delta_millis = scheduled
+            .p80_finish
+            .signed_duration_since(baseline.p80_finish)
+            .num_milliseconds();
+        let delta_hours = delta_millis as f64 / 3_600_000.0;
+        let net_delta_millis = scheduled
+            .p80_finish
+            .signed_duration_since(flow.p80_finish)
+            .num_milliseconds();
+        let net_delta_hours = net_delta_millis as f64 / 3_600_000.0;
+        let rebase_delta_hours = baseline
+            .p80_finish
+            .signed_duration_since(flow.p80_finish)
+            .num_milliseconds() as f64
+            / 3_600_000.0;
+        let mut risks = Vec::new();
+        if flow
+            .tasks
+            .iter()
+            .any(|task| matches!(task.status, TaskStatus::InProgress | TaskStatus::Blocked))
+        {
+            risks.push("当前 Flow 已有执行中或阻塞任务，追加范围可能增加协调成本".into());
+        }
+        if new_tasks.iter().any(|task| task.requires_human) {
+            risks.push("新增工作引入了 Human 审批或责任 Gate".into());
+        }
+        if delta_hours > 0.0 {
+            risks.push(format!("新增范围使重算基线 P80 延后 {delta_hours:.1} 小时"));
+        }
+        if rebase_delta_hours.abs() >= 0.1 {
+            risks.push(format!(
+                "当前进度先使正式 P80 重基线 {rebase_delta_hours:+.1} 小时，再叠加新增范围"
+            ));
+        }
+        let revision = FlowScheduleRevision {
+            task_estimates: scheduled.task_estimates,
+            p50_finish: scheduled.p50_finish,
+            p80_finish: scheduled.p80_finish,
+            critical_path: scheduled.critical_path,
+            reason: format!("preview change {request_id}: {summary}"),
+            revised_by: requester.name.clone(),
+            revised_at: now,
+        };
+        let impact = FlowChangeImpact {
+            added_task_ids: new_tasks.iter().map(|task| task.id.clone()).collect(),
+            added_task_titles: new_tasks.iter().map(|task| task.title.clone()).collect(),
+            affected_task_ids: new_tasks.iter().map(|task| task.id.clone()).collect(),
+            official_p80_finish: flow.p80_finish,
+            baseline_p80_finish: baseline.p80_finish,
+            proposed_p80_finish: revision.p80_finish,
+            baseline_p80_delta_hours: (rebase_delta_hours * 10.0).round() / 10.0,
+            scope_p80_delta_hours: (delta_hours * 10.0).round() / 10.0,
+            net_p80_delta_hours: (net_delta_hours * 10.0).round() / 10.0,
+            risks,
+        };
+        let request = FlowChangeRequest {
+            id: request_id,
+            flow_id: flow.id,
+            summary: summary.to_string(),
+            requested_by_id: requester.id,
+            requested_by_name: requester.name.clone(),
+            planner: planner.to_string(),
+            proposed_prd: plan.prd,
+            new_tasks,
+            preview_schedule: revision,
+            base_task_statuses: flow
+                .tasks
+                .iter()
+                .map(|task| (task.id.clone(), task.status.clone()))
+                .collect(),
+            base_p80_finish: flow.p80_finish,
+            impact,
+            status: FlowChangeStatus::Proposed,
+            created_at: now,
+            resolved_at: None,
+            resolved_by: None,
+            rejection_reason: None,
+        };
+        self.commit(
+            &requester.name,
+            vec![DomainEvent::FlowChangeProposed {
+                request: Box::new(request.clone()),
+            }],
+        )?;
+        Ok(request)
+    }
+
+    pub fn flow_changes(&self, flow_id: &str, actor: &str) -> Result<Vec<FlowChangeRequest>> {
+        let flow = self.state.flow(flow_id)?;
+        let principal = self.state.principal(actor)?;
+        if !self.principal_has_flow_access(flow, principal) {
+            return Err(MambaError::PermissionDenied(format!(
+                "{} cannot access flow {}",
+                principal.name, flow.id
+            )));
+        }
+        let mut changes = self
+            .state
+            .flow_changes
+            .values()
+            .filter(|request| request.flow_id == flow.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        changes.sort_by_key(|request| std::cmp::Reverse(request.created_at));
+        Ok(changes)
+    }
+
+    pub fn pending_flow_change(&self, flow_id: &str) -> Option<&FlowChangeRequest> {
+        self.state.flow_changes.values().find(|request| {
+            request.flow_id == flow_id && request.status == FlowChangeStatus::Proposed
+        })
+    }
+
+    pub fn approve_flow_change(
+        &mut self,
+        request_id: &str,
+        actor: &str,
+    ) -> Result<FlowChangeRequest> {
+        let principal = self.state.principal(actor)?.clone();
+        let request = self
+            .state
+            .flow_changes
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "flow change request",
+                id: request_id.to_string(),
+            })?;
+        let flow = self.state.flow(&request.flow_id)?.clone();
+        if principal.kind != PrincipalKind::Human
+            || (flow.demand.requester != principal.id && flow.demand.requester != principal.name)
+        {
+            return Err(MambaError::PermissionDenied(format!(
+                "only demand requester {} can approve flow change {}",
+                flow.demand.requester, request.id
+            )));
+        }
+        if request.status != FlowChangeStatus::Proposed {
+            return Err(MambaError::InvalidTransition(format!(
+                "flow change {} is {:?}",
+                request.id, request.status
+            )));
+        }
+        let current_statuses = flow
+            .tasks
+            .iter()
+            .map(|task| (task.id.clone(), task.status.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if current_statuses != request.base_task_statuses
+            || flow.p80_finish != request.base_p80_finish
+        {
+            return Err(MambaError::InvalidTransition(
+                "flow changed after this preview; generate a fresh change request".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut new_tasks = request.new_tasks.clone();
+        for task in &mut new_tasks {
+            task.status = TaskStatus::Assigned;
+        }
+        let mut updated_flow = flow.clone();
+        updated_flow.prd = request.proposed_prd.clone();
+        updated_flow.tasks.extend(new_tasks.clone());
+        let scheduled = reschedule(&updated_flow, &self.state, now)?;
+        let revision = FlowScheduleRevision {
+            task_estimates: scheduled.task_estimates,
+            p50_finish: scheduled.p50_finish,
+            p80_finish: scheduled.p80_finish,
+            critical_path: scheduled.critical_path,
+            reason: format!("approved flow change {}: {}", request.id, request.summary),
+            revised_by: principal.name.clone(),
+            revised_at: now,
+        };
+        let mut events = vec![DomainEvent::FlowChangeApplied {
+            flow_id: flow.id.clone(),
+            request_id: request.id.clone(),
+            prd: request.proposed_prd,
+            new_tasks: new_tasks.clone(),
+            revision,
+            applied_by: principal.name.clone(),
+            applied_at: now,
+        }];
+        events.extend(new_tasks.iter().map(|task| DomainEvent::WorkRequestSent {
+            flow_id: flow.id.clone(),
+            task_id: task.id.clone(),
+            target_id: task.assignment.as_ref().unwrap().owner.id.clone(),
+        }));
+        self.commit(&principal.name, events)?;
+        Ok(self.state.flow_changes[request_id].clone())
+    }
+
+    pub fn reject_flow_change(
+        &mut self,
+        request_id: &str,
+        actor: &str,
+        reason: &str,
+    ) -> Result<FlowChangeRequest> {
+        let reason = reason.trim();
+        if reason.is_empty() || reason.chars().count() > 1_000 {
+            return Err(MambaError::Validation(
+                "flow change rejection reason must contain 1 to 1000 characters".into(),
+            ));
+        }
+        let principal = self.state.principal(actor)?.clone();
+        let request = self
+            .state
+            .flow_changes
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "flow change request",
+                id: request_id.to_string(),
+            })?;
+        let flow = self.state.flow(&request.flow_id)?;
+        if principal.kind != PrincipalKind::Human
+            || (flow.demand.requester != principal.id && flow.demand.requester != principal.name)
+        {
+            return Err(MambaError::PermissionDenied(format!(
+                "only demand requester {} can reject flow change {}",
+                flow.demand.requester, request.id
+            )));
+        }
+        if request.status != FlowChangeStatus::Proposed {
+            return Err(MambaError::InvalidTransition(format!(
+                "flow change {} is {:?}",
+                request.id, request.status
+            )));
+        }
+        self.commit(
+            &principal.name,
+            vec![DomainEvent::FlowChangeRejected {
+                flow_id: flow.id.clone(),
+                request_id: request.id.clone(),
+                rejected_by: principal.name.clone(),
+                reason: reason.to_string(),
+                rejected_at: Utc::now(),
+            }],
+        )?;
+        Ok(self.state.flow_changes[request_id].clone())
+    }
+
     pub fn start_task(&mut self, task_id: &str, actor: &str) -> Result<Task> {
         let (flow, task) = self.task_snapshot(task_id)?;
         ensure_status(&task, &[TaskStatus::Accepted, TaskStatus::Blocked])?;
@@ -2336,6 +2713,77 @@ fn target_kind_rank(kind: &TargetKind) -> u8 {
     }
 }
 
+fn validate_append_only_revision(flow: &Flow, drafts: &[TaskDraft]) -> Result<Vec<TaskDraft>> {
+    let keys = drafts
+        .iter()
+        .map(|draft| draft.key.as_str())
+        .collect::<BTreeSet<_>>();
+    if keys.len() != drafts.len() {
+        return Err(MambaError::Validation(
+            "flow change task keys must be unique".into(),
+        ));
+    }
+    let existing_keys = flow
+        .tasks
+        .iter()
+        .map(|task| task.key.as_str())
+        .collect::<BTreeSet<_>>();
+    for task in &flow.tasks {
+        let expected = TaskDraft {
+            key: task.key.clone(),
+            title: task.title.clone(),
+            description: task.description.clone(),
+            required_capabilities: task.required_capabilities.clone(),
+            depends_on: task
+                .depends_on
+                .iter()
+                .filter_map(|dependency| flow.task(dependency))
+                .map(|dependency| dependency.key.clone())
+                .collect(),
+            effort_hours: task.estimate.effort_hours,
+            requires_human: task.requires_human,
+            acceptance_criteria: task.acceptance_criteria.clone(),
+        };
+        let proposed = drafts
+            .iter()
+            .find(|draft| draft.key == task.key)
+            .ok_or_else(|| {
+                MambaError::Validation(format!(
+                    "flow change cannot remove existing task {}",
+                    task.key
+                ))
+            })?;
+        if proposed != &expected {
+            return Err(MambaError::Validation(format!(
+                "flow change cannot modify existing task {}; append a new task instead",
+                task.key
+            )));
+        }
+    }
+    let additions = drafts
+        .iter()
+        .filter(|draft| !existing_keys.contains(draft.key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let all_keys = drafts
+        .iter()
+        .map(|draft| draft.key.as_str())
+        .collect::<BTreeSet<_>>();
+    for task in &additions {
+        if let Some(dependency) = task
+            .depends_on
+            .iter()
+            .find(|dependency| !all_keys.contains(dependency.as_str()))
+        {
+            return Err(MambaError::Validation(format!(
+                "new task {} depends on unknown task {}",
+                task.key, dependency
+            )));
+        }
+    }
+    Ok(additions)
+}
+
 fn validate_run_id(run_id: &str) -> Result<()> {
     if run_id.is_empty()
         || run_id.len() > 100
@@ -3128,6 +3576,139 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(kinds.contains(&"task.reassigned".to_string()));
         assert!(kinds.contains(&"flow.rescheduled".to_string()));
+    }
+
+    #[tokio::test]
+    async fn flow_change_preview_requires_fresh_human_approval_and_replays() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Delivery", "product,delivery,security", "admin")
+            .unwrap();
+        let manager = app
+            .register_principal(
+                "Manager",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery,security",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let engineer = app
+            .register_principal(
+                "Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "delivery,security",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare a launch brief",
+                &manager.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        app.approve_flow(&flow.id, &manager.name).unwrap();
+        let original_tasks = flow.tasks.len();
+        let change = app
+            .propose_flow_change(
+                &flow.id,
+                &manager.name,
+                "Add a security sign-off checklist",
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(change.status, FlowChangeStatus::Proposed);
+        assert_eq!(change.new_tasks.len(), 1);
+        assert_eq!(
+            app.state().flow(&flow.id).unwrap().tasks.len(),
+            original_tasks
+        );
+        assert!(change.impact.scope_p80_delta_hours > 0.0);
+        assert!(app.approve_flow_change(&change.id, &engineer.name).is_err());
+        let applied = app.approve_flow_change(&change.id, &manager.name).unwrap();
+        assert_eq!(applied.status, FlowChangeStatus::Applied);
+        let updated = app.state().flow(&flow.id).unwrap();
+        assert_eq!(updated.tasks.len(), original_tasks + 1);
+        assert_eq!(
+            updated.task("change-1").unwrap().status,
+            TaskStatus::Assigned
+        );
+        assert!(
+            updated
+                .prd
+                .acceptance_criteria
+                .iter()
+                .any(|criterion| criterion.contains("security sign-off"))
+        );
+
+        let stale = app
+            .propose_flow_change(
+                &flow.id,
+                &manager.name,
+                "Add a customer communication step",
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let manager_task = app
+            .state()
+            .flow(&flow.id)
+            .unwrap()
+            .tasks
+            .iter()
+            .find(|task| {
+                task.status == TaskStatus::Assigned
+                    && task.assignment.as_ref().is_some_and(|assignment| {
+                        assignment.owner.id == manager.id
+                            || assignment.owner.kind == TargetKind::Team
+                    })
+            })
+            .unwrap()
+            .id
+            .clone();
+        app.accept_task(&manager_task, &manager.name).unwrap();
+        let stale_error = app
+            .approve_flow_change(&stale.id, &manager.name)
+            .unwrap_err();
+        assert!(matches!(stale_error, MambaError::InvalidTransition(_)));
+        let rejected = app
+            .reject_flow_change(&stale.id, &manager.name, "Regenerate against current work")
+            .unwrap();
+        assert_eq!(rejected.status, FlowChangeStatus::Rejected);
+
+        drop(app);
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        assert_eq!(
+            replayed.state().flow(&flow.id).unwrap().tasks.len(),
+            original_tasks + 1
+        );
+        assert_eq!(
+            replayed.state().flow_changes[&change.id].status,
+            FlowChangeStatus::Applied
+        );
+        assert_eq!(
+            replayed.state().flow_changes[&stale.id].status,
+            FlowChangeStatus::Rejected
+        );
     }
 
     #[tokio::test]

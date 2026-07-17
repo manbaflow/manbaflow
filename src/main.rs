@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use manbaflow::dashboard::DashboardSnapshot;
 use manbaflow::domain::{
-    ExecutorConfig, ExecutorKind, ExecutorMode, Flow, FlowMessage, FlowMessageKind, PrincipalKind,
-    Task, TrackingAttention, TrackingEscalation,
+    ExecutorConfig, ExecutorKind, ExecutorMode, Flow, FlowChangeRequest, FlowMessage,
+    FlowMessageKind, PrincipalKind, Task, TrackingAttention, TrackingEscalation,
 };
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
@@ -311,6 +311,39 @@ enum FlowCommand {
         flow: String,
         #[arg(long)]
         by: String,
+    },
+    /// 为运行中的 Flow 生成 append-only 变更与影响预览
+    ChangePropose {
+        flow: String,
+        summary: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long, value_enum, default_value = "local")]
+        planner: PlannerKindArg,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+    },
+    /// 查看 Flow 的变更历史与待审批影响
+    Changes {
+        flow: String,
+        #[arg(long = "as")]
+        actor: String,
+    },
+    /// Requester 批准影响预览并追加新任务
+    ChangeApprove {
+        change: String,
+        #[arg(long)]
+        by: String,
+    },
+    /// Requester 拒绝一份变更预览
+    ChangeReject {
+        change: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -779,6 +812,45 @@ async fn run(cli: Cli) -> Result<()> {
                     &flow,
                     cli.json,
                     format!("{} 已批准，{} 个任务完成传球", flow.id, flow.tasks.len()),
+                );
+            }
+            FlowCommand::ChangePropose {
+                flow,
+                summary,
+                by,
+                planner,
+                workspace,
+                timeout,
+            } => {
+                let workspace = absolute_path(workspace)?;
+                let change = app
+                    .propose_flow_change(&flow, &by, &summary, planner.into(), &workspace, timeout)
+                    .await?;
+                output(&change, cli.json, flow_change_summary(&change));
+            }
+            FlowCommand::Changes { flow, actor } => {
+                let changes = app.flow_changes(&flow, &actor)?;
+                let text = changes
+                    .iter()
+                    .map(flow_change_summary)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                output(&changes, cli.json, text);
+            }
+            FlowCommand::ChangeApprove { change, by } => {
+                let change = app.approve_flow_change(&change, &by)?;
+                output(
+                    &change,
+                    cli.json,
+                    format!("{} 已批准并进入正式 Flow", change.id),
+                );
+            }
+            FlowCommand::ChangeReject { change, by, reason } => {
+                let change = app.reject_flow_change(&change, &by, &reason)?;
+                output(
+                    &change,
+                    cli.json,
+                    format!("{} 已拒绝：{}", change.id, reason),
                 );
             }
         },
@@ -1352,6 +1424,25 @@ fn flow_summary(flow: &Flow) -> String {
         flow.p50_finish.format("%Y-%m-%d %H:%M UTC"),
         flow.p80_finish.format("%Y-%m-%d %H:%M UTC"),
         flow.tasks.len()
+    )
+}
+
+fn flow_change_summary(change: &FlowChangeRequest) -> String {
+    let risks = if change.impact.risks.is_empty() {
+        String::new()
+    } else {
+        format!("\n风险: {}", change.impact.risks.join(" · "))
+    };
+    format!(
+        "{}\t{:?}\t+{} tasks\t{}\nP80 progress {:+.1}h + scope {:+.1}h = net {:+.1}h{}",
+        change.id,
+        change.status,
+        change.new_tasks.len(),
+        change.summary,
+        change.impact.baseline_p80_delta_hours,
+        change.impact.scope_p80_delta_hours,
+        change.impact.net_p80_delta_hours,
+        risks
     )
 }
 

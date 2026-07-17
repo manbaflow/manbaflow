@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    ApiCredential, ExecutionRecord, FlightLease, FlightLeaseStatus, Flow, FlowMessage, FlowStatus,
-    Organization, Principal, TargetKind, TaskStatus, Team, TrackingAttention, TrackingEscalation,
+    ApiCredential, ExecutionRecord, FlightLease, FlightLeaseStatus, Flow, FlowChangeRequest,
+    FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, Organization, Principal,
+    TargetKind, TaskStatus, Team, TrackingAttention, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -19,6 +20,7 @@ pub struct OrganizationState {
     pub external_binding_clocks: BTreeMap<String, DateTime<Utc>>,
     pub flows: BTreeMap<String, Flow>,
     pub messages: BTreeMap<String, FlowMessage>,
+    pub flow_changes: BTreeMap<String, FlowChangeRequest>,
     pub executions: BTreeMap<String, ExecutionRecord>,
     pub flight_leases: BTreeMap<String, FlightLease>,
     pub attentions: BTreeMap<String, TrackingAttention>,
@@ -212,24 +214,77 @@ impl OrganizationState {
                 task.last_heartbeat = None;
             }
             DomainEvent::FlowRescheduled { flow_id, revision } => {
-                let flow = self.flow_mut(flow_id)?;
-                for task in &mut flow.tasks {
-                    let estimate = revision.task_estimates.get(&task.id).ok_or_else(|| {
-                        MambaError::Validation(format!(
-                            "flow schedule revision has no estimate for task {}",
-                            task.id
-                        ))
-                    })?;
-                    task.estimate = estimate.clone();
-                }
-                if revision.task_estimates.len() != flow.tasks.len() {
-                    return Err(MambaError::Validation(format!(
-                        "flow schedule revision for {flow_id} has unexpected tasks"
+                self.apply_schedule_revision(flow_id, revision)?;
+            }
+            DomainEvent::FlowChangeProposed { request } => {
+                self.flow(&request.flow_id)?;
+                self.principal(&request.requested_by_id)?;
+                self.flow_changes
+                    .insert(request.id.clone(), request.as_ref().clone());
+            }
+            DomainEvent::FlowChangeApplied {
+                flow_id,
+                request_id,
+                prd,
+                new_tasks,
+                applied_by,
+                applied_at,
+                revision,
+            } => {
+                let request =
+                    self.flow_changes
+                        .get(request_id)
+                        .ok_or_else(|| MambaError::NotFound {
+                            entity: "flow change request",
+                            id: request_id.clone(),
+                        })?;
+                if request.flow_id != *flow_id || request.status != FlowChangeStatus::Proposed {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "flow change request {request_id} cannot be applied"
                     )));
                 }
-                flow.p50_finish = revision.p50_finish;
-                flow.p80_finish = revision.p80_finish;
-                flow.critical_path = revision.critical_path.clone();
+                let flow = self.flow_mut(flow_id)?;
+                for task in new_tasks {
+                    if flow.task(&task.id).is_some()
+                        || flow.tasks.iter().any(|existing| existing.key == task.key)
+                    {
+                        return Err(MambaError::Validation(format!(
+                            "flow change request adds duplicate task {}",
+                            task.key
+                        )));
+                    }
+                    flow.tasks.push(task.clone());
+                }
+                flow.prd = prd.clone();
+                self.apply_schedule_revision(flow_id, revision)?;
+                let request = self.flow_changes.get_mut(request_id).unwrap();
+                request.status = FlowChangeStatus::Applied;
+                request.resolved_at = Some(*applied_at);
+                request.resolved_by = Some(applied_by.clone());
+            }
+            DomainEvent::FlowChangeRejected {
+                flow_id,
+                request_id,
+                rejected_by,
+                reason,
+                rejected_at,
+            } => {
+                let request =
+                    self.flow_changes
+                        .get_mut(request_id)
+                        .ok_or_else(|| MambaError::NotFound {
+                            entity: "flow change request",
+                            id: request_id.clone(),
+                        })?;
+                if request.flow_id != *flow_id || request.status != FlowChangeStatus::Proposed {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "flow change request {request_id} cannot be rejected"
+                    )));
+                }
+                request.status = FlowChangeStatus::Rejected;
+                request.resolved_at = Some(*rejected_at);
+                request.resolved_by = Some(rejected_by.clone());
+                request.rejection_reason = Some(reason.clone());
             }
             DomainEvent::TaskStarted {
                 flow_id,
@@ -604,6 +659,32 @@ impl OrganizationState {
         if let Some(value) = flow.tasks.iter().map(|task| task.estimate.p80_finish).max() {
             flow.p80_finish = value;
         }
+        Ok(())
+    }
+
+    fn apply_schedule_revision(
+        &mut self,
+        flow_id: &str,
+        revision: &FlowScheduleRevision,
+    ) -> Result<()> {
+        let flow = self.flow_mut(flow_id)?;
+        for task in &mut flow.tasks {
+            let estimate = revision.task_estimates.get(&task.id).ok_or_else(|| {
+                MambaError::Validation(format!(
+                    "flow schedule revision has no estimate for task {}",
+                    task.id
+                ))
+            })?;
+            task.estimate = estimate.clone();
+        }
+        if revision.task_estimates.len() != flow.tasks.len() {
+            return Err(MambaError::Validation(format!(
+                "flow schedule revision for {flow_id} has unexpected tasks"
+            )));
+        }
+        flow.p50_finish = revision.p50_finish;
+        flow.p80_finish = revision.p80_finish;
+        flow.critical_path = revision.critical_path.clone();
         Ok(())
     }
 }

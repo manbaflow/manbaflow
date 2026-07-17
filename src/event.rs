@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     ApiCredential, Assignment, AttentionKind, Demand, Estimate, Evidence, ExecutionRecord,
-    ExternalArtifact, FlightLease, Flow, FlowMessage, FlowScheduleRevision, MessageAcknowledgement,
-    Organization, Principal, RemoteFlightReport, Team, TrackingAttention, TrackingEscalation,
+    ExternalArtifact, FlightLease, Flow, FlowChangeRequest, FlowMessage, FlowScheduleRevision,
+    MessageAcknowledgement, Organization, PrdDraft, Principal, RemoteFlightReport, Task, Team,
+    TrackingAttention, TrackingEscalation,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -81,6 +82,25 @@ pub enum DomainEvent {
     FlowRescheduled {
         flow_id: String,
         revision: FlowScheduleRevision,
+    },
+    FlowChangeProposed {
+        request: Box<FlowChangeRequest>,
+    },
+    FlowChangeApplied {
+        flow_id: String,
+        request_id: String,
+        prd: PrdDraft,
+        new_tasks: Vec<Task>,
+        revision: FlowScheduleRevision,
+        applied_by: String,
+        applied_at: DateTime<Utc>,
+    },
+    FlowChangeRejected {
+        flow_id: String,
+        request_id: String,
+        rejected_by: String,
+        reason: String,
+        rejected_at: DateTime<Utc>,
     },
     TaskStarted {
         flow_id: String,
@@ -230,6 +250,9 @@ impl DomainEvent {
             Self::TaskEstimateNegotiated { .. } => "task.estimate_negotiated",
             Self::TaskReassigned { .. } => "task.reassigned",
             Self::FlowRescheduled { .. } => "flow.rescheduled",
+            Self::FlowChangeProposed { .. } => "flow_change.proposed",
+            Self::FlowChangeApplied { .. } => "flow_change.applied",
+            Self::FlowChangeRejected { .. } => "flow_change.rejected",
             Self::TaskStarted { .. } => "task.started",
             Self::TaskHeartbeat { .. } => "task.heartbeat",
             Self::TaskBlocked { .. } => "task.blocked",
@@ -267,6 +290,8 @@ impl DomainEvent {
             | Self::TaskEstimateNegotiated { flow_id, .. }
             | Self::TaskReassigned { flow_id, .. }
             | Self::FlowRescheduled { flow_id, .. }
+            | Self::FlowChangeApplied { flow_id, .. }
+            | Self::FlowChangeRejected { flow_id, .. }
             | Self::TaskStarted { flow_id, .. }
             | Self::TaskHeartbeat { flow_id, .. }
             | Self::TaskBlocked { flow_id, .. }
@@ -286,6 +311,7 @@ impl DomainEvent {
             Self::TrackingAttentionRaised { attention } => Some(&attention.flow_id),
             Self::TrackingEscalationRaised { escalation } => Some(&escalation.flow_id),
             Self::FlowMessagePosted { message } => Some(&message.flow_id),
+            Self::FlowChangeProposed { request } => Some(&request.flow_id),
             Self::ExecutorFinished { record } => Some(&record.flow_id),
             Self::RemoteFlightAuthorized { lease } => Some(&lease.flow_id),
             Self::OrganizationInitialized { .. }

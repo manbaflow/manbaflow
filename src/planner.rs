@@ -1,9 +1,10 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{ExecutorKind, ExecutorMode, PlanDraft, PrdDraft, TaskDraft};
+use crate::domain::{ExecutorKind, ExecutorMode, Flow, PlanDraft, PrdDraft, TaskDraft};
 use crate::error::{MambaError, Result};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
 use crate::ids::normalize_capability;
@@ -38,45 +39,92 @@ pub async fn generate_plan(
     let plan = match planner {
         PlannerKind::Local => local_plan(demand),
         PlannerKind::ClaudeCode | PlannerKind::Codex => {
-            let kind = match planner {
-                PlannerKind::ClaudeCode => ExecutorKind::ClaudeCode,
-                PlannerKind::Codex => ExecutorKind::Codex,
-                PlannerKind::Local => unreachable!(),
-            };
-            let executor = state
-                .principals
-                .values()
-                .filter(|principal| principal.active)
-                .filter_map(|principal| {
-                    principal
-                        .executor
-                        .as_ref()
-                        .map(|config| (principal, config))
-                })
-                .filter(|(_, config)| config.kind == kind)
-                .min_by(|(left, _), (right, _)| left.name.cmp(&right.name));
-            let command = executor.and_then(|(_, config)| config.command.clone());
-            let model = executor.and_then(|(_, config)| config.model.clone());
-            let prompt = planner_prompt(demand, state);
-            let schema = serde_json::to_value(schema_for!(PlanDraft))?;
-            let output = TerminalExecutor::run(ExecutionRequest {
-                kind,
-                command,
-                workspace: workspace.to_path_buf(),
-                model,
-                mode: ExecutorMode::Plan,
-                prompt,
-                output_schema: Some(schema),
-                timeout_seconds,
+            model_plan(
+                planner,
+                planner_prompt(demand, state),
+                state,
+                workspace,
                 log_path,
-            })
-            .await?;
-            serde_json::from_value(output.structured_output.ok_or_else(|| {
-                MambaError::InvalidExecutorOutput("planner returned no structured output".into())
-            })?)?
+                timeout_seconds,
+            )
+            .await?
         }
     };
     validate_plan(plan)
+}
+
+pub async fn generate_revision_plan(
+    planner: PlannerKind,
+    flow: &Flow,
+    change: &str,
+    state: &OrganizationState,
+    workspace: &Path,
+    log_path: PathBuf,
+    timeout_seconds: u64,
+) -> Result<PlanDraft> {
+    let plan = match planner {
+        PlannerKind::Local => local_revision(flow, change),
+        PlannerKind::ClaudeCode | PlannerKind::Codex => {
+            let current = serde_json::to_string_pretty(&flow_to_plan(flow))?;
+            let prompt = format!(
+                "You are revising an approved enterprise Flow. Return a complete revised PlanDraft.\n\
+                 Preserve every existing task key and its definition exactly. Do not remove, rename, or modify existing tasks.\n\
+                 Express the requested change by updating the PRD and appending at most 20 dependency-aware tasks.\n\
+                 New task keys must be unique kebab-case. Dependencies may reference existing or new task keys.\n\
+                 Return only data matching the supplied JSON schema. Do not assign people.\n\n\
+                 Current plan:\n{current}\n\nRequested change:\n{change}"
+            );
+            model_plan(planner, prompt, state, workspace, log_path, timeout_seconds).await?
+        }
+    };
+    validate_plan(plan)
+}
+
+async fn model_plan(
+    planner: PlannerKind,
+    prompt: String,
+    state: &OrganizationState,
+    workspace: &Path,
+    log_path: PathBuf,
+    timeout_seconds: u64,
+) -> Result<PlanDraft> {
+    let kind = match planner {
+        PlannerKind::ClaudeCode => ExecutorKind::ClaudeCode,
+        PlannerKind::Codex => ExecutorKind::Codex,
+        PlannerKind::Local => unreachable!(),
+    };
+    let executor = state
+        .principals
+        .values()
+        .filter(|principal| principal.active)
+        .filter_map(|principal| {
+            principal
+                .executor
+                .as_ref()
+                .map(|config| (principal, config))
+        })
+        .filter(|(_, config)| config.kind == kind)
+        .min_by(|(left, _), (right, _)| left.name.cmp(&right.name));
+    let command = executor.and_then(|(_, config)| config.command.clone());
+    let model = executor.and_then(|(_, config)| config.model.clone());
+    let schema = serde_json::to_value(schema_for!(PlanDraft))?;
+    let output = TerminalExecutor::run(ExecutionRequest {
+        kind,
+        command,
+        workspace: workspace.to_path_buf(),
+        model,
+        mode: ExecutorMode::Plan,
+        prompt,
+        output_schema: Some(schema),
+        timeout_seconds,
+        log_path,
+    })
+    .await?;
+    Ok(serde_json::from_value(
+        output.structured_output.ok_or_else(|| {
+            MambaError::InvalidExecutorOutput("planner returned no structured output".into())
+        })?,
+    )?)
 }
 
 fn planner_prompt(demand: &str, state: &OrganizationState) -> String {
@@ -111,6 +159,96 @@ fn planner_prompt(demand: &str, state: &OrganizationState) -> String {
          Teams:\n{teams}\n\n\
          People and agents:\n{people}"
     )
+}
+
+fn local_revision(flow: &Flow, change: &str) -> PlanDraft {
+    let mut plan = flow_to_plan(flow);
+    plan.prd.summary = format!("{}\n\nChange request: {}", plan.prd.summary, change.trim());
+    plan.prd
+        .goals
+        .push(format!("deliver approved change: {}", change.trim()));
+    plan.prd.acceptance_criteria.push(format!(
+        "change request is verified and accepted: {}",
+        change.trim()
+    ));
+
+    let mut suffix = 1usize;
+    let keys = plan
+        .tasks
+        .iter()
+        .map(|task| task.key.as_str())
+        .collect::<BTreeSet<_>>();
+    let key = loop {
+        let candidate = format!("change-{suffix}");
+        if !keys.contains(candidate.as_str()) {
+            break candidate;
+        }
+        suffix += 1;
+    };
+    let depended_on = plan
+        .tasks
+        .iter()
+        .flat_map(|task| task.depends_on.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let leaves = plan
+        .tasks
+        .iter()
+        .filter(|task| !depended_on.contains(&task.key))
+        .map(|task| task.key.clone())
+        .collect::<Vec<_>>();
+    let lowered = change.to_lowercase();
+    let capabilities = if lowered.contains("security") || lowered.contains("安全") {
+        vec!["security".into()]
+    } else if lowered.contains("observ") || lowered.contains("监控") {
+        vec!["observability".into()]
+    } else if lowered.contains("document") || lowered.contains("office") || lowered.contains("文档")
+    {
+        vec!["product".into()]
+    } else {
+        Vec::new()
+    };
+    let compact = change.trim().chars().take(64).collect::<String>();
+    let title = if compact.is_ascii() {
+        format!("Implement change: {compact}")
+    } else {
+        format!("落实变更：{compact}")
+    };
+    plan.tasks.push(TaskDraft {
+        key,
+        title,
+        description: change.trim().to_string(),
+        required_capabilities: capabilities,
+        depends_on: leaves,
+        effort_hours: 8.0,
+        requires_human: false,
+        acceptance_criteria: vec!["the requested change has evidence and passes review".into()],
+    });
+    plan
+}
+
+fn flow_to_plan(flow: &Flow) -> PlanDraft {
+    PlanDraft {
+        prd: flow.prd.clone(),
+        tasks: flow
+            .tasks
+            .iter()
+            .map(|task| TaskDraft {
+                key: task.key.clone(),
+                title: task.title.clone(),
+                description: task.description.clone(),
+                required_capabilities: task.required_capabilities.clone(),
+                depends_on: task
+                    .depends_on
+                    .iter()
+                    .filter_map(|dependency| flow.task(dependency))
+                    .map(|dependency| dependency.key.clone())
+                    .collect(),
+                effort_hours: task.estimate.effort_hours,
+                requires_human: task.requires_human,
+                acceptance_criteria: task.acceptance_criteria.clone(),
+            })
+            .collect(),
+    }
 }
 
 fn local_plan(demand: &str) -> PlanDraft {

@@ -283,6 +283,49 @@ pub struct FlowScheduleRevision {
     pub revised_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowChangeStatus {
+    Proposed,
+    Applied,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FlowChangeImpact {
+    pub added_task_ids: Vec<String>,
+    pub added_task_titles: Vec<String>,
+    pub affected_task_ids: Vec<String>,
+    pub official_p80_finish: DateTime<Utc>,
+    pub baseline_p80_finish: DateTime<Utc>,
+    pub proposed_p80_finish: DateTime<Utc>,
+    pub baseline_p80_delta_hours: f64,
+    pub scope_p80_delta_hours: f64,
+    pub net_p80_delta_hours: f64,
+    pub risks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FlowChangeRequest {
+    pub id: String,
+    pub flow_id: String,
+    pub summary: String,
+    pub requested_by_id: String,
+    pub requested_by_name: String,
+    pub planner: String,
+    pub proposed_prd: PrdDraft,
+    pub new_tasks: Vec<Task>,
+    pub preview_schedule: FlowScheduleRevision,
+    pub base_task_statuses: BTreeMap<String, TaskStatus>,
+    pub base_p80_finish: DateTime<Utc>,
+    pub impact: FlowChangeImpact,
+    pub status: FlowChangeStatus,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolved_by: Option<String>,
+    pub rejection_reason: Option<String>,
+}
+
 impl Flow {
     pub fn task(&self, task_id: &str) -> Option<&Task> {
         self.tasks

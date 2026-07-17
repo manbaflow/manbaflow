@@ -17,11 +17,13 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
-    AssignmentTarget, Evidence, ExecutorKind, FlightLease, Flow, FlowMessage, FlowMessageKind,
-    MessageInboxItem, Principal, PrincipalKind, RemoteFlightReport, Task, TrackingEscalation,
+    AssignmentTarget, Evidence, ExecutorKind, FlightLease, Flow, FlowChangeRequest, FlowMessage,
+    FlowMessageKind, MessageInboxItem, Principal, PrincipalKind, RemoteFlightReport, Task,
+    TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
+use crate::planner::PlannerKind;
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -125,6 +127,16 @@ struct ReassignInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ProposeFlowChangeInput {
+    summary: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RejectFlowChangeInput {
+    reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct MessageInboxQuery {
     #[serde(default)]
     all: bool,
@@ -206,6 +218,15 @@ fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAu
             "/api/v1/flows/{id}/messages",
             get(flow_messages).post(post_message),
         )
+        .route(
+            "/api/v1/flows/{id}/changes",
+            get(flow_changes).post(propose_flow_change),
+        )
+        .route(
+            "/api/v1/flow-changes/{id}/approve",
+            post(approve_flow_change),
+        )
+        .route("/api/v1/flow-changes/{id}/reject", post(reject_flow_change))
         .route("/api/v1/tasks/{id}/accept", post(accept_task))
         .route("/api/v1/tasks/{id}/start", post(start_task))
         .route("/api/v1/tasks/{id}/heartbeat", post(heartbeat_task))
@@ -342,6 +363,61 @@ async fn post_message(
             &input.body,
             input.requires_ack,
         )
+    })
+    .await
+}
+
+async fn flow_changes(
+    State(state): State<ApiState>,
+    Path(flow_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<FlowChangeRequest>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.flow_changes(&flow_id, &principal.id)?))
+}
+
+async fn propose_flow_change(
+    State(state): State<ApiState>,
+    Path(flow_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<ProposeFlowChangeInput>,
+) -> ApiResult<Json<FlowChangeRequest>> {
+    let workspace = std::env::current_dir().map_err(MambaError::from)?;
+    let mut app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    let change = app
+        .propose_flow_change(
+            &flow_id,
+            &principal.id,
+            &input.summary,
+            PlannerKind::Local,
+            &workspace,
+            30,
+        )
+        .await?;
+    Ok(Json(change))
+}
+
+async fn approve_flow_change(
+    State(state): State<ApiState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<FlowChangeRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.approve_flow_change(&request_id, actor)
+    })
+    .await
+}
+
+async fn reject_flow_change(
+    State(state): State<ApiState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<RejectFlowChangeInput>,
+) -> ApiResult<Json<FlowChangeRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.reject_flow_change(&request_id, actor, &input.reason)
     })
     .await
 }
@@ -946,6 +1022,45 @@ mod tests {
                 .estimate
                 .effort_hours,
             12.0
+        );
+
+        let proposed = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                &format!("/api/v1/flows/{}/changes", flow.id),
+                &issued.token,
+                json!({"summary": "Add a release checklist"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(proposed.status(), StatusCode::OK);
+        let body = to_bytes(proposed.into_body(), usize::MAX).await.unwrap();
+        let change: FlowChangeRequest = serde_json::from_slice(&body).unwrap();
+        assert_eq!(change.new_tasks.len(), 1);
+        let denied = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/flow-changes/{}/approve", change.id),
+                &observer_token.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let approved = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/flow-changes/{}/approve", change.id),
+                &issued.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+        assert_eq!(
+            app.lock().await.state().flow(&flow.id).unwrap().tasks.len(),
+            4
         );
 
         app.lock()

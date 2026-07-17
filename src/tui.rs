@@ -156,6 +156,8 @@ enum MouseAction {
     SendMessage,
     NegotiateEstimate,
     Reassign,
+    RequestChange,
+    RejectChange,
     ScanTracker,
     AcknowledgeEscalation,
     CycleActor,
@@ -208,6 +210,12 @@ enum InputPurpose {
         task_id: String,
         candidates: Vec<AssignmentTarget>,
         selected: usize,
+    },
+    FlowChange {
+        flow_id: String,
+    },
+    RejectChange {
+        request_id: String,
     },
     Run {
         task_id: String,
@@ -400,6 +408,8 @@ impl UiState {
             KeyCode::Char('m') => self.open_message_input(app),
             KeyCode::Char('i') => self.open_estimate_input(app),
             KeyCode::Char('v') => self.open_reassign_input(app),
+            KeyCode::Char('f') => self.open_flow_change_input(app),
+            KeyCode::Char('o') => self.open_reject_change_input(app),
             KeyCode::Char('p') => self.open_run_confirmation(app, ExecutorMode::Plan),
             KeyCode::Char('x') => self.open_run_confirmation(app, ExecutorMode::Execute),
             KeyCode::Char('t') => self.scan_tracker(app, true),
@@ -511,6 +521,8 @@ impl UiState {
             MouseAction::SendMessage => self.open_message_input(app),
             MouseAction::NegotiateEstimate => self.open_estimate_input(app),
             MouseAction::Reassign => self.open_reassign_input(app),
+            MouseAction::RequestChange => self.open_flow_change_input(app),
+            MouseAction::RejectChange => self.open_reject_change_input(app),
             MouseAction::ScanTracker => self.scan_tracker(app, true),
             MouseAction::AcknowledgeEscalation => self.acknowledge_next_inbox(app),
             MouseAction::CycleActor => self.cycle_actor(app),
@@ -621,6 +633,34 @@ impl UiState {
             return;
         }
 
+        if let InputPurpose::FlowChange { flow_id } = &modal.purpose {
+            let result = app
+                .propose_flow_change(
+                    flow_id,
+                    &actor,
+                    value,
+                    PlannerKind::Local,
+                    &self.workspace,
+                    30,
+                )
+                .await;
+            match result {
+                Ok(change) => {
+                    self.refresh_timeline(app);
+                    self.success(format!(
+                        "{} 影响预览：+{} tasks · 进度 {:+.1}h + 范围 {:+.1}h = 净 {:+.1}h；按 a 批准",
+                        change.id,
+                        change.new_tasks.len(),
+                        change.impact.baseline_p80_delta_hours,
+                        change.impact.scope_p80_delta_hours,
+                        change.impact.net_p80_delta_hours
+                    ));
+                }
+                Err(error) => self.failure(error),
+            }
+            return;
+        }
+
         let result = match modal.purpose {
             InputPurpose::Demand => unreachable!(),
             InputPurpose::Evidence { task_id } => app
@@ -692,6 +732,10 @@ impl UiState {
                         flow.p80_finish.format("%m-%d %H:%M")
                     )
                 }),
+            InputPurpose::FlowChange { .. } => unreachable!(),
+            InputPurpose::RejectChange { request_id } => app
+                .reject_flow_change(&request_id, &actor, value)
+                .map(|change| format!("{} 已驳回，正式 Flow 保持不变", change.id)),
             InputPurpose::Run { .. } => unreachable!(),
         };
         match result {
@@ -798,8 +842,18 @@ impl UiState {
             let flow_id = self.selected_flow(app).map(|flow| flow.id.clone());
             flow_id
                 .ok_or_else(|| MambaError::Validation("没有选中的 Flow".to_string()))
-                .and_then(|flow_id| app.approve_flow(&flow_id, &actor))
-                .map(|flow| format!("{} 已批准，WorkRequest 完成传球", flow.id))
+                .and_then(|flow_id| {
+                    if let Some(change_id) = app
+                        .pending_flow_change(&flow_id)
+                        .map(|change| change.id.clone())
+                    {
+                        app.approve_flow_change(&change_id, &actor)
+                            .map(|change| format!("{} 已批准，新增任务完成传球", change.id))
+                    } else {
+                        app.approve_flow(&flow_id, &actor)
+                            .map(|flow| format!("{} 已批准，WorkRequest 完成传球", flow.id))
+                    }
+                })
         } else {
             let task_id = self
                 .selected_task_context(app)
@@ -1108,6 +1162,43 @@ impl UiState {
             )),
             Err(error) => self.failure(error),
         }
+    }
+
+    fn open_flow_change_input(&mut self, app: &MambaApp) {
+        let Some(flow) = self.selected_flow(app) else {
+            self.failure(MambaError::Validation("请先选择一条 Flow".into()));
+            return;
+        };
+        if let Some(change) = app.pending_flow_change(&flow.id) {
+            self.failure(MambaError::InvalidTransition(format!(
+                "{} 正在等待批准；按 a 应用或按 o 驳回",
+                change.id
+            )));
+            return;
+        }
+        self.modal = Some(InputModal {
+            purpose: InputPurpose::FlowChange {
+                flow_id: flow.id.clone(),
+            },
+            value: String::new(),
+        });
+    }
+
+    fn open_reject_change_input(&mut self, app: &MambaApp) {
+        let Some(flow) = self.selected_flow(app) else {
+            self.failure(MambaError::Validation("请先选择一条 Flow".into()));
+            return;
+        };
+        let Some(change) = app.pending_flow_change(&flow.id) else {
+            self.failure(MambaError::Validation("当前 Flow 没有待处理的变更".into()));
+            return;
+        };
+        self.modal = Some(InputModal {
+            purpose: InputPurpose::RejectChange {
+                request_id: change.id.clone(),
+            },
+            value: String::new(),
+        });
     }
 
     fn open_task_input(&mut self, app: &MambaApp, evidence: bool) {
@@ -1639,6 +1730,11 @@ fn render_flow_table(
         .iter()
         .filter_map(|id| app.state().flows.get(id))
         .map(|flow| {
+            let title = if app.pending_flow_change(&flow.id).is_some() {
+                format!("[CHG] {}", flow.prd.title)
+            } else {
+                flow.prd.title.clone()
+            };
             let health = dashboard
                 .flows
                 .iter()
@@ -1653,7 +1749,13 @@ fn render_flow_table(
             let cells = if compact_columns {
                 vec![
                     Cell::from(flow_health_label(health)).style(flow_health_style(health)),
-                    Cell::from(flow.prd.title.clone()).style(Style::new().fg(TEXT)),
+                    Cell::from(title.clone()).style(Style::new().fg(
+                        if title.starts_with("[CHG]") {
+                            ORANGE
+                        } else {
+                            TEXT
+                        },
+                    )),
                     Cell::from(format!("{completed}/{}", flow.tasks.len()))
                         .style(Style::new().fg(CYAN)),
                 ]
@@ -1661,7 +1763,13 @@ fn render_flow_table(
                 vec![
                     Cell::from(flow_health_label(health)).style(flow_health_style(health)),
                     Cell::from(flow.id.clone()).style(Style::new().fg(MUTED)),
-                    Cell::from(flow.prd.title.clone()).style(Style::new().fg(TEXT)),
+                    Cell::from(title.clone()).style(Style::new().fg(
+                        if title.starts_with("[CHG]") {
+                            ORANGE
+                        } else {
+                            TEXT
+                        },
+                    )),
                     Cell::from(format!("{completed}/{}", flow.tasks.len()))
                         .style(Style::new().fg(CYAN)),
                     Cell::from(flow.p80_finish.format("%m-%d %H:%M").to_string())
@@ -1854,6 +1962,14 @@ fn render_action_queue(frame: &mut Frame, app: &MambaApp, area: Rect) {
 
 fn render_flows(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
     if area.width < 92 {
+        if area.height < 18 {
+            let [flows, tasks] = Layout::vertical([Constraint::Length(6), Constraint::Min(6)])
+                .spacing(1)
+                .areas(area);
+            render_flow_selector(frame, app, state, flows, !state.focus_tasks);
+            render_tasks(frame, state, app, tasks, state.focus_tasks);
+            return;
+        }
         let [flows, prd, tasks] = Layout::vertical([
             Constraint::Percentage(28),
             Constraint::Percentage(27),
@@ -1862,7 +1978,14 @@ fn render_flows(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Re
         .spacing(1)
         .areas(area);
         render_flow_selector(frame, app, state, flows, !state.focus_tasks);
-        render_prd(frame, state.selected_flow(app), prd);
+        render_prd(
+            frame,
+            state.selected_flow(app),
+            state
+                .selected_flow(app)
+                .and_then(|flow| app.pending_flow_change(&flow.id)),
+            prd,
+        );
         render_tasks(frame, state, app, tasks, state.focus_tasks);
         return;
     }
@@ -1878,7 +2001,14 @@ fn render_flows(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Re
     ])
     .spacing(1)
     .areas(right);
-    render_prd(frame, state.selected_flow(app), prd);
+    render_prd(
+        frame,
+        state.selected_flow(app),
+        state
+            .selected_flow(app)
+            .and_then(|flow| app.pending_flow_change(&flow.id)),
+        prd,
+    );
     render_tasks(frame, state, app, tasks, state.focus_tasks);
     render_task_detail(
         frame,
@@ -1887,7 +2017,12 @@ fn render_flows(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Re
     );
 }
 
-fn render_prd(frame: &mut Frame, flow: Option<&Flow>, area: Rect) {
+fn render_prd(
+    frame: &mut Frame,
+    flow: Option<&Flow>,
+    pending_change: Option<&crate::domain::FlowChangeRequest>,
+    area: Rect,
+) {
     let text = flow.map_or_else(
         || Text::from("还没有 Flow。点击 SHOWCASE 装载演示，或按 n 提出需求。"),
         |flow| {
@@ -1896,6 +2031,22 @@ fn render_prd(frame: &mut Frame, flow: Option<&Flow>, area: Rect) {
                 Line::styled(flow.prd.summary.clone(), Style::new().fg(TEXT)),
                 Line::raw(""),
             ];
+            if let Some(change) = pending_change {
+                lines.push(Line::from(vec![
+                    Span::styled("CHANGE  ", Style::new().fg(PURPLE).bold()),
+                    Span::styled(
+                        format!(
+                            "{} · +{} tasks · 进度 {:+.1}h + 范围 {:+.1}h = 净 {:+.1}h · 按 a 批准",
+                            change.id,
+                            change.new_tasks.len(),
+                            change.impact.baseline_p80_delta_hours,
+                            change.impact.scope_p80_delta_hours,
+                            change.impact.net_p80_delta_hours
+                        ),
+                        Style::new().fg(ORANGE),
+                    ),
+                ]));
+            }
             lines.extend(flow.prd.acceptance_criteria.iter().map(|criterion| {
                 Line::from(vec![
                     Span::styled("✓ ", Style::new().fg(GREEN)),
@@ -1932,7 +2083,18 @@ fn render_flow_selector(
                 .count();
             Row::new(vec![
                 Cell::from(flow_status_label(&flow.status)).style(flow_status_style(&flow.status)),
-                Cell::from(flow.prd.title.clone()).style(Style::new().fg(TEXT)),
+                Cell::from(if app.pending_flow_change(&flow.id).is_some() {
+                    format!("[CHG] {}", flow.prd.title)
+                } else {
+                    flow.prd.title.clone()
+                })
+                .style(Style::new().fg(
+                    if app.pending_flow_change(&flow.id).is_some() {
+                        ORANGE
+                    } else {
+                        TEXT
+                    },
+                )),
                 Cell::from(format!("{completed}/{}", flow.tasks.len()))
                     .style(Style::new().fg(CYAN)),
             ])
@@ -2567,11 +2729,13 @@ fn render_shortcuts(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area
     let mut actions = match state.view {
         View::Overview => vec![
             ("新需求", MouseAction::NewDemand),
+            ("变更", MouseAction::RequestChange),
             ("批准", MouseAction::ApproveOrAccept),
             ("巡航", MouseAction::ScanTracker),
         ],
         View::Flows => vec![
             ("批准/接单", MouseAction::ApproveOrAccept),
+            ("变更", MouseAction::RequestChange),
             ("推进", MouseAction::Advance),
             ("传球", MouseAction::SendMessage),
             ("调时", MouseAction::NegotiateEstimate),
@@ -2597,6 +2761,17 @@ fn render_shortcuts(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area
     };
     if state.view == View::Overview && app.state().organization.is_none() {
         actions.insert(0, ("SHOWCASE", MouseAction::LoadShowcase));
+    }
+    if state
+        .selected_flow(app)
+        .is_some_and(|flow| app.pending_flow_change(&flow.id).is_some())
+    {
+        let index = match state.view {
+            View::Overview => 3.min(actions.len()),
+            View::Flows => 2.min(actions.len()),
+            _ => actions.len(),
+        };
+        actions.insert(index, ("驳回变更", MouseAction::RejectChange));
     }
     let mut spans = Vec::new();
     let mut x = area.x;
@@ -2684,6 +2859,16 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
                     .unwrap_or("无候选人")
             ),
             ORANGE,
+        ),
+        InputPurpose::FlowChange { .. } => (
+            "CHANGE REQUEST / 航线变更",
+            "描述新增范围；先生成影响预览，不会立即修改正式 Flow".into(),
+            PURPLE,
+        ),
+        InputPurpose::RejectChange { .. } => (
+            "REJECT CHANGE / 驳回变更",
+            "输入驳回原因；申请会进入黑匣子，正式 Flow 保持不变".into(),
+            RED,
         ),
         InputPurpose::Run { mode, .. } => (
             "FLIGHT CLEARANCE / 航班放行",
@@ -2832,7 +3017,7 @@ fn render_planner_selector(frame: &mut Frame, area: Rect, state: &mut UiState) {
 }
 
 fn render_help_modal(frame: &mut Frame) {
-    let area = centered(frame.area(), 78, 32);
+    let area = centered(frame.area(), 78, 33);
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::styled("塔台操作手册", Style::new().fg(GOLD).bold()),
@@ -2851,6 +3036,8 @@ fn render_help_modal(frame: &mut Frame) {
         help_line("m", "围绕当前任务向 Owner、Copilot 或 Requester 传球"),
         help_line("i", "协商当前任务基础工时并动态重排整条 DAG"),
         help_line("v", "Requester 为当前任务选择新 Owner 并重新排期"),
+        help_line("f", "为当前 Flow 生成 append-only 变更和影响预览"),
+        help_line("o", "驳回当前 Flow 待批准的变更并记录原因"),
         help_line("a", "批准 Flow，或接受当前 Assignment"),
         help_line("s", "按状态接单、开工或提交验收"),
         help_line("e", "为当前任务补充 Evidence"),
@@ -2986,6 +3173,8 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::SendMessage => GOLD,
         MouseAction::NegotiateEstimate => CYAN,
         MouseAction::Reassign => ORANGE,
+        MouseAction::RequestChange => PURPLE,
+        MouseAction::RejectChange => RED,
         MouseAction::Block | MouseAction::Quit => RED,
         MouseAction::ScanTracker => ORANGE,
         MouseAction::AcknowledgeEscalation => GOLD,
@@ -3873,6 +4062,95 @@ mod tests {
                 > old_downstream_start
         );
         assert!(state.message.contains("重新排期"));
+
+        state.actor_id = Some(manager.id.clone());
+        state.focus_tasks = false;
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let change_action = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::RequestChange))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(change_action))
+            .await
+            .unwrap();
+        let Some(modal) = &mut state.modal else {
+            panic!("flow change modal should open");
+        };
+        modal.value = "Add a customer migration checklist".into();
+        let task_count = app.state().flow(&flow.id).unwrap().tasks.len();
+        state.submit_modal(&mut app).await;
+        assert_eq!(app.state().flow(&flow.id).unwrap().tasks.len(), task_count);
+        assert!(app.pending_flow_change(&flow.id).is_some());
+
+        let compact_backend = TestBackend::new(80, 24);
+        let mut compact_terminal = Terminal::new(compact_backend).unwrap();
+        compact_terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let compact_content = compact_terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(compact_content.contains("[CHG]"), "{compact_content}");
+
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let approve = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::ApproveOrAccept))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(approve))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.state().flow(&flow.id).unwrap().tasks.len(),
+            task_count + 1
+        );
+        assert!(app.pending_flow_change(&flow.id).is_none());
+        assert!(state.message.contains("新增任务完成传球"));
+
+        state.open_flow_change_input(&app);
+        state.modal.as_mut().unwrap().value = "Add an optional launch survey".into();
+        let approved_task_count = app.state().flow(&flow.id).unwrap().tasks.len();
+        state.submit_modal(&mut app).await;
+        let rejected_change_id = app.pending_flow_change(&flow.id).unwrap().id.clone();
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let reject = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::RejectChange))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(reject))
+            .await
+            .unwrap();
+        state.modal.as_mut().unwrap().value = "Not required for this release".into();
+        state.submit_modal(&mut app).await;
+        assert_eq!(
+            app.state().flow(&flow.id).unwrap().tasks.len(),
+            approved_task_count
+        );
+        assert!(app.pending_flow_change(&flow.id).is_none());
+        assert_eq!(
+            app.state().flow_changes[&rejected_change_id].status,
+            crate::domain::FlowChangeStatus::Rejected
+        );
+        assert!(state.message.contains("正式 Flow 保持不变"));
     }
 
     #[cfg(unix)]
