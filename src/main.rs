@@ -1,17 +1,19 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use manbaflow::calendar::{parse_workdays, summary as calendar_summary};
 use manbaflow::dashboard::DashboardSnapshot;
 use manbaflow::domain::{
     ExecutorConfig, ExecutorKind, ExecutorMode, Flow, FlowChangeRequest, FlowMessage,
-    FlowMessageKind, PrincipalKind, Task, TrackingAttention, TrackingEscalation,
+    FlowMessageKind, PrincipalKind, Task, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
 use manbaflow::showcase::seed_showcase;
 use manbaflow::worker::{RemoteWorker, WorkerOptions, WorkerOutcome, WorkerOutcomeStatus};
-use manbaflow::{MambaApp, Result};
+use manbaflow::{MambaApp, MambaError, Result};
 use serde::Serialize;
 use serde_json::json;
 
@@ -165,10 +167,60 @@ enum PrincipalCommand {
     Add(PrincipalAdd),
     /// 列出所有 Human 和 Agent
     List,
+    /// 配置工作时间和请假区间
+    Calendar {
+        #[command(subcommand)]
+        command: CalendarCommand,
+    },
     /// 管理远程 API Bearer Token
     Token {
         #[command(subcommand)]
         command: CredentialCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CalendarCommand {
+    /// 查看 Principal 的工作日历和请假记录
+    Show {
+        #[arg(long = "for")]
+        target: String,
+    },
+    /// 设置固定 UTC 偏移、工作日和每日工作时间
+    Set {
+        #[arg(long = "for")]
+        target: String,
+        #[arg(long)]
+        utc_offset: String,
+        #[arg(long, default_value = "mon,tue,wed,thu,fri")]
+        days: String,
+        #[arg(long, default_value = "09:00")]
+        start: String,
+        #[arg(long, default_value = "18:00")]
+        end: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
+    /// 登记不可用时间并重排受影响 Flow
+    TimeOffAdd {
+        #[arg(long = "for")]
+        target: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        until: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
+    /// 取消请假并恢复排期
+    TimeOffCancel {
+        #[arg(long = "for")]
+        target: String,
+        block: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
     },
 }
 
@@ -712,7 +764,7 @@ async fn run(cli: Cli) -> Result<()> {
                     .values()
                     .map(|principal| {
                         format!(
-                            "{}\t{}\t{:?}\t{}%\t{}",
+                            "{}\t{}\t{:?}\t{}%\t{}\t{}",
                             principal.id,
                             principal.name,
                             principal.kind,
@@ -724,12 +776,75 @@ async fn run(cli: Cli) -> Result<()> {
                                 .unwrap_or_else(|| match principal.kind {
                                     PrincipalKind::Human => "human".into(),
                                     PrincipalKind::Agent => "remote-worker".into(),
-                                })
+                                }),
+                            app.state()
+                                .work_calendar(&principal.id)
+                                .map(calendar_summary)
+                                .unwrap_or_else(|_| "calendar unavailable".into())
                         )
                     })
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
+            PrincipalCommand::Calendar { command } => match command {
+                CalendarCommand::Show { target } => {
+                    let calendar = app.state().work_calendar(&target)?;
+                    output(calendar, cli.json, calendar_text(calendar));
+                }
+                CalendarCommand::Set {
+                    target,
+                    utc_offset,
+                    days,
+                    start,
+                    end,
+                    by,
+                } => {
+                    let calendar = app.configure_work_calendar(
+                        &target,
+                        parse_utc_offset(&utc_offset)?,
+                        parse_workdays(&days)?,
+                        parse_clock_minute(&start, false)?,
+                        parse_clock_minute(&end, true)?,
+                        &by,
+                    )?;
+                    output(
+                        &calendar,
+                        cli.json,
+                        format!("{} 工作日历已更新：{}", target, calendar_summary(&calendar)),
+                    );
+                }
+                CalendarCommand::TimeOffAdd {
+                    target,
+                    from,
+                    until,
+                    reason,
+                    by,
+                } => {
+                    let block = app.add_time_off(
+                        &target,
+                        parse_datetime(&from)?,
+                        parse_datetime(&until)?,
+                        &reason,
+                        &by,
+                    )?;
+                    output(
+                        &block,
+                        cli.json,
+                        format!(
+                            "{} 已登记不可用：{} 到 {} ({})",
+                            block.id, block.starts_at, block.ends_at, block.reason
+                        ),
+                    );
+                }
+                CalendarCommand::TimeOffCancel { target, block, by } => {
+                    let block = app.cancel_time_off(&target, &block, &by)?;
+                    output(
+                        &block,
+                        cli.json,
+                        format!("{} 已取消，相关 Flow 已重新排期", block.id),
+                    );
+                }
+            },
             PrincipalCommand::Token { command } => match command {
                 CredentialCommand::Issue { target, label, by } => {
                     let issued = app.issue_api_credential(&target, &label, &by)?;
@@ -1318,6 +1433,16 @@ async fn bootstrap_demo(
         None,
         "admin",
     )?;
+    let workdays = parse_workdays("mon,tue,wed,thu,fri")?;
+    app.configure_work_calendar(
+        &leader.id,
+        8 * 60,
+        workdays.clone(),
+        9 * 60,
+        18 * 60,
+        "admin",
+    )?;
+    app.configure_work_calendar(&engineer.id, 8 * 60, workdays, 9 * 60, 18 * 60, "admin")?;
     let codex = app.register_principal(
         "Codex 副驾",
         PrincipalKind::Agent,
@@ -1425,6 +1550,84 @@ fn flow_summary(flow: &Flow) -> String {
         flow.p80_finish.format("%Y-%m-%d %H:%M UTC"),
         flow.tasks.len()
     )
+}
+
+fn calendar_text(calendar: &WorkCalendar) -> String {
+    let mut lines = vec![calendar_summary(calendar)];
+    lines.extend(calendar.time_off.iter().map(|block| {
+        format!(
+            "{}\t{}\t{} -> {}\t{}",
+            block.id,
+            if block.is_active() {
+                "ACTIVE"
+            } else {
+                "CANCELLED"
+            },
+            block.starts_at,
+            block.ends_at,
+            block.reason
+        )
+    }));
+    lines.join("\n")
+}
+
+fn parse_datetime(value: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| {
+            MambaError::Validation(format!(
+                "invalid RFC3339 datetime `{value}`; example: 2026-07-20T09:00:00+08:00"
+            ))
+        })
+}
+
+fn parse_utc_offset(value: &str) -> Result<i32> {
+    let value = value.trim();
+    let sign = match value.as_bytes().first() {
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => {
+            return Err(MambaError::Validation(
+                "UTC offset must start with + or -, for example +08:00".into(),
+            ));
+        }
+    };
+    let (hours, minutes) = value[1..]
+        .split_once(':')
+        .ok_or_else(|| MambaError::Validation("UTC offset must use +HH:MM".into()))?;
+    let hours = hours
+        .parse::<i32>()
+        .map_err(|_| MambaError::Validation("UTC offset hours must be numeric".into()))?;
+    let minutes = minutes
+        .parse::<i32>()
+        .map_err(|_| MambaError::Validation("UTC offset minutes must be numeric".into()))?;
+    if hours > 14 || minutes > 59 || (hours == 14 && minutes != 0) {
+        return Err(MambaError::Validation(
+            "UTC offset must be between -14:00 and +14:00".into(),
+        ));
+    }
+    Ok(sign * (hours * 60 + minutes))
+}
+
+fn parse_clock_minute(value: &str, allow_end_of_day: bool) -> Result<u16> {
+    if allow_end_of_day && value == "24:00" {
+        return Ok(24 * 60);
+    }
+    let (hours, minutes) = value
+        .split_once(':')
+        .ok_or_else(|| MambaError::Validation("clock time must use HH:MM".into()))?;
+    let hours = hours
+        .parse::<u16>()
+        .map_err(|_| MambaError::Validation("clock hours must be numeric".into()))?;
+    let minutes = minutes
+        .parse::<u16>()
+        .map_err(|_| MambaError::Validation("clock minutes must be numeric".into()))?;
+    if hours > 23 || minutes > 59 {
+        return Err(MambaError::Validation(
+            "clock time must be within 00:00..23:59".into(),
+        ));
+    }
+    Ok(hours * 60 + minutes)
 }
 
 fn flow_change_summary(change: &FlowChangeRequest) -> String {

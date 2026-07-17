@@ -91,7 +91,7 @@ pub fn schedule(
         .map(|task| (task.key.clone(), new_id("TSK")))
         .collect::<BTreeMap<_, _>>();
     let mut estimates = BTreeMap::<String, Estimate>::new();
-    let mut longest = BTreeMap::<String, (f64, Vec<String>)>::new();
+    let mut paths = BTreeMap::<String, Vec<String>>::new();
 
     for index in order {
         let draft = &drafts[index];
@@ -104,25 +104,31 @@ pub fn schedule(
             + if draft.requires_human { 0.08 } else { 0.0 };
         let p50_hours = round_hours(draft.effort_hours / capacity * coordination_factor);
         let p80_hours = round_hours(p50_hours * 1.4);
-        let earliest_start = draft
+        let dependency_start = draft
             .depends_on
             .iter()
             .filter_map(|dependency| estimates.get(dependency))
             .map(|estimate| estimate.p80_finish)
             .max()
             .unwrap_or(now);
-        let p50_finish = earliest_start + hours(p50_hours);
-        let p80_finish = earliest_start + hours(p80_hours);
+        let earliest_start = assignment_start(assignment, state, dependency_start)?;
+        let p50_finish = assignment_finish(assignment, state, earliest_start, p50_hours)?;
+        let p80_finish = assignment_finish(assignment, state, earliest_start, p80_hours)?;
 
-        let (previous_hours, mut path) = draft
+        let mut path = draft
             .depends_on
             .iter()
-            .filter_map(|dependency| longest.get(dependency))
-            .max_by(|left, right| left.0.total_cmp(&right.0))
-            .cloned()
-            .unwrap_or((0.0, Vec::new()));
+            .filter_map(|dependency| {
+                Some((
+                    estimates.get(dependency)?.p80_finish,
+                    paths.get(dependency)?,
+                ))
+            })
+            .max_by_key(|(finish, _)| *finish)
+            .map(|(_, path)| path.clone())
+            .unwrap_or_default();
         path.push(draft.key.clone());
-        longest.insert(draft.key.clone(), (previous_hours + p80_hours, path));
+        paths.insert(draft.key.clone(), path);
 
         estimates.insert(
             draft.key.clone(),
@@ -135,6 +141,7 @@ pub fn schedule(
                     format!("base effort: {:.1}h", draft.effort_hours),
                     format!("owner capacity factor: {:.2}", capacity),
                     format!("coordination factor: {:.2}", coordination_factor),
+                    assignment_calendar_rationale(assignment, state),
                 ],
                 earliest_start,
                 p50_finish,
@@ -177,10 +184,10 @@ pub fn schedule(
         .map(|task| task.estimate.p80_finish)
         .max()
         .unwrap_or(now);
-    let critical_path = longest
-        .into_values()
-        .max_by(|left, right| left.0.total_cmp(&right.0))
-        .map(|(_, path)| path)
+    let critical_path = tasks
+        .iter()
+        .max_by_key(|task| task.estimate.p80_finish)
+        .and_then(|task| paths.remove(&task.key))
         .unwrap_or_default();
 
     Ok(Schedule {
@@ -249,11 +256,11 @@ pub fn reschedule(
     }
 
     let mut estimates = BTreeMap::<String, Estimate>::new();
-    let mut longest = BTreeMap::<String, (f64, Vec<String>)>::new();
+    let mut paths = BTreeMap::<String, Vec<String>>::new();
     for index in order {
         let task = &flow.tasks[index];
         let terminal = task.status.is_terminal();
-        let earliest_start = task
+        let dependency_start = task
             .depends_on
             .iter()
             .filter_map(|dependency| estimates.get(dependency))
@@ -262,7 +269,6 @@ pub fn reschedule(
             .unwrap_or(now)
             .max(now);
         let mut estimate = task.estimate.clone();
-        let path_hours;
         if terminal {
             let finished_at = task.last_heartbeat.unwrap_or(now).min(now);
             estimate.earliest_start = finished_at;
@@ -278,7 +284,6 @@ pub fn reschedule(
                     .rationale
                     .push("terminal task preserved as an actual waypoint".into());
             }
-            path_hours = 0.0;
         } else {
             let assignment = task
                 .assignment
@@ -291,28 +296,36 @@ pub fn reschedule(
             estimate.p50_hours =
                 round_hours(estimate.effort_hours / capacity * coordination_factor);
             estimate.p80_hours = round_hours(estimate.p50_hours * 1.4);
+            let earliest_start = assignment_start(assignment, state, dependency_start)?;
             estimate.earliest_start = earliest_start;
-            estimate.p50_finish = earliest_start + hours(estimate.p50_hours);
-            estimate.p80_finish = earliest_start + hours(estimate.p80_hours);
+            estimate.p50_finish =
+                assignment_finish(assignment, state, earliest_start, estimate.p50_hours)?;
+            estimate.p80_finish =
+                assignment_finish(assignment, state, earliest_start, estimate.p80_hours)?;
             estimate.confidence = "rescheduled".into();
             estimate.rationale = vec![
                 format!("base effort: {:.1}h", estimate.effort_hours),
                 format!("owner capacity factor: {:.2}", capacity),
                 format!("coordination factor: {:.2}", coordination_factor),
+                assignment_calendar_rationale(assignment, state),
                 format!("dynamic schedule anchor: {}", now.to_rfc3339()),
             ];
-            path_hours = estimate.p80_hours;
         }
 
-        let (previous_hours, mut path) = task
+        let mut path = task
             .depends_on
             .iter()
-            .filter_map(|dependency| longest.get(dependency))
-            .max_by(|left, right| left.0.total_cmp(&right.0))
-            .cloned()
-            .unwrap_or((0.0, Vec::new()));
+            .filter_map(|dependency| {
+                Some((
+                    estimates.get(dependency)?.p80_finish,
+                    paths.get(dependency)?,
+                ))
+            })
+            .max_by_key(|(finish, _)| *finish)
+            .map(|(_, path)| path.clone())
+            .unwrap_or_default();
         path.push(task.key.clone());
-        longest.insert(task.id.clone(), (previous_hours + path_hours, path));
+        paths.insert(task.id.clone(), path);
         estimates.insert(task.id.clone(), estimate);
     }
 
@@ -328,10 +341,13 @@ pub fn reschedule(
         .map(|estimate| estimate.p80_finish)
         .max()
         .unwrap_or(now);
-    let critical_path = longest
-        .into_values()
-        .max_by(|left, right| left.0.total_cmp(&right.0))
-        .map(|(_, path)| path)
+    let critical_path = flow
+        .tasks
+        .iter()
+        .filter(|task| !task.status.is_terminal())
+        .filter_map(|task| Some((estimates.get(&task.id)?.p80_finish, paths.get(&task.id)?)))
+        .max_by_key(|(finish, _)| *finish)
+        .map(|(_, path)| path.clone())
         .unwrap_or_default();
     Ok(Reschedule {
         task_estimates: estimates,
@@ -352,6 +368,45 @@ fn assignment_capacity(assignment: &Assignment, state: &OrganizationState) -> f6
         .unwrap_or(1.0)
 }
 
+fn assignment_start(
+    assignment: &Assignment,
+    state: &OrganizationState,
+    start: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    match assignment_calendar(assignment, state) {
+        Some(calendar) => crate::calendar::next_available(calendar, start),
+        None => Ok(start),
+    }
+}
+
+fn assignment_finish(
+    assignment: &Assignment,
+    state: &OrganizationState,
+    start: DateTime<Utc>,
+    working_hours: f64,
+) -> Result<DateTime<Utc>> {
+    match assignment_calendar(assignment, state) {
+        Some(calendar) => crate::calendar::add_working_hours(calendar, start, working_hours),
+        None => Ok(start + hours(working_hours)),
+    }
+}
+
+fn assignment_calendar<'a>(
+    assignment: &Assignment,
+    state: &'a OrganizationState,
+) -> Option<&'a crate::domain::WorkCalendar> {
+    (assignment.owner.kind != TargetKind::Team)
+        .then(|| state.calendars.get(&assignment.owner.id))
+        .flatten()
+}
+
+fn assignment_calendar_rationale(assignment: &Assignment, state: &OrganizationState) -> String {
+    assignment_calendar(assignment, state).map_or_else(
+        || "work calendar: continuous team availability".into(),
+        |calendar| format!("work calendar: {}", crate::calendar::summary(calendar)),
+    )
+}
+
 fn hours(value: f64) -> Duration {
     Duration::milliseconds((value.max(0.0) * 3_600_000.0).round() as i64)
 }
@@ -362,8 +417,11 @@ fn round_hours(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use super::*;
-    use crate::domain::{AssignmentTarget, TargetKind};
+    use crate::calendar::parse_workdays;
+    use crate::domain::{AssignmentTarget, TargetKind, WorkCalendar};
 
     #[test]
     fn dependency_moves_downstream_start_after_upstream_p80() {
@@ -411,5 +469,40 @@ mod tests {
         let schedule = schedule(&drafts, &assignments, &OrganizationState::default()).unwrap();
         assert!(schedule.tasks[1].estimate.earliest_start >= schedule.tasks[0].estimate.p80_finish);
         assert_eq!(schedule.critical_path, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn assignment_finish_obeys_the_owners_work_calendar() {
+        let mut state = OrganizationState::default();
+        state.calendars.insert(
+            "H-1".into(),
+            WorkCalendar {
+                principal_id: "H-1".into(),
+                utc_offset_minutes: 8 * 60,
+                working_days: parse_workdays("mon,tue,wed,thu,fri").unwrap(),
+                day_start_minute: 9 * 60,
+                day_end_minute: 18 * 60,
+                time_off: Vec::new(),
+                updated_by: "admin".into(),
+                updated_at: Utc::now(),
+            },
+        );
+        let assignment = Assignment {
+            owner: AssignmentTarget {
+                kind: TargetKind::Human,
+                id: "H-1".into(),
+                name: "Engineer".into(),
+            },
+            copilots: Vec::new(),
+            score: 1.0,
+            rationale: Vec::new(),
+        };
+        let friday = Utc.with_ymd_and_hms(2026, 7, 17, 8, 0, 0).unwrap();
+
+        assert_eq!(
+            assignment_finish(&assignment, &state, friday, 4.0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 20, 3, 0, 0).unwrap()
+        );
+        assert!(assignment_calendar_rationale(&assignment, &state).contains("Mon,Tue"));
     }
 }

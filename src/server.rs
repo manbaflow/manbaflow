@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -17,9 +18,9 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
-    AssignmentTarget, Evidence, ExecutorKind, FlightLease, Flow, FlowChangeRequest, FlowMessage,
-    FlowMessageKind, MessageInboxItem, Principal, PrincipalKind, RemoteFlightReport, Task,
-    TrackingEscalation,
+    AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, Flow,
+    FlowChangeRequest, FlowMessage, FlowMessageKind, MessageInboxItem, Principal, PrincipalKind,
+    RemoteFlightReport, Task, TrackingEscalation, WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
@@ -137,6 +138,21 @@ struct RejectFlowChangeInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ConfigureCalendarInput {
+    utc_offset_minutes: i32,
+    working_days: Vec<Workday>,
+    day_start_minute: u16,
+    day_end_minute: u16,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TimeOffInput {
+    starts_at: DateTime<Utc>,
+    ends_at: DateTime<Utc>,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct MessageInboxQuery {
     #[serde(default)]
     all: bool,
@@ -207,6 +223,9 @@ fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAu
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/me", get(me))
+        .route("/api/v1/me/calendar", get(my_calendar).put(set_my_calendar))
+        .route("/api/v1/me/time-off", post(add_my_time_off))
+        .route("/api/v1/me/time-off/{id}/cancel", post(cancel_my_time_off))
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/inbox", get(inbox))
         .route("/api/v1/messages", get(message_inbox))
@@ -288,6 +307,55 @@ async fn health() -> Json<HealthResponse> {
 async fn me(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Json<Principal>> {
     let app = state.app.lock().await;
     Ok(Json(authenticate(&app, &headers)?))
+}
+
+async fn my_calendar(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<WorkCalendar>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.state().work_calendar(&principal.id)?.clone()))
+}
+
+async fn set_my_calendar(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<ConfigureCalendarInput>,
+) -> ApiResult<Json<WorkCalendar>> {
+    mutate(&state, &headers, |app, actor| {
+        app.configure_work_calendar(
+            actor,
+            input.utc_offset_minutes,
+            input.working_days,
+            input.day_start_minute,
+            input.day_end_minute,
+            actor,
+        )
+    })
+    .await
+}
+
+async fn add_my_time_off(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<TimeOffInput>,
+) -> ApiResult<Json<AvailabilityBlock>> {
+    mutate(&state, &headers, |app, actor| {
+        app.add_time_off(actor, input.starts_at, input.ends_at, &input.reason, actor)
+    })
+    .await
+}
+
+async fn cancel_my_time_off(
+    State(state): State<ApiState>,
+    Path(block_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<AvailabilityBlock>> {
+    mutate(&state, &headers, |app, actor| {
+        app.cancel_time_off(actor, &block_id, actor)
+    })
+    .await
 }
 
 async fn dashboard(
@@ -868,6 +936,67 @@ mod tests {
         let body = to_bytes(inbox.into_body(), usize::MAX).await.unwrap();
         let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(items.as_array().unwrap().len(), 3);
+
+        let configured = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "PUT",
+                "/api/v1/me/calendar",
+                &issued.token,
+                json!({
+                    "utc_offset_minutes": 480,
+                    "working_days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                    "day_start_minute": 540,
+                    "day_end_minute": 1080
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(configured.status(), StatusCode::OK);
+        let body = to_bytes(configured.into_body(), usize::MAX).await.unwrap();
+        let calendar: WorkCalendar = serde_json::from_slice(&body).unwrap();
+        assert_eq!(calendar.principal_id, human.id);
+        assert_eq!(calendar.utc_offset_minutes, 480);
+        assert_eq!(
+            app.lock()
+                .await
+                .state()
+                .work_calendar(&observer.id)
+                .unwrap()
+                .utc_offset_minutes,
+            0
+        );
+
+        let starts_at = Utc::now();
+        let ends_at = starts_at + chrono::Duration::days(2);
+        let added = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/api/v1/me/time-off",
+                &issued.token,
+                json!({
+                    "starts_at": starts_at,
+                    "ends_at": ends_at,
+                    "reason": "customer onsite"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(added.status(), StatusCode::OK);
+        let body = to_bytes(added.into_body(), usize::MAX).await.unwrap();
+        let block: AvailabilityBlock = serde_json::from_slice(&body).unwrap();
+        assert_eq!(block.principal_id, human.id);
+        let cancelled = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/me/time-off/{}/cancel", block.id),
+                &issued.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
 
         let accepted = service
             .clone()

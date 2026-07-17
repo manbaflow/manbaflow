@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use crate::domain::{
     ApiCredential, ExecutionRecord, FlightLease, FlightLeaseStatus, Flow, FlowChangeRequest,
     FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, Organization, Principal,
-    TargetKind, TaskStatus, Team, TrackingAttention, TrackingEscalation,
+    TargetKind, TaskStatus, Team, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -15,6 +15,7 @@ pub struct OrganizationState {
     pub organization: Option<Organization>,
     pub teams: BTreeMap<String, Team>,
     pub principals: BTreeMap<String, Principal>,
+    pub calendars: BTreeMap<String, WorkCalendar>,
     pub credentials: BTreeMap<String, ApiCredential>,
     pub external_deliveries: BTreeMap<String, DateTime<Utc>>,
     pub external_binding_clocks: BTreeMap<String, DateTime<Utc>>,
@@ -58,6 +59,66 @@ impl OrganizationState {
             DomainEvent::PrincipalRegistered { principal } => {
                 self.principals
                     .insert(principal.id.clone(), principal.clone());
+                self.calendars
+                    .entry(principal.id.clone())
+                    .or_insert_with(|| {
+                        WorkCalendar::always_available(principal.id.clone(), principal.created_at)
+                    });
+            }
+            DomainEvent::WorkCalendarConfigured { calendar } => {
+                self.principal(&calendar.principal_id)?;
+                crate::calendar::validate(calendar)?;
+                self.calendars
+                    .insert(calendar.principal_id.clone(), calendar.clone());
+            }
+            DomainEvent::TimeOffAdded { block } => {
+                self.principal(&block.principal_id)?;
+                let calendar = self.calendars.get_mut(&block.principal_id).ok_or_else(|| {
+                    MambaError::NotFound {
+                        entity: "work calendar",
+                        id: block.principal_id.clone(),
+                    }
+                })?;
+                if calendar
+                    .time_off
+                    .iter()
+                    .any(|existing| existing.id == block.id)
+                {
+                    return Err(MambaError::Validation(format!(
+                        "time off block already exists: {}",
+                        block.id
+                    )));
+                }
+                calendar.time_off.push(block.clone());
+            }
+            DomainEvent::TimeOffCancelled {
+                principal_id,
+                block_id,
+                cancelled_by,
+                cancelled_at,
+            } => {
+                let calendar =
+                    self.calendars
+                        .get_mut(principal_id)
+                        .ok_or_else(|| MambaError::NotFound {
+                            entity: "work calendar",
+                            id: principal_id.clone(),
+                        })?;
+                let block = calendar
+                    .time_off
+                    .iter_mut()
+                    .find(|block| block.id == *block_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "time off block",
+                        id: block_id.clone(),
+                    })?;
+                if !block.is_active() {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "time off block {block_id} is already cancelled"
+                    )));
+                }
+                block.cancelled_by = Some(cancelled_by.clone());
+                block.cancelled_at = Some(*cancelled_at);
             }
             DomainEvent::ApiCredentialIssued { credential } => {
                 self.principal(&credential.principal_id)?;
@@ -560,6 +621,16 @@ impl OrganizationState {
             .ok_or_else(|| MambaError::NotFound {
                 entity: "principal",
                 id: id_or_name.to_string(),
+            })
+    }
+
+    pub fn work_calendar(&self, id_or_name: &str) -> Result<&WorkCalendar> {
+        let principal = self.principal(id_or_name)?;
+        self.calendars
+            .get(&principal.id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "work calendar",
+                id: principal.id.clone(),
             })
     }
 

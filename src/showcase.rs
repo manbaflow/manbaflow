@@ -54,6 +54,16 @@ pub async fn bootstrap_showcase(app: &mut MambaApp, workspace: &Path) -> Result<
         None,
         "admin",
     )?;
+    let workdays = crate::calendar::parse_workdays("mon,tue,wed,thu,fri")?;
+    app.configure_work_calendar(
+        &leader.id,
+        8 * 60,
+        workdays.clone(),
+        9 * 60,
+        18 * 60,
+        "admin",
+    )?;
+    app.configure_work_calendar(&engineer.id, 8 * 60, workdays, 9 * 60, 18 * 60, "admin")?;
     app.register_principal(
         "Codex 副驾",
         PrincipalKind::Agent,

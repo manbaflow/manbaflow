@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::Utc;
+
 use crate::domain::{
     Assignment, AssignmentTarget, Principal, PrincipalKind, TargetKind, TaskDraft,
 };
@@ -124,17 +126,37 @@ impl<'a> Matcher<'a> {
         } else {
             0.0
         };
-        let score = coverage * 70.0 + capacity * 30.0 + executor_bonus - load_penalty;
+        let calendar = self.state.calendars.get(&principal.id);
+        let now = Utc::now();
+        let next_available =
+            calendar.and_then(|calendar| crate::calendar::next_available(calendar, now).ok());
+        let availability_delay_hours = next_available
+            .map(|next| next.signed_duration_since(now).num_minutes().max(0) as f64 / 60.0)
+            .unwrap_or(0.0);
+        let availability_penalty = (availability_delay_hours / 24.0 * 5.0).min(25.0);
+        let score = coverage * 70.0 + capacity * 30.0 + executor_bonus
+            - load_penalty
+            - availability_penalty;
 
-        Some((
-            score,
-            principal,
-            vec![
-                format!("capability coverage: {:.0}%", coverage * 100.0),
-                format!("declared capacity: {}%", principal.capacity_percent),
-                format!("current active assignments: {load:.0}"),
-            ],
-        ))
+        let mut rationale = vec![
+            format!("capability coverage: {:.0}%", coverage * 100.0),
+            format!("declared capacity: {}%", principal.capacity_percent),
+            format!("current active assignments: {load:.0}"),
+        ];
+        if let Some(calendar) = calendar {
+            rationale.push(format!(
+                "work calendar: {}",
+                crate::calendar::summary(calendar)
+            ));
+        }
+        if availability_delay_hours >= 0.1 {
+            rationale.push(format!(
+                "next availability: {} ({availability_delay_hours:.1}h delay)",
+                next_available.unwrap().to_rfc3339()
+            ));
+        }
+
+        Some((score, principal, rationale))
     }
 
     fn copilots_for(
@@ -197,10 +219,10 @@ fn coverage(required: &BTreeSet<String>, actual: &BTreeSet<String>) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
 
     use super::*;
-    use crate::domain::{Organization, Principal};
+    use crate::domain::{AvailabilityBlock, Organization, Principal, WorkCalendar};
 
     #[test]
     fn human_work_is_assigned_to_human_with_owned_agent_as_copilot() {
@@ -256,5 +278,66 @@ mod tests {
         let assignment = Matcher::new(&state).match_task(&task).unwrap();
         assert_eq!(assignment.owner.id, "P-1");
         assert_eq!(assignment.copilots[0].id, "A-1");
+    }
+
+    #[test]
+    fn current_time_off_lowers_a_candidates_priority() {
+        let now = Utc::now();
+        let mut state = OrganizationState::default();
+        for (id, name) in [("P-1", "Alice"), ("P-2", "Bob")] {
+            state.principals.insert(
+                id.into(),
+                Principal {
+                    id: id.into(),
+                    name: name.into(),
+                    kind: PrincipalKind::Human,
+                    team_id: None,
+                    owner_id: None,
+                    capabilities: vec!["delivery".into()],
+                    capacity_percent: 100,
+                    executor: None,
+                    active: true,
+                    created_at: now,
+                },
+            );
+            state
+                .calendars
+                .insert(id.into(), WorkCalendar::always_available(id.into(), now));
+        }
+        state
+            .calendars
+            .get_mut("P-1")
+            .unwrap()
+            .time_off
+            .push(AvailabilityBlock {
+                id: "OFF-1".into(),
+                principal_id: "P-1".into(),
+                starts_at: now - Duration::hours(1),
+                ends_at: now + Duration::days(10),
+                reason: "leave".into(),
+                created_by: "Alice".into(),
+                created_at: now,
+                cancelled_by: None,
+                cancelled_at: None,
+            });
+        let task = TaskDraft {
+            key: "launch".into(),
+            title: "Launch".into(),
+            description: "Launch".into(),
+            required_capabilities: vec!["delivery".into()],
+            depends_on: Vec::new(),
+            effort_hours: 4.0,
+            requires_human: true,
+            acceptance_criteria: vec!["done".into()],
+        };
+
+        let assignment = Matcher::new(&state).match_task(&task).unwrap();
+        assert_eq!(assignment.owner.name, "Bob");
+        assert!(
+            assignment
+                .rationale
+                .iter()
+                .any(|reason| reason.contains("work calendar"))
+        );
     }
 }

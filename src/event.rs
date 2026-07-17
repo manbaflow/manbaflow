@@ -2,10 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    ApiCredential, Assignment, AttentionKind, Demand, Estimate, Evidence, ExecutionRecord,
-    ExternalArtifact, FlightLease, Flow, FlowChangeRequest, FlowMessage, FlowScheduleRevision,
-    MessageAcknowledgement, Organization, PrdDraft, Principal, RemoteFlightReport, Task, Team,
-    TrackingAttention, TrackingEscalation,
+    ApiCredential, Assignment, AttentionKind, AvailabilityBlock, Demand, Estimate, Evidence,
+    ExecutionRecord, ExternalArtifact, FlightLease, Flow, FlowChangeRequest, FlowMessage,
+    FlowScheduleRevision, MessageAcknowledgement, Organization, PrdDraft, Principal,
+    RemoteFlightReport, Task, Team, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -19,6 +19,18 @@ pub enum DomainEvent {
     },
     PrincipalRegistered {
         principal: Principal,
+    },
+    WorkCalendarConfigured {
+        calendar: WorkCalendar,
+    },
+    TimeOffAdded {
+        block: AvailabilityBlock,
+    },
+    TimeOffCancelled {
+        principal_id: String,
+        block_id: String,
+        cancelled_by: String,
+        cancelled_at: DateTime<Utc>,
     },
     ApiCredentialIssued {
         credential: ApiCredential,
@@ -237,6 +249,9 @@ impl DomainEvent {
             Self::OrganizationInitialized { .. } => "organization.initialized",
             Self::TeamCreated { .. } => "team.created",
             Self::PrincipalRegistered { .. } => "principal.registered",
+            Self::WorkCalendarConfigured { .. } => "calendar.configured",
+            Self::TimeOffAdded { .. } => "calendar.time_off_added",
+            Self::TimeOffCancelled { .. } => "calendar.time_off_cancelled",
             Self::ApiCredentialIssued { .. } => "api_credential.issued",
             Self::ApiCredentialRevoked { .. } => "api_credential.revoked",
             Self::DemandCreated { .. } => "demand.created",
@@ -317,6 +332,9 @@ impl DomainEvent {
             Self::OrganizationInitialized { .. }
             | Self::TeamCreated { .. }
             | Self::PrincipalRegistered { .. }
+            | Self::WorkCalendarConfigured { .. }
+            | Self::TimeOffAdded { .. }
+            | Self::TimeOffCancelled { .. }
             | Self::ApiCredentialIssued { .. }
             | Self::ApiCredentialRevoked { .. }
             | Self::ExternalDeliveryProcessed { .. } => None,

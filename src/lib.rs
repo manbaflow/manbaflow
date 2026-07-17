@@ -1,4 +1,5 @@
 pub mod app;
+pub mod calendar;
 pub mod dashboard;
 pub mod domain;
 pub mod error;

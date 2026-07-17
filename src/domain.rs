@@ -66,6 +66,72 @@ pub struct Principal {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Workday {
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AvailabilityBlock {
+    pub id: String,
+    pub principal_id: String,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub reason: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub cancelled_by: Option<String>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+}
+
+impl AvailabilityBlock {
+    pub fn is_active(&self) -> bool {
+        self.cancelled_at.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkCalendar {
+    pub principal_id: String,
+    pub utc_offset_minutes: i32,
+    pub working_days: Vec<Workday>,
+    pub day_start_minute: u16,
+    pub day_end_minute: u16,
+    pub time_off: Vec<AvailabilityBlock>,
+    pub updated_by: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl WorkCalendar {
+    pub fn always_available(principal_id: String, created_at: DateTime<Utc>) -> Self {
+        Self {
+            principal_id,
+            utc_offset_minutes: 0,
+            working_days: vec![
+                Workday::Monday,
+                Workday::Tuesday,
+                Workday::Wednesday,
+                Workday::Thursday,
+                Workday::Friday,
+                Workday::Saturday,
+                Workday::Sunday,
+            ],
+            day_start_minute: 0,
+            day_end_minute: 24 * 60,
+            time_off: Vec::new(),
+            updated_by: "system".into(),
+            updated_at: created_at,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiCredential {
     pub id: String,

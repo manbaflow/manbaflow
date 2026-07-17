@@ -161,7 +161,6 @@ enum MouseAction {
     ScanTracker,
     AcknowledgeEscalation,
     CycleActor,
-    Help,
     Quit,
     ConfirmModal,
     CancelModal,
@@ -282,7 +281,6 @@ struct UiState {
     workspace: PathBuf,
     timeline: Vec<EventEnvelope>,
     modal: Option<InputModal>,
-    show_help: bool,
     message: String,
     message_is_error: bool,
     active_flights: BTreeMap<String, ActiveFlight>,
@@ -322,8 +320,7 @@ impl UiState {
             workspace: options.workspace,
             timeline: Vec::new(),
             modal: None,
-            show_help: false,
-            message: "塔台在线。按 ? 查看完整操作。".to_string(),
+            message: "塔台在线。通过标签、列表和底部操作带调度 Flow。".to_string(),
             message_is_error: false,
             active_flights: BTreeMap::new(),
             flight_tx,
@@ -341,92 +338,16 @@ impl UiState {
     }
 
     async fn handle_key(&mut self, app: &mut MambaApp, key: KeyEvent) -> Result<bool> {
-        if self.show_help {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
-            ) {
-                self.show_help = false;
-            }
-            return Ok(false);
-        }
         if self.modal.is_some() {
             return self.handle_modal_key(app, key).await;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(self.request_quit());
         }
-
-        match key.code {
-            KeyCode::Char('q') => return Ok(self.request_quit()),
-            KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Char('1') => self.switch_view(app, View::Overview),
-            KeyCode::Char('2') => self.switch_view(app, View::Flows),
-            KeyCode::Char('3') => self.switch_view(app, View::Inbox),
-            KeyCode::Char('4') => self.switch_view(app, View::Roster),
-            KeyCode::Char('5') => self.switch_view(app, View::Timeline),
-            KeyCode::Tab => {
-                let next = (self.view.index() + 1) % View::ALL.len();
-                self.switch_view(app, View::ALL[next]);
-            }
-            KeyCode::BackTab => {
-                let next = (self.view.index() + View::ALL.len() - 1) % View::ALL.len();
-                self.switch_view(app, View::ALL[next]);
-            }
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(app, 1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(app, -1),
-            KeyCode::Char('h') | KeyCode::Left if self.view == View::Flows => {
-                self.focus_tasks = false;
-            }
-            KeyCode::Char('l') | KeyCode::Right if self.view == View::Flows => {
-                self.focus_tasks = true;
-            }
-            KeyCode::Char('h') | KeyCode::Left if self.view == View::Timeline => {
-                self.flow_index = shifted(self.flow_index, flow_ids(app).len(), -1);
-                self.refresh_timeline(app);
-            }
-            KeyCode::Char('l') | KeyCode::Right if self.view == View::Timeline => {
-                self.flow_index = shifted(self.flow_index, flow_ids(app).len(), 1);
-                self.refresh_timeline(app);
-            }
-            KeyCode::Char('u') => self.cycle_actor(app),
-            KeyCode::Char('r') => match app.reload() {
-                Ok(()) => {
-                    self.clamp_selection(app);
-                    self.refresh_timeline(app);
-                    self.success("已从 Flow Ledger 重建塔台状态");
-                }
-                Err(error) => self.failure(error),
-            },
-            KeyCode::Char('d') => self.load_showcase(app).await,
-            KeyCode::Char('n') => self.open_demand_modal(),
-            KeyCode::Char('a') => self.approve_or_accept(app),
-            KeyCode::Char('s') => self.advance_task(app),
-            KeyCode::Char('c') => self.complete_task(app),
-            KeyCode::Char('e') => self.open_task_input(app, true),
-            KeyCode::Char('b') => self.open_task_input(app, false),
-            KeyCode::Char('m') => self.open_message_input(app),
-            KeyCode::Char('i') => self.open_estimate_input(app),
-            KeyCode::Char('v') => self.open_reassign_input(app),
-            KeyCode::Char('f') => self.open_flow_change_input(app),
-            KeyCode::Char('o') => self.open_reject_change_input(app),
-            KeyCode::Char('p') => self.open_run_confirmation(app, ExecutorMode::Plan),
-            KeyCode::Char('x') => self.open_run_confirmation(app, ExecutorMode::Execute),
-            KeyCode::Char('t') => self.scan_tracker(app, true),
-            KeyCode::Char('g') => self.acknowledge_next_inbox(app),
-            _ => {}
-        }
-        Ok(false)
+        Ok(matches!(key.code, KeyCode::Char('q')) && self.request_quit())
     }
 
     async fn handle_mouse(&mut self, app: &mut MambaApp, mouse: MouseEvent) -> Result<bool> {
-        if self.show_help {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.show_help = false;
-            }
-            return Ok(false);
-        }
-
         let target = self.target_at(mouse.column, mouse.row);
         if self.modal.is_some() {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -526,7 +447,6 @@ impl UiState {
             MouseAction::ScanTracker => self.scan_tracker(app, true),
             MouseAction::AcknowledgeEscalation => self.acknowledge_next_inbox(app),
             MouseAction::CycleActor => self.cycle_actor(app),
-            MouseAction::Help => self.show_help = true,
             MouseAction::Quit => return Ok(self.request_quit()),
             MouseAction::ConfirmModal => self.submit_modal(app).await,
             MouseAction::CancelModal => self.modal = None,
@@ -561,29 +481,6 @@ impl UiState {
     async fn handle_modal_key(&mut self, app: &mut MambaApp, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Esc => self.modal = None,
-            KeyCode::Tab
-                if self
-                    .modal
-                    .as_ref()
-                    .is_some_and(|modal| matches!(&modal.purpose, InputPurpose::Demand)) =>
-            {
-                self.demand_planner = next_planner(self.demand_planner);
-            }
-            KeyCode::Tab => {
-                if let Some(InputModal {
-                    purpose:
-                        InputPurpose::Reassign {
-                            candidates,
-                            selected,
-                            ..
-                        },
-                    ..
-                }) = &mut self.modal
-                    && !candidates.is_empty()
-                {
-                    *selected = (*selected + 1) % candidates.len();
-                }
-            }
             KeyCode::Backspace => {
                 if let Some(modal) = &mut self.modal {
                     modal.value.pop();
@@ -611,7 +508,7 @@ impl UiState {
         }
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
             self.failure(MambaError::Validation(
-                "请先注册 Human，或按 u 选择操作人".to_string(),
+                "请先注册 Human，或点击顶部当前球权选择操作人".to_string(),
             ));
             return;
         };
@@ -648,7 +545,7 @@ impl UiState {
                 Ok(change) => {
                     self.refresh_timeline(app);
                     self.success(format!(
-                        "{} 影响预览：+{} tasks · 进度 {:+.1}h + 范围 {:+.1}h = 净 {:+.1}h；按 a 批准",
+                        "{} 影响预览：+{} tasks · 进度 {:+.1}h + 范围 {:+.1}h = 净 {:+.1}h；请在底部批准或驳回",
                         change.id,
                         change.new_tasks.len(),
                         change.impact.baseline_p80_delta_hours,
@@ -1171,7 +1068,7 @@ impl UiState {
         };
         if let Some(change) = app.pending_flow_change(&flow.id) {
             self.failure(MambaError::InvalidTransition(format!(
-                "{} 正在等待批准；按 a 应用或按 o 驳回",
+                "{} 正在等待处理；请使用底部的批准或驳回变更",
                 change.id
             )));
             return;
@@ -1469,12 +1366,12 @@ impl UiState {
 fn render(frame: &mut Frame, app: &MambaApp, state: &mut UiState) {
     state.hit_regions.clear();
     frame.render_widget(Block::default().style(Style::new().bg(BG)), frame.area());
-    let [header, tabs, content, status, help] = Layout::vertical([
+    let [header, tabs, content, status, actions] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Min(10),
         Constraint::Length(3),
-        Constraint::Length(1),
+        Constraint::Length(3),
     ])
     .areas(frame.area());
 
@@ -1488,11 +1385,9 @@ fn render(frame: &mut Frame, app: &MambaApp, state: &mut UiState) {
         View::Timeline => render_timeline(frame, app, state, content),
     }
     render_status(frame, state, status);
-    render_shortcuts(frame, app, state, help);
+    render_actions(frame, app, state, actions);
 
-    if state.show_help {
-        render_help_modal(frame);
-    } else if let Some(modal) = state.modal.clone() {
+    if let Some(modal) = state.modal.clone() {
         render_input_modal(frame, &modal, state);
     }
 }
@@ -1819,7 +1714,7 @@ fn render_flow_table(
 fn render_tower_brief(frame: &mut Frame, app: &MambaApp, flow: Option<&Flow>, area: Rect) {
     let Some(flow) = flow else {
         frame.render_widget(
-            Paragraph::new("点击 SHOWCASE 装载演示机队，或按 n 提出第一个需求。")
+            Paragraph::new("点击 SHOWCASE 装载演示机队，或点击底部的新需求。")
                 .style(Style::new().fg(MUTED))
                 .alignment(Alignment::Center)
                 .block(panel_block("TOWER BRIEF", false)),
@@ -2024,7 +1919,7 @@ fn render_prd(
     area: Rect,
 ) {
     let text = flow.map_or_else(
-        || Text::from("还没有 Flow。点击 SHOWCASE 装载演示，或按 n 提出需求。"),
+        || Text::from("还没有 Flow。点击 SHOWCASE 装载演示，或点击底部的新需求。"),
         |flow| {
             let mut lines = vec![
                 Line::styled(flow.prd.title.clone(), Style::new().fg(GOLD).bold()),
@@ -2036,7 +1931,7 @@ fn render_prd(
                     Span::styled("CHANGE  ", Style::new().fg(PURPLE).bold()),
                     Span::styled(
                         format!(
-                            "{} · +{} tasks · 进度 {:+.1}h + 范围 {:+.1}h = 净 {:+.1}h · 按 a 批准",
+                            "{} · +{} tasks · 进度 {:+.1}h + 范围 {:+.1}h = 净 {:+.1}h · 底部处理",
                             change.id,
                             change.new_tasks.len(),
                             change.impact.baseline_p80_delta_hours,
@@ -2368,6 +2263,20 @@ fn render_task_detail(frame: &mut Frame, task: Option<&Task>, area: Rect) {
             Span::styled(blocker.clone(), Style::new().fg(RED)),
         ]));
     }
+    if let Some(calendar) = task
+        .estimate
+        .rationale
+        .iter()
+        .find(|reason| reason.starts_with("work calendar:"))
+    {
+        lines.push(Line::from(vec![
+            Span::styled("日历  ", Style::new().fg(MUTED)),
+            Span::styled(
+                calendar.trim_start_matches("work calendar: ").to_string(),
+                Style::new().fg(ORANGE),
+            ),
+        ]));
+    }
     lines.extend(
         task.external_artifacts
             .iter()
@@ -2430,6 +2339,7 @@ fn render_roster(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
     );
 
     let principals_vec = app.state().principals.values().collect::<Vec<_>>();
+    let wide_roster = principals.width >= 110;
     let rows = principals_vec
         .iter()
         .map(|principal| {
@@ -2447,45 +2357,87 @@ fn render_roster(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
                     PrincipalKind::Human => "human".to_string(),
                     PrincipalKind::Agent => "remote-worker".to_string(),
                 });
-            Row::new(vec![
-                Cell::from(principal.name.clone()).style(Style::new().fg(TEXT).bold()),
-                Cell::from(match principal.kind {
-                    PrincipalKind::Human => "HUMAN",
-                    PrincipalKind::Agent => "AGENT",
-                })
-                .style(Style::new().fg(match principal.kind {
-                    PrincipalKind::Human => GOLD,
-                    PrincipalKind::Agent => CYAN,
-                })),
-                Cell::from(team.to_string()).style(Style::new().fg(MUTED)),
-                Cell::from(format!("{}%", principal.capacity_percent))
-                    .style(Style::new().fg(GREEN)),
-                Cell::from(terminal).style(Style::new().fg(PURPLE)),
-                Cell::from(principal.capabilities.join(", ")).style(Style::new().fg(MUTED)),
-            ])
+            let calendar = app.state().work_calendar(&principal.id).ok();
+            let calendar_label = calendar.map_or_else(
+                || "未配置".into(),
+                |calendar| {
+                    let active_time_off = calendar
+                        .time_off
+                        .iter()
+                        .filter(|block| block.is_active() && block.ends_at > chrono::Utc::now())
+                        .count();
+                    let summary = crate::calendar::summary(calendar);
+                    if active_time_off == 0 {
+                        summary
+                    } else {
+                        format!("{summary} · OFF {active_time_off}")
+                    }
+                },
+            );
+            let name = Cell::from(principal.name.clone()).style(Style::new().fg(TEXT).bold());
+            let kind = Cell::from(match principal.kind {
+                PrincipalKind::Human => "HUMAN",
+                PrincipalKind::Agent => "AGENT",
+            })
+            .style(Style::new().fg(match principal.kind {
+                PrincipalKind::Human => GOLD,
+                PrincipalKind::Agent => CYAN,
+            }));
+            let capacity = Cell::from(format!("{}%", principal.capacity_percent))
+                .style(Style::new().fg(GREEN));
+            let calendar = Cell::from(calendar_label).style(Style::new().fg(ORANGE));
+            let terminal = Cell::from(terminal).style(Style::new().fg(PURPLE));
+            if wide_roster {
+                Row::new(vec![
+                    name,
+                    kind,
+                    Cell::from(team.to_string()).style(Style::new().fg(MUTED)),
+                    capacity,
+                    calendar,
+                    terminal,
+                    Cell::from(principal.capabilities.join(", ")).style(Style::new().fg(MUTED)),
+                ])
+            } else {
+                Row::new(vec![name, kind, capacity, calendar, terminal])
+            }
         })
         .collect::<Vec<_>>();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(18),
-            Constraint::Length(8),
-            Constraint::Length(16),
-            Constraint::Length(8),
-            Constraint::Length(13),
-            Constraint::Min(20),
-        ],
-    )
-    .header(
-        Row::new(["成员", "类型", "球队", "产能", "终端", "能力"])
-            .style(Style::new().fg(GOLD).bold())
-            .bottom_margin(1),
-    )
-    .row_highlight_style(Style::new().bg(PANEL_ALT).fg(TEXT).bold())
-    .highlight_symbol("24 ")
-    .highlight_spacing(HighlightSpacing::Always)
-    .column_spacing(1)
-    .block(panel_block("ROSTER / 轮换阵容", true));
+    let (widths, headers): (Vec<Constraint>, Vec<&str>) = if wide_roster {
+        (
+            vec![
+                Constraint::Length(18),
+                Constraint::Length(8),
+                Constraint::Length(14),
+                Constraint::Length(7),
+                Constraint::Length(25),
+                Constraint::Length(13),
+                Constraint::Min(16),
+            ],
+            vec!["成员", "类型", "球队", "产能", "工作日历", "终端", "能力"],
+        )
+    } else {
+        (
+            vec![
+                Constraint::Length(16),
+                Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Min(22),
+                Constraint::Length(13),
+            ],
+            vec!["成员", "类型", "产能", "工作日历", "终端"],
+        )
+    };
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(headers)
+                .style(Style::new().fg(GOLD).bold())
+                .bottom_margin(1),
+        )
+        .row_highlight_style(Style::new().bg(PANEL_ALT).fg(TEXT).bold())
+        .highlight_symbol("24 ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .column_spacing(1)
+        .block(panel_block("ROSTER / 轮换阵容", true));
     let mut table_state = TableState::default();
     table_state.select((!principals_vec.is_empty()).then_some(state.roster_index));
     register_table_rows(
@@ -2691,8 +2643,8 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect
     if items.is_empty() {
         items.push(ListItem::new(Text::from(vec![
             Line::styled("机队待命", Style::new().fg(MUTED)),
-            Line::styled("选中任务后按 p 规划", Style::new().fg(TEXT)),
-            Line::styled("或按 x 请求执行", Style::new().fg(TEXT)),
+            Line::styled("选中任务后点击底部的规划", Style::new().fg(TEXT)),
+            Line::styled("需要写入时点击执行", Style::new().fg(TEXT)),
         ])));
     }
     frame.render_widget(
@@ -2725,7 +2677,7 @@ fn render_status(frame: &mut Frame, state: &UiState, area: Rect) {
     );
 }
 
-fn render_shortcuts(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
     let mut actions = match state.view {
         View::Overview => vec![
             ("新需求", MouseAction::NewDemand),
@@ -2773,37 +2725,27 @@ fn render_shortcuts(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area
         };
         actions.insert(index, ("驳回变更", MouseAction::RejectChange));
     }
-    let mut spans = Vec::new();
+    frame.render_widget(Block::default().style(Style::new().bg(PANEL)), area);
     let mut x = area.x;
-    for (label, action) in actions
-        .into_iter()
-        .chain([("帮助", MouseAction::Help), ("退出", MouseAction::Quit)])
-    {
+    let mut y = area.y;
+    for (label, action) in actions.into_iter().chain([("退出", MouseAction::Quit)]) {
         let text = format!(" {label} ");
         let width = Line::from(text.as_str()).width() as u16;
-        let available = area.right().saturating_sub(x);
-        if available < width {
+        if x > area.x && area.right().saturating_sub(x) < width {
+            x = area.x;
+            y = y.saturating_add(1);
+        }
+        if y >= area.bottom() || width > area.width {
             break;
         }
-        state.register_hit(
-            Rect::new(x, area.y, width, area.height),
-            HitTarget::Action(action),
+        let button = Rect::new(x, y, width, 1);
+        state.register_hit(button, HitTarget::Action(action));
+        frame.render_widget(
+            Paragraph::new(text).style(Style::new().fg(action_color(action)).bg(PANEL_ALT).bold()),
+            button,
         );
-        spans.push(Span::styled(
-            text,
-            Style::new().fg(action_color(action)).bg(PANEL_ALT).bold(),
-        ));
-        spans.push(Span::raw(" "));
         x = x.saturating_add(width).saturating_add(1);
     }
-    spans.push(Span::styled(
-        "  点击操作 · 滚轮移动 · ? 完整帮助",
-        Style::new().fg(MUTED),
-    ));
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::new().bg(PANEL)),
-        area,
-    );
 }
 
 fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState) {
@@ -2815,7 +2757,7 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
     let (title, prompt, color): (&str, String, Color) = match &modal.purpose {
         InputPurpose::Demand => (
             "NEW DEMAND / 管理需求",
-            "描述目标；Tab 或鼠标选择 PRD 规划器".into(),
+            "描述目标；点击选择 PRD 规划器".into(),
             GOLD,
         ),
         InputPurpose::Evidence { .. } => ("EVIDENCE / 交付证据", "输入证据摘要".into(), GREEN),
@@ -2852,7 +2794,7 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
         } => (
             "LINEUP / 任务换防",
             format!(
-                "换防给 {}；输入原因，Tab 或点击切换候选人",
+                "换防给 {}；输入原因，点击候选条切换人选",
                 candidates
                     .get(*selected)
                     .map(|target| target.name.as_str())
@@ -2942,13 +2884,13 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
     state.register_hit(confirm, HitTarget::Action(MouseAction::ConfirmModal));
     state.register_hit(cancel, HitTarget::Action(MouseAction::CancelModal));
     frame.render_widget(
-        Paragraph::new("[ 确认 / Enter ]")
+        Paragraph::new("[ 确认 ]")
             .style(Style::new().fg(BG).bg(color).bold())
             .alignment(Alignment::Center),
         confirm,
     );
     frame.render_widget(
-        Paragraph::new("[ 取消 / Esc ]")
+        Paragraph::new("[ 取消 ]")
             .style(Style::new().fg(TEXT).bg(PANEL_ALT))
             .alignment(Alignment::Center),
         cancel,
@@ -3014,63 +2956,6 @@ fn render_planner_selector(frame: &mut Frame, area: Rect, state: &mut UiState) {
             areas[index],
         );
     }
-}
-
-fn render_help_modal(frame: &mut Frame) {
-    let area = centered(frame.area(), 78, 33);
-    frame.render_widget(Clear, area);
-    let lines = vec![
-        Line::styled("塔台操作手册", Style::new().fg(GOLD).bold()),
-        Line::raw(""),
-        help_line("1-5 / Tab", "切换总览、Flow、Inbox、阵容与时间线"),
-        help_line("鼠标点击", "选择标签、表格行、球权与底栏操作"),
-        help_line("鼠标滚轮", "移动指针所在列表的当前选择"),
-        help_line("j / k", "移动当前列表选择"),
-        help_line("h / l", "在 Flow 列表与任务列表之间切换球权"),
-        help_line("h / l (时间线)", "切换正在审计的 Flow"),
-        help_line("u", "切换当前 Human 操作人"),
-        help_line("d", "从空塔台装载完整的交互式 Showcase"),
-        help_line("n", "提出新需求，选择 Local / Claude Code / Codex 规划"),
-        help_line("t", "立即巡航扫描 Todo 风险；后台每 30 秒自动扫描"),
-        help_line("g", "确认当前 Inbox 中首个 Flow 指令或 Tower Call"),
-        help_line("m", "围绕当前任务向 Owner、Copilot 或 Requester 传球"),
-        help_line("i", "协商当前任务基础工时并动态重排整条 DAG"),
-        help_line("v", "Requester 为当前任务选择新 Owner 并重新排期"),
-        help_line("f", "为当前 Flow 生成 append-only 变更和影响预览"),
-        help_line("o", "驳回当前 Flow 待批准的变更并记录原因"),
-        help_line("a", "批准 Flow，或接受当前 Assignment"),
-        help_line("s", "按状态接单、开工或提交验收"),
-        help_line("e", "为当前任务补充 Evidence"),
-        help_line("b", "报告阻塞，等待塔台协防"),
-        help_line("p", "确认后调用已分配终端进行只读规划"),
-        help_line("x", "Human 确认后授予终端 workspace-write"),
-        help_line("c", "由当前 Human 完成最终验收"),
-        help_line("r", "从 append-only Flow Ledger 重建状态"),
-        help_line("q / Ctrl-C", "安全退出塔台"),
-        Line::raw(""),
-        Line::styled(
-            "TUI 与 task run 共用放行协议；没有 MAMBA 确认就不会授予 workspace-write。",
-            Style::new().fg(CYAN),
-        ),
-        Line::styled("点击任意位置，或按 ?、Esc、q 返回", Style::new().fg(MUTED)),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(GOLD))
-                .style(Style::new().bg(PANEL))
-                .title(" HELP / WHAT CAN I SAY "),
-        ),
-        area,
-    );
-}
-
-fn help_line<'a>(key: &'a str, description: &'a str) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(format!("{key:<14}"), Style::new().fg(GOLD).bold()),
-        Span::styled(description, Style::new().fg(TEXT)),
-    ])
 }
 
 fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
@@ -3178,7 +3063,7 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::Block | MouseAction::Quit => RED,
         MouseAction::ScanTracker => ORANGE,
         MouseAction::AcknowledgeEscalation => GOLD,
-        MouseAction::CycleActor | MouseAction::Help => PURPLE,
+        MouseAction::CycleActor => PURPLE,
         MouseAction::ConfirmModal => GREEN,
         MouseAction::CancelModal => MUTED,
         MouseAction::SelectPlanner(planner) => planner_color(planner),
@@ -3245,14 +3130,6 @@ fn task_has_executor(app: &MambaApp, task: &Task) -> bool {
                     .any(|copilot| copilot.id == principal.id)
                 || principal.owner_id.as_deref() == Some(assignment.owner.id.as_str()))
     })
-}
-
-fn next_planner(planner: PlannerKind) -> PlannerKind {
-    match planner {
-        PlannerKind::Local => PlannerKind::ClaudeCode,
-        PlannerKind::ClaudeCode => PlannerKind::Codex,
-        PlannerKind::Codex => PlannerKind::Local,
-    }
 }
 
 fn planner_label(planner: PlannerKind) -> &'static str {
@@ -3631,6 +3508,15 @@ mod tests {
         let showcase = seed_showcase(&mut app, directory.path(), &human.name)
             .await
             .unwrap();
+        app.configure_work_calendar(
+            &human.id,
+            8 * 60,
+            crate::calendar::parse_workdays("mon,tue,wed,thu,fri").unwrap(),
+            9 * 60,
+            18 * 60,
+            "admin",
+        )
+        .unwrap();
 
         let mut state = UiState::new(
             &app,
@@ -3691,6 +3577,19 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("FLIGHT DECK"));
         assert!(content.contains("CLEARED"));
+
+        state.view = View::Roster;
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("UTC+08:00"));
     }
 
     #[tokio::test]
@@ -3789,6 +3688,28 @@ mod tests {
             .collect::<String>();
         assert!(compact_content.contains("TOWER COMMS"));
         assert!(compact_content.contains("Provider Secret"));
+        for action in [
+            MouseAction::ApproveOrAccept,
+            MouseAction::AcknowledgeEscalation,
+            MouseAction::SendMessage,
+            MouseAction::NegotiateEstimate,
+            MouseAction::Reassign,
+            MouseAction::Advance,
+            MouseAction::Plan,
+            MouseAction::Execute,
+            MouseAction::Evidence,
+            MouseAction::Block,
+            MouseAction::Complete,
+            MouseAction::Quit,
+        ] {
+            assert!(
+                state
+                    .hit_regions
+                    .iter()
+                    .any(|region| region.target == HitTarget::Action(action)),
+                "compact Inbox is missing mouse action {action:?}"
+            );
+        }
         state.acknowledge_next_inbox(&mut app);
         assert!(state.message.contains("已收到指令"));
         assert!(app.message_inbox("佐巴扬", false).unwrap().is_empty());
@@ -3806,16 +3727,16 @@ mod tests {
                 .any(|item| item.message.body.contains("恢复执行"))
         );
 
-        state
-            .handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
-            )
-            .await
-            .unwrap();
         assert_eq!(app.state().flows.len(), 3);
-        assert!(state.message_is_error);
-        assert!(state.message.contains("空塔台"));
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        assert!(
+            !state
+                .hit_regions
+                .iter()
+                .any(|region| { region.target == HitTarget::Action(MouseAction::LoadShowcase) })
+        );
     }
 
     #[tokio::test]
