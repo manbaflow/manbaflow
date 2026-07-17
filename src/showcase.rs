@@ -4,8 +4,8 @@ use serde::Serialize;
 
 use crate::MambaApp;
 use crate::domain::{
-    ExecutorConfig, ExecutorKind, Flow, FlowMessageKind, PrincipalKind, TargetKind, Task,
-    TaskStatus,
+    ExecutorConfig, ExecutorKind, ExternalInteractionAction, Flow, FlowMessageKind, PrincipalKind,
+    TargetKind, Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::planner::PlannerKind;
@@ -115,6 +115,38 @@ pub async fn seed_showcase(
     app.approve_flow(&gateway.id, requester)?;
     complete_task(app, &gateway.id, "scope-contract", requester)?;
 
+    let gateway_core_assignment = app
+        .state()
+        .flow(&gateway.id)?
+        .task("gateway-core")
+        .cloned()
+        .ok_or_else(|| MambaError::NotFound {
+            entity: "showcase task",
+            id: "gateway-core".into(),
+        })?;
+    let gateway_actor = task_actor(app, &gateway_core_assignment)?;
+    let gateway_principal = app.state().principal(&gateway_actor)?.clone();
+    let showcase_external_user = format!("SHOWCASE_{}", gateway_principal.id);
+    if app
+        .state()
+        .external_identity("slack", &showcase_external_user)
+        .is_err()
+    {
+        app.bind_external_identity(
+            "slack",
+            &showcase_external_user,
+            &gateway_principal.id,
+            "tower://showcase",
+        )?;
+    }
+    app.process_external_interaction(
+        "slack",
+        "showcase-gateway-core-accept",
+        &showcase_external_user,
+        ExternalInteractionAction::TaskAccept,
+        &gateway_core_assignment.id,
+        None,
+    )?;
     let gateway_core = start_task(app, &gateway.id, "gateway-core")?;
     let gateway_actor = task_actor(app, &gateway_core)?;
     app.heartbeat_task(
@@ -362,6 +394,15 @@ mod tests {
         assert_eq!(dashboard.metrics.blocked_tasks, 1);
         assert_eq!(dashboard.metrics.awaiting_human, 1);
         assert_eq!(dashboard.metrics.open_flights, 1);
+        assert_eq!(app.state().external_interactions.len(), 1);
+        assert_eq!(
+            app.state()
+                .external_identities
+                .values()
+                .filter(|binding| binding.is_active())
+                .count(),
+            1
+        );
         assert!(
             dashboard
                 .flows

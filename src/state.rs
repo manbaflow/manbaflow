@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    ApiCredential, ExecutionRecord, FlightLease, FlightLeaseStatus, Flow, FlowChangeRequest,
-    FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, NotificationDelivery,
-    NotificationEndpoint, NotificationStatus, Organization, Principal, TargetKind, TaskStatus,
-    Team, TrackingAttention, TrackingEscalation, WorkCalendar,
+    ApiCredential, ExecutionRecord, ExternalIdentityBinding, ExternalInteractionReceipt,
+    FlightLease, FlightLeaseStatus, Flow, FlowChangeRequest, FlowChangeStatus, FlowMessage,
+    FlowScheduleRevision, FlowStatus, NotificationDelivery, NotificationEndpoint,
+    NotificationStatus, Organization, Principal, PrincipalKind, TargetKind, TaskStatus, Team,
+    TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -16,6 +17,8 @@ pub struct OrganizationState {
     pub organization: Option<Organization>,
     pub teams: BTreeMap<String, Team>,
     pub principals: BTreeMap<String, Principal>,
+    pub external_identities: BTreeMap<String, ExternalIdentityBinding>,
+    pub external_interactions: BTreeMap<String, ExternalInteractionReceipt>,
     pub calendars: BTreeMap<String, WorkCalendar>,
     pub notification_endpoints: BTreeMap<String, NotificationEndpoint>,
     pub notification_deliveries: BTreeMap<String, NotificationDelivery>,
@@ -67,6 +70,53 @@ impl OrganizationState {
                     .or_insert_with(|| {
                         WorkCalendar::always_available(principal.id.clone(), principal.created_at)
                     });
+            }
+            DomainEvent::ExternalIdentityBound { binding } => {
+                if self.external_identities.contains_key(&binding.id) {
+                    return Err(MambaError::Validation(format!(
+                        "external identity binding already exists: {}",
+                        binding.id
+                    )));
+                }
+                let principal = self.principal(&binding.principal_id)?;
+                if principal.kind != PrincipalKind::Human || !principal.active {
+                    return Err(MambaError::PermissionDenied(
+                        "external identities can only bind to an active Human principal".into(),
+                    ));
+                }
+                if self.external_identities.values().any(|candidate| {
+                    candidate.is_active()
+                        && candidate.provider == binding.provider
+                        && (candidate.external_user_id == binding.external_user_id
+                            || candidate.principal_id == binding.principal_id)
+                }) {
+                    return Err(MambaError::Validation(format!(
+                        "active {} identity is already bound",
+                        binding.provider
+                    )));
+                }
+                self.external_identities
+                    .insert(binding.id.clone(), binding.clone());
+            }
+            DomainEvent::ExternalIdentityUnbound {
+                binding_id,
+                unbound_by,
+                unbound_at,
+            } => {
+                let binding = self
+                    .external_identities
+                    .get_mut(binding_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "external identity binding",
+                        id: binding_id.clone(),
+                    })?;
+                if !binding.is_active() {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "external identity binding {binding_id} is already inactive"
+                    )));
+                }
+                binding.unbound_by = Some(unbound_by.clone());
+                binding.unbound_at = Some(*unbound_at);
             }
             DomainEvent::WorkCalendarConfigured { calendar } => {
                 self.principal(&calendar.principal_id)?;
@@ -532,6 +582,15 @@ impl OrganizationState {
                     .and_modify(|current| *current = (*current).max(*occurred_at))
                     .or_insert(*occurred_at);
             }
+            DomainEvent::ExternalInteractionProcessed { receipt } => {
+                let key = format!("{}:{}", receipt.provider, receipt.delivery_id);
+                if self.external_interactions.contains_key(&key) {
+                    return Err(MambaError::Validation(format!(
+                        "external interaction already processed: {key}"
+                    )));
+                }
+                self.external_interactions.insert(key, receipt.clone());
+            }
             DomainEvent::TaskSubmitted {
                 flow_id,
                 task_id,
@@ -725,6 +784,24 @@ impl OrganizationState {
             .ok_or_else(|| MambaError::NotFound {
                 entity: "principal",
                 id: id_or_name.to_string(),
+            })
+    }
+
+    pub fn external_identity(
+        &self,
+        provider: &str,
+        external_user_id: &str,
+    ) -> Result<&ExternalIdentityBinding> {
+        self.external_identities
+            .values()
+            .find(|binding| {
+                binding.is_active()
+                    && binding.provider == provider
+                    && binding.external_user_id == external_user_id
+            })
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "active external identity",
+                id: format!("{provider}:{external_user_id}"),
             })
     }
 

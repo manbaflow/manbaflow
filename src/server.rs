@@ -25,6 +25,9 @@ use crate::domain::{
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
+use crate::interaction::{
+    ExternalInteractionInput, InteractionWebhookAuth, parse_slack_interaction, slack_delivery_id,
+};
 use crate::notification::NotificationDispatchSummary;
 use crate::planner::PlannerKind;
 
@@ -41,6 +44,7 @@ pub struct ServerOptions {
 struct ApiState {
     app: Arc<Mutex<MambaApp>>,
     gitlab_webhook_auth: Option<GitLabWebhookAuth>,
+    interaction_auth: InteractionWebhookAuth,
 }
 
 #[derive(Debug)]
@@ -261,6 +265,7 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
         ));
     }
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
+    let interaction_auth = InteractionWebhookAuth::from_env()?;
     let listener = TcpListener::bind(options.bind).await?;
     println!(
         "MambaFlow control plane listening on http://{}",
@@ -269,16 +274,26 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
     if gitlab_webhook_auth.is_some() {
         println!("GitLab webhook receiver enabled");
     }
+    if interaction_auth.bridge_enabled() {
+        println!("Human interaction Bridge receiver enabled");
+    }
+    if interaction_auth.slack_enabled() {
+        println!("Slack interaction receiver enabled");
+    }
     let app = Arc::new(Mutex::new(app));
     spawn_tracker(app.clone(), &options);
     spawn_notification_dispatcher(app.clone(), &options);
-    axum::serve(listener, router(app, gitlab_webhook_auth))
+    axum::serve(listener, router(app, gitlab_webhook_auth, interaction_auth))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
 }
 
-fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAuth>) -> Router {
+fn router(
+    app: Arc<Mutex<MambaApp>>,
+    gitlab_webhook_auth: Option<GitLabWebhookAuth>,
+    interaction_auth: InteractionWebhookAuth,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/me", get(me))
@@ -336,10 +351,13 @@ fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAu
         .route("/api/v1/tasks/{id}/submit", post(submit_task))
         .route("/api/v1/tasks/{id}/complete", post(complete_task))
         .route("/api/v1/connectors/gitlab/webhook", post(gitlab_webhook))
+        .route("/api/v1/connectors/interactions", post(bridge_interaction))
+        .route("/api/v1/connectors/slack/actions", post(slack_interaction))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(ApiState {
             app,
             gitlab_webhook_auth,
+            interaction_auth,
         })
 }
 
@@ -872,6 +890,59 @@ async fn ack_escalation(
     .await
 }
 
+async fn bridge_interaction(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<crate::domain::ExternalInteractionResult>> {
+    let provider = required_webhook_header(&headers, "x-mamba-provider")?;
+    let delivery_id = required_webhook_header(&headers, "x-mamba-delivery-id")?;
+    let timestamp = required_webhook_header(&headers, "x-mamba-timestamp")?;
+    let signature = required_webhook_header(&headers, "x-mamba-signature")?;
+    state.interaction_auth.verify_bridge(
+        provider,
+        delivery_id,
+        timestamp,
+        signature,
+        &body,
+        Utc::now(),
+    )?;
+    let input: ExternalInteractionInput = serde_json::from_slice(&body)
+        .map_err(|_| MambaError::Validation("invalid interaction Bridge payload".into()))?;
+    let mut app = state.app.lock().await;
+    Ok(Json(app.process_external_interaction(
+        provider,
+        delivery_id,
+        &input.external_user_id,
+        input.action,
+        &input.target_id,
+        input.reason.as_deref(),
+    )?))
+}
+
+async fn slack_interaction(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<crate::domain::ExternalInteractionResult>> {
+    let timestamp = required_webhook_header(&headers, "x-slack-request-timestamp")?;
+    let signature = required_webhook_header(&headers, "x-slack-signature")?;
+    state
+        .interaction_auth
+        .verify_slack(timestamp, signature, &body, Utc::now())?;
+    let delivery_id = slack_delivery_id(timestamp, &body);
+    let input = parse_slack_interaction(&body)?;
+    let mut app = state.app.lock().await;
+    Ok(Json(app.process_external_interaction(
+        "slack",
+        &delivery_id,
+        &input.external_user_id,
+        input.action,
+        &input.target_id,
+        input.reason.as_deref(),
+    )?))
+}
+
 async fn gitlab_webhook(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1018,6 +1089,13 @@ fn webhook_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+fn required_webhook_header<'a>(headers: &'a HeaderMap, name: &str) -> ApiResult<&'a str> {
+    webhook_header(headers, name).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("missing {name} header"),
+    })
+}
+
 fn default_lease_ttl_seconds() -> u64 {
     3_600
 }
@@ -1048,6 +1126,151 @@ mod tests {
     use crate::planner::PlannerKind;
 
     type TestHmacSha256 = Hmac<Sha256>;
+
+    #[tokio::test]
+    async fn signed_bridge_and_slack_actions_use_bound_human_identity() {
+        let directory = tempdir().unwrap();
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Delivery", "product,delivery", "admin")
+            .unwrap();
+        let human = app
+            .register_principal(
+                "Leader",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        app.bind_external_identity("feishu", "ou_leader", &human.id, "admin")
+            .unwrap();
+        app.bind_external_identity("slack", "U_LEADER", &human.id, "admin")
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare a launch brief",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        app.approve_flow(&flow.id, &human.name).unwrap();
+        let task_id = flow.tasks[0].id.clone();
+        let message = app
+            .post_flow_message(
+                &flow.id,
+                Some(&task_id),
+                &human.name,
+                FlowMessageKind::Command,
+                std::slice::from_ref(&human.name),
+                "Confirm the release window",
+                true,
+            )
+            .unwrap();
+        let app = Arc::new(Mutex::new(app));
+        let bridge_secret = b"bridge-test-secret";
+        let slack_secret = b"slack-test-secret";
+        let service = router(
+            app.clone(),
+            None,
+            InteractionWebhookAuth::for_test(Some(bridge_secret), Some(slack_secret)),
+        );
+        let timestamp = Utc::now().timestamp();
+        let bridge_body = serde_json::to_vec(&json!({
+            "external_user_id": "ou_leader",
+            "action": "task.accept",
+            "target_id": task_id
+        }))
+        .unwrap();
+        let accepted = service
+            .clone()
+            .oneshot(bridge_interaction_request(
+                "feishu",
+                "feishu-delivery-1",
+                timestamp,
+                bridge_secret,
+                &bridge_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = to_bytes(accepted.into_body(), usize::MAX).await.unwrap();
+        let accepted: crate::domain::ExternalInteractionResult =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!accepted.duplicate);
+        assert_eq!(accepted.receipt.principal_id, human.id);
+        let sequence = app.lock().await.state().last_sequence;
+
+        let duplicate = service
+            .clone()
+            .oneshot(bridge_interaction_request(
+                "feishu",
+                "feishu-delivery-1",
+                timestamp,
+                bridge_secret,
+                &bridge_body,
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(duplicate.into_body(), usize::MAX).await.unwrap();
+        let duplicate: crate::domain::ExternalInteractionResult =
+            serde_json::from_slice(&body).unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(app.lock().await.state().last_sequence, sequence);
+
+        let slack_payload = json!({
+            "type": "block_actions",
+            "user": {"id": "U_LEADER"},
+            "actions": [{
+                "action_id": "mambaflow.message.ack",
+                "value": message.id
+            }]
+        });
+        let slack_body = serde_urlencoded::to_string([("payload", slack_payload.to_string())])
+            .unwrap()
+            .into_bytes();
+        let acknowledged = service
+            .clone()
+            .oneshot(slack_interaction_request(
+                timestamp,
+                slack_secret,
+                &slack_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(acknowledged.status(), StatusCode::OK);
+        assert!(
+            app.lock().await.state().messages[&message.id].recipient_is_acknowledged(&human.id)
+        );
+        assert_eq!(
+            app.lock()
+                .await
+                .state()
+                .find_task(&task_id)
+                .unwrap()
+                .1
+                .status,
+            crate::domain::TaskStatus::Accepted
+        );
+
+        let invalid = service
+            .oneshot(slack_interaction_request(
+                timestamp,
+                b"wrong-secret",
+                &slack_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::FORBIDDEN);
+        assert_eq!(app.lock().await.state().external_interactions.len(), 2);
+    }
 
     #[tokio::test]
     async fn bearer_identity_drives_remote_inbox_and_task_actions() {
@@ -1106,7 +1329,7 @@ mod tests {
         );
 
         let app = Arc::new(Mutex::new(app));
-        let service = router(app.clone(), None);
+        let service = router(app.clone(), None, InteractionWebhookAuth::default());
         let unauthorized = service
             .clone()
             .oneshot(
@@ -1457,7 +1680,11 @@ mod tests {
                 "admin",
             )
             .unwrap();
-        let service = router(Arc::new(Mutex::new(app)), None);
+        let service = router(
+            Arc::new(Mutex::new(app)),
+            None,
+            InteractionWebhookAuth::default(),
+        );
 
         let endpoints = service
             .clone()
@@ -1631,7 +1858,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let app = Arc::new(Mutex::new(app));
-        let service = router(app.clone(), Some(auth));
+        let service = router(app.clone(), Some(auth), InteractionWebhookAuth::default());
         let timestamp = Utc::now().timestamp();
         let merged_body = merge_request_webhook("merged", "def456");
 
@@ -1809,6 +2036,53 @@ mod tests {
             .header("webhook-id", delivery_id)
             .header("webhook-timestamp", timestamp)
             .header("webhook-signature", signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    fn bridge_interaction_request(
+        provider: &str,
+        delivery_id: &str,
+        timestamp: i64,
+        key: &[u8],
+        body: &[u8],
+    ) -> Request<Body> {
+        let timestamp = timestamp.to_string();
+        let mut message = format!("{provider}.{delivery_id}.{timestamp}.").into_bytes();
+        message.extend_from_slice(body);
+        let mut mac = TestHmacSha256::new_from_slice(key).expect("HMAC accepts keys of any size");
+        mac.update(&message);
+        let signature = format!("v1,{}", BASE64_STANDARD.encode(mac.finalize().into_bytes()));
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/connectors/interactions")
+            .header("content-type", "application/json")
+            .header("x-mamba-provider", provider)
+            .header("x-mamba-delivery-id", delivery_id)
+            .header("x-mamba-timestamp", timestamp)
+            .header("x-mamba-signature", signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    fn slack_interaction_request(timestamp: i64, key: &[u8], body: &[u8]) -> Request<Body> {
+        let timestamp = timestamp.to_string();
+        let mut message = format!("v0:{timestamp}:").into_bytes();
+        message.extend_from_slice(body);
+        let mut mac = TestHmacSha256::new_from_slice(key).expect("HMAC accepts keys of any size");
+        mac.update(&message);
+        let signature = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/connectors/slack/actions")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-slack-request-timestamp", timestamp)
+            .header("x-slack-signature", format!("v0={signature}"))
             .body(Body::from(body.to_vec()))
             .unwrap()
     }

@@ -392,6 +392,14 @@ struct NotificationCard {
     facts: Vec<(String, String)>,
     severity: CardSeverity,
     footer: String,
+    actions: Vec<CardAction>,
+}
+
+#[derive(Clone, Debug)]
+struct CardAction {
+    label: &'static str,
+    action_id: &'static str,
+    target_id: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -485,6 +493,35 @@ fn notification_card(
         }
     }
     facts.push(("传球人".into(), webhook.actor.clone()));
+    let actions = match webhook.event_type.as_str() {
+        "work_request.sent" => value_text(data, "task_id")
+            .map(|target_id| CardAction {
+                label: "接球",
+                action_id: "mambaflow.task.accept",
+                target_id,
+            })
+            .into_iter()
+            .collect(),
+        "flow_message.posted" if nested_bool(data, &["message", "requires_ack"]) == Some(true) => {
+            nested_text(data, &["message", "id"])
+                .map(|target_id| CardAction {
+                    label: "确认收到",
+                    action_id: "mambaflow.message.ack",
+                    target_id,
+                })
+                .into_iter()
+                .collect()
+        }
+        "tracking.escalation_raised" => nested_text(data, &["escalation", "id"])
+            .map(|target_id| CardAction {
+                label: "接手处理",
+                action_id: "mambaflow.escalation.ack",
+                target_id,
+            })
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    };
     NotificationCard {
         title: limit_text(title, 120),
         summary: limit_text(&summary, 1_500),
@@ -496,6 +533,7 @@ fn notification_card(
             delivery.source_event_kind,
             delivery.queued_at.format("%Y-%m-%d %H:%M UTC")
         ),
+        actions,
     }
 }
 
@@ -508,6 +546,12 @@ fn nested_text(value: &Value, keys: &[&str]) -> Option<String> {
         .iter()
         .try_fold(value, |current, key| current.get(key))?;
     scalar_text(value)
+}
+
+fn nested_bool(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .try_fold(value, |current, key| current.get(key))?
+        .as_bool()
 }
 
 fn scalar_text(value: &Value) -> Option<String> {
@@ -538,23 +582,36 @@ fn render_slack(card: &NotificationCard) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let mut blocks = vec![
+        json!({
+            "type": "header",
+            "text": {"type": "plain_text", "text": card.title, "emoji": true}
+        }),
+        json!({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": slack_escape(&card.summary)}
+        }),
+        json!({"type": "section", "fields": fields}),
+    ];
+    if !card.actions.is_empty() {
+        blocks.push(json!({
+            "type": "actions",
+            "elements": card.actions.iter().map(|action| json!({
+                "type": "button",
+                "text": {"type": "plain_text", "text": action.label, "emoji": true},
+                "action_id": action.action_id,
+                "value": action.target_id,
+                "style": "primary"
+            })).collect::<Vec<_>>()
+        }));
+    }
+    blocks.push(json!({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": slack_escape(&card.footer)}]
+    }));
     json!({
         "text": format!("{}: {}", card.title, card.summary),
-        "blocks": [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": card.title, "emoji": true}
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": slack_escape(&card.summary)}
-            },
-            {"type": "section", "fields": fields},
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": slack_escape(&card.footer)}]
-            }
-        ]
+        "blocks": blocks
     })
 }
 
@@ -729,6 +786,49 @@ mod tests {
         assert_eq!(endpoint.connector, NotificationConnector::Generic);
         assert!(endpoint.url_env.is_none());
         validate_endpoint(&endpoint).unwrap();
+    }
+
+    #[test]
+    fn slack_work_request_card_contains_a_scoped_accept_action() {
+        let now = Utc::now();
+        let delivery = NotificationDelivery {
+            id: "NTF-ACTION".into(),
+            organization_id: "ORG-1".into(),
+            endpoint_id: "NEND-1".into(),
+            source_event_kind: "work_request.sent".into(),
+            flow_id: Some("FLOW-1".into()),
+            actor: "牢大".into(),
+            payload: json!({
+                "type": "work_request_sent",
+                "data": {"flow_id": "FLOW-1", "task_id": "TSK-1", "target_id": "HUM-1"}
+            }),
+            status: NotificationStatus::Pending,
+            attempts: 0,
+            queued_at: now,
+            last_attempt_at: None,
+            delivered_at: None,
+            response_status: None,
+            last_error: None,
+        };
+        let webhook = NotificationWebhook {
+            specversion: "1.0",
+            id: delivery.id.clone(),
+            source: "mambaflow://organizations/ORG-1".into(),
+            event_type: delivery.source_event_kind.clone(),
+            subject: Some("mambaflow://flows/FLOW-1".into()),
+            time: now,
+            actor: delivery.actor.clone(),
+            data: delivery.payload.clone(),
+        };
+        let slack = render_slack(&notification_card(&webhook, &delivery));
+        let action = slack["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["type"] == "actions")
+            .unwrap();
+        assert_eq!(action["elements"][0]["action_id"], "mambaflow.task.accept");
+        assert_eq!(action["elements"][0]["value"], "TSK-1");
     }
 
     #[tokio::test]

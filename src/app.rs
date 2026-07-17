@@ -10,12 +10,13 @@ use crate::dashboard::{DashboardSnapshot, build_dashboard};
 use crate::domain::{
     ApiCredential, Assignment, AssignmentTarget, AttentionSeverity, AvailabilityBlock, Demand,
     Estimate, Evidence, ExecutionRecord, ExecutorConfig, ExecutorKind, ExecutorMode,
-    ExternalArtifact, FlightLease, FlightLeaseStatus, Flow, FlowChangeImpact, FlowChangeRequest,
-    FlowChangeStatus, FlowMessage, FlowMessageKind, FlowScheduleRevision, FlowStatus,
-    IssuedCredential, MessageAcknowledgement, MessageInboxItem, NotificationConnector,
-    NotificationDelivery, NotificationEndpoint, NotificationStatus, Organization, Principal,
-    PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskDraft, TaskStatus, Team,
-    TrackingAttention, TrackingEscalation, TrackingScan, WorkCalendar, Workday,
+    ExternalArtifact, ExternalIdentityBinding, ExternalInteractionAction,
+    ExternalInteractionReceipt, ExternalInteractionResult, FlightLease, FlightLeaseStatus, Flow,
+    FlowChangeImpact, FlowChangeRequest, FlowChangeStatus, FlowMessage, FlowMessageKind,
+    FlowScheduleRevision, FlowStatus, IssuedCredential, MessageAcknowledgement, MessageInboxItem,
+    NotificationConnector, NotificationDelivery, NotificationEndpoint, NotificationStatus,
+    Organization, Principal, PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskDraft,
+    TaskStatus, Team, TrackingAttention, TrackingEscalation, TrackingScan, WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -199,6 +200,75 @@ impl MambaApp {
             }],
         )?;
         Ok(principal)
+    }
+
+    pub fn bind_external_identity(
+        &mut self,
+        provider: &str,
+        external_user_id: &str,
+        principal: &str,
+        actor: &str,
+    ) -> Result<ExternalIdentityBinding> {
+        let provider = normalize_external_provider(provider)?;
+        let external_user_id = validate_external_value(external_user_id, "external user ID", 200)?;
+        let principal = self.state.principal(principal)?.clone();
+        if principal.kind != PrincipalKind::Human || !principal.active {
+            return Err(MambaError::PermissionDenied(
+                "external identities can only bind to an active Human principal".into(),
+            ));
+        }
+        if self.state.external_identities.values().any(|binding| {
+            binding.is_active()
+                && binding.provider == provider
+                && (binding.external_user_id == external_user_id
+                    || binding.principal_id == principal.id)
+        }) {
+            return Err(MambaError::Validation(format!(
+                "active {provider} identity is already bound"
+            )));
+        }
+        let binding = ExternalIdentityBinding {
+            id: new_id("XID"),
+            provider,
+            external_user_id,
+            principal_id: principal.id,
+            bound_by: actor.to_string(),
+            bound_at: Utc::now(),
+            unbound_by: None,
+            unbound_at: None,
+        };
+        self.commit(
+            actor,
+            vec![DomainEvent::ExternalIdentityBound {
+                binding: binding.clone(),
+            }],
+        )?;
+        Ok(binding)
+    }
+
+    pub fn unbind_external_identity(
+        &mut self,
+        binding_id: &str,
+        actor: &str,
+    ) -> Result<ExternalIdentityBinding> {
+        let binding = self
+            .state
+            .external_identities
+            .get(binding_id)
+            .filter(|binding| binding.is_active())
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "active external identity binding",
+                id: binding_id.to_string(),
+            })?;
+        self.commit(
+            actor,
+            vec![DomainEvent::ExternalIdentityUnbound {
+                binding_id: binding.id.clone(),
+                unbound_by: actor.to_string(),
+                unbound_at: Utc::now(),
+            }],
+        )?;
+        Ok(self.state.external_identities[binding_id].clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1498,6 +1568,177 @@ impl MambaApp {
             }],
         )?;
         Ok(self.state.find_task(&task.id)?.1.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_external_interaction(
+        &mut self,
+        provider: &str,
+        delivery_id: &str,
+        external_user_id: &str,
+        action: ExternalInteractionAction,
+        target_id: &str,
+        reason: Option<&str>,
+    ) -> Result<ExternalInteractionResult> {
+        let provider = normalize_external_provider(provider)?;
+        let delivery_id = validate_external_value(delivery_id, "delivery ID", 200)?;
+        let external_user_id = validate_external_value(external_user_id, "external user ID", 200)?;
+        let target_id = validate_external_value(target_id, "interaction target", 200)?;
+        let reason = reason
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| validate_external_value(value, "interaction reason", 500))
+            .transpose()?;
+        let key = format!("{provider}:{delivery_id}");
+        if let Some(receipt) = self.state.external_interactions.get(&key) {
+            if receipt.external_user_id != external_user_id
+                || receipt.action != action
+                || receipt.target_id != target_id
+                || receipt.reason != reason
+            {
+                return Err(MambaError::Validation(format!(
+                    "external interaction delivery ID collision: {key}"
+                )));
+            }
+            return Ok(ExternalInteractionResult {
+                duplicate: true,
+                receipt: receipt.clone(),
+            });
+        }
+        let binding = self
+            .state
+            .external_identity(&provider, &external_user_id)?
+            .clone();
+        let principal = self.state.principal(&binding.principal_id)?.clone();
+        if principal.kind != PrincipalKind::Human || !principal.active {
+            return Err(MambaError::PermissionDenied(
+                "external interaction requires an active Human binding".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut events = Vec::new();
+        let flow_id = match action {
+            ExternalInteractionAction::TaskAccept => {
+                let (flow, task) = self.task_snapshot(&target_id)?;
+                ensure_status(&task, &[TaskStatus::Assigned])?;
+                self.ensure_task_actor(&task, &principal.name)?;
+                events.push(DomainEvent::TaskAccepted {
+                    flow_id: flow.id.clone(),
+                    task_id: task.id,
+                    accepted_by: principal.name.clone(),
+                    accepted_at: now,
+                });
+                Some(flow.id)
+            }
+            ExternalInteractionAction::TaskReject => {
+                let reason = reason.as_deref().ok_or_else(|| {
+                    MambaError::Validation("task.reject requires a reason".into())
+                })?;
+                let (flow, task) = self.task_snapshot(&target_id)?;
+                ensure_status(&task, &[TaskStatus::Assigned])?;
+                self.ensure_task_actor(&task, &principal.name)?;
+                events.push(DomainEvent::TaskRejected {
+                    flow_id: flow.id.clone(),
+                    task_id: task.id,
+                    rejected_by: principal.name.clone(),
+                    reason: reason.to_string(),
+                });
+                Some(flow.id)
+            }
+            ExternalInteractionAction::MessageAck => {
+                let message = self
+                    .state
+                    .messages
+                    .get(&target_id)
+                    .cloned()
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "flow message",
+                        id: target_id.clone(),
+                    })?;
+                if !message.requires_ack {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "flow message {} does not require acknowledgement",
+                        message.id
+                    )));
+                }
+                let represented = self.message_recipient_ids(&message, &principal);
+                if represented.is_empty() {
+                    return Err(MambaError::PermissionDenied(format!(
+                        "{} is not a recipient of flow message {}",
+                        principal.name, message.id
+                    )));
+                }
+                let acknowledgements = represented
+                    .into_iter()
+                    .filter(|recipient_id| !message.recipient_is_acknowledged(recipient_id))
+                    .map(|recipient_id| MessageAcknowledgement {
+                        recipient_id,
+                        acknowledged_by_id: principal.id.clone(),
+                        acknowledged_by_name: principal.name.clone(),
+                        acknowledged_at: now,
+                    })
+                    .collect::<Vec<_>>();
+                if !acknowledgements.is_empty() {
+                    events.push(DomainEvent::FlowMessageAcknowledged {
+                        flow_id: message.flow_id.clone(),
+                        message_id: message.id,
+                        acknowledgements,
+                    });
+                }
+                Some(message.flow_id)
+            }
+            ExternalInteractionAction::EscalationAck => {
+                let escalation =
+                    self.state
+                        .escalations
+                        .get(&target_id)
+                        .cloned()
+                        .ok_or_else(|| MambaError::NotFound {
+                            entity: "tracking escalation",
+                            id: target_id.clone(),
+                        })?;
+                if escalation.recipient_id != principal.id {
+                    return Err(MambaError::PermissionDenied(format!(
+                        "{} is not the recipient of escalation {}",
+                        principal.name, escalation.id
+                    )));
+                }
+                if !escalation.is_active() || escalation.acknowledged_at.is_some() {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "escalation {} cannot be acknowledged",
+                        escalation.id
+                    )));
+                }
+                events.push(DomainEvent::TrackingEscalationAcknowledged {
+                    flow_id: escalation.flow_id.clone(),
+                    task_id: escalation.task_id,
+                    escalation_id: escalation.id,
+                    acknowledged_by: principal.name.clone(),
+                    acknowledged_at: now,
+                });
+                Some(escalation.flow_id)
+            }
+        };
+        let receipt = ExternalInteractionReceipt {
+            id: new_id("XACT"),
+            provider,
+            delivery_id,
+            external_user_id,
+            principal_id: principal.id,
+            action,
+            target_id,
+            reason,
+            flow_id,
+            processed_at: now,
+        };
+        events.push(DomainEvent::ExternalInteractionProcessed {
+            receipt: receipt.clone(),
+        });
+        self.commit(&principal.name, events)?;
+        Ok(ExternalInteractionResult {
+            duplicate: false,
+            receipt,
+        })
     }
 
     pub fn negotiate_task(
@@ -3151,6 +3392,32 @@ fn ensure_status(task: &Task, expected: &[TaskStatus]) -> Result<()> {
     }
 }
 
+fn normalize_external_provider(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || value.chars().count() > 40
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(MambaError::Validation(
+            "external provider must contain only letters, digits, _ or -".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_external_value(value: &str, label: &str, max_chars: usize) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > max_chars || value.chars().any(char::is_control)
+    {
+        return Err(MambaError::Validation(format!(
+            "{label} must contain 1 to {max_chars} printable characters"
+        )));
+    }
+    Ok(value.to_string())
+}
+
 fn target_for_principal(principal: &Principal) -> AssignmentTarget {
     AssignmentTarget {
         kind: match principal.kind {
@@ -3427,6 +3694,135 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn external_human_interactions_are_bound_atomic_idempotent_and_replayable() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Delivery", "product,delivery", "admin")
+            .unwrap();
+        let human = app
+            .register_principal(
+                "Leader",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let binding = app
+            .bind_external_identity("Slack", "U-LEADER", &human.id, "admin")
+            .unwrap();
+        assert_eq!(binding.provider, "slack");
+        assert!(
+            app.bind_external_identity("slack", "U-OTHER", &human.id, "admin")
+                .is_err()
+        );
+        let flow = app
+            .create_demand(
+                "Prepare a launch plan",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        app.approve_flow(&flow.id, &human.name).unwrap();
+        let task = flow.tasks[0].clone();
+
+        let accepted = app
+            .process_external_interaction(
+                "slack",
+                "delivery-1",
+                "U-LEADER",
+                ExternalInteractionAction::TaskAccept,
+                &task.id,
+                None,
+            )
+            .unwrap();
+        assert!(!accepted.duplicate);
+        assert_eq!(accepted.receipt.principal_id, human.id);
+        assert_eq!(
+            app.state().find_task(&task.id).unwrap().1.status,
+            TaskStatus::Accepted
+        );
+        let duplicate = app
+            .process_external_interaction(
+                "slack",
+                "delivery-1",
+                "U-LEADER",
+                ExternalInteractionAction::TaskAccept,
+                &task.id,
+                None,
+            )
+            .unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.receipt.id, accepted.receipt.id);
+        assert!(
+            app.process_external_interaction(
+                "slack",
+                "delivery-1",
+                "U-LEADER",
+                ExternalInteractionAction::TaskAccept,
+                "TSK-DIFFERENT",
+                None,
+            )
+            .is_err()
+        );
+
+        let message = app
+            .post_flow_message(
+                &flow.id,
+                Some(&task.id),
+                &human.name,
+                FlowMessageKind::Command,
+                std::slice::from_ref(&human.name),
+                "Confirm the release window",
+                true,
+            )
+            .unwrap();
+        app.process_external_interaction(
+            "slack",
+            "delivery-2",
+            "U-LEADER",
+            ExternalInteractionAction::MessageAck,
+            &message.id,
+            None,
+        )
+        .unwrap();
+        assert!(app.state().messages[&message.id].recipient_is_acknowledged(&human.id));
+        assert_eq!(app.state().external_interactions.len(), 2);
+
+        app.unbind_external_identity(&binding.id, "admin").unwrap();
+        assert!(
+            app.process_external_interaction(
+                "slack",
+                "delivery-3",
+                "U-LEADER",
+                ExternalInteractionAction::MessageAck,
+                &message.id,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(app.state().external_interactions.len(), 2);
+
+        drop(app);
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        assert_eq!(replayed.state().external_interactions.len(), 2);
+        assert!(!replayed.state().external_identities[&binding.id].is_active());
+        assert_eq!(
+            replayed.state().find_task(&task.id).unwrap().1.status,
+            TaskStatus::Accepted
+        );
+    }
 
     #[tokio::test]
     async fn notification_outbox_is_atomic_retryable_and_replayable() {

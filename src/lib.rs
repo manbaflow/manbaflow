@@ -7,6 +7,7 @@ pub mod event;
 pub mod executor;
 pub mod gitlab;
 pub mod ids;
+pub mod interaction;
 pub mod matcher;
 pub mod notification;
 pub mod planner;

@@ -121,10 +121,10 @@ mamba notification endpoint-disable NEND-xxxxxxxx
 
 ## Office 与双向交互
 
-当前原生 Connector 负责单向通知，收到 `work_request.sent`、`task.blocked`、升级或验收事件时生成适合
-供应商的卡片。它不冒充员工读取聊天，也不把按钮点击直接当作 Human 批准。需要从聊天中接单、审批或回复
-时，应使用供应商 App/Bot 的 OAuth 与回调接口，把已经验证的用户身份映射为 MambaFlow Principal，再调用
-Control Plane API。
+当前原生 Connector 收到 `work_request.sent`、`task.blocked`、升级或验收事件时生成适合供应商的卡片。
+Slack 支持经过 App Signing Secret 验证的接球与确认按钮；飞书和 Teams 的双向身份需要供应商 App/Bot 或
+Power Automate Bridge。身份绑定、允许动作、幂等回执和 Bridge 签名协议见
+[Human Interaction Gateway](INTERACTIONS.md)。
 
 日历方向使用 Control Plane 已有的 `GET/PUT /api/v1/me/calendar` 与 `POST /api/v1/me/time-off`：Bridge
 读取 Microsoft 365、Google Workspace 或飞书日历的忙碌区间，再以员工自己的 Bearer 身份同步。这样厂商

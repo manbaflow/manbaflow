@@ -179,6 +179,67 @@ pub struct NotificationDelivery {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalIdentityBinding {
+    pub id: String,
+    pub provider: String,
+    pub external_user_id: String,
+    pub principal_id: String,
+    pub bound_by: String,
+    pub bound_at: DateTime<Utc>,
+    pub unbound_by: Option<String>,
+    pub unbound_at: Option<DateTime<Utc>>,
+}
+
+impl ExternalIdentityBinding {
+    pub fn is_active(&self) -> bool {
+        self.unbound_at.is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExternalInteractionAction {
+    #[serde(rename = "task.accept")]
+    TaskAccept,
+    #[serde(rename = "task.reject")]
+    TaskReject,
+    #[serde(rename = "message.ack")]
+    MessageAck,
+    #[serde(rename = "escalation.ack")]
+    EscalationAck,
+}
+
+impl ExternalInteractionAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskAccept => "task.accept",
+            Self::TaskReject => "task.reject",
+            Self::MessageAck => "message.ack",
+            Self::EscalationAck => "escalation.ack",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalInteractionReceipt {
+    pub id: String,
+    pub provider: String,
+    pub delivery_id: String,
+    pub external_user_id: String,
+    pub principal_id: String,
+    pub action: ExternalInteractionAction,
+    pub target_id: String,
+    pub reason: Option<String>,
+    pub flow_id: Option<String>,
+    pub processed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalInteractionResult {
+    pub duplicate: bool,
+    pub receipt: ExternalInteractionReceipt,
+}
+
 impl WorkCalendar {
     pub fn always_available(principal_id: String, created_at: DateTime<Utc>) -> Self {
         Self {

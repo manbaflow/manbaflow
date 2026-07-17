@@ -185,6 +185,41 @@ enum PrincipalCommand {
         #[command(subcommand)]
         command: CredentialCommand,
     },
+    /// 管理 Slack、飞书或 Teams 用户与 Human Principal 的身份绑定
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityCommand {
+    /// 将一个供应商用户绑定到 Human Principal
+    Bind {
+        #[arg(long = "for")]
+        target: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        external_user: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
+    /// 查看外部身份绑定
+    List {
+        #[arg(long = "for")]
+        target: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// 停用一个身份绑定，历史交互回执仍保留
+    Unbind {
+        binding: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -987,6 +1022,80 @@ async fn run(cli: Cli) -> Result<()> {
                 CredentialCommand::Revoke { credential, by } => {
                     let credential = app.revoke_api_credential(&credential, &by)?;
                     output(&credential, cli.json, format!("{} 已撤销", credential.id));
+                }
+            },
+            PrincipalCommand::Identity { command } => match command {
+                IdentityCommand::Bind {
+                    target,
+                    provider,
+                    external_user,
+                    by,
+                } => {
+                    let binding =
+                        app.bind_external_identity(&provider, &external_user, &target, &by)?;
+                    output(
+                        &binding,
+                        cli.json,
+                        format!(
+                            "{} 已绑定 {}:{} -> {}",
+                            binding.id, binding.provider, binding.external_user_id, target
+                        ),
+                    );
+                }
+                IdentityCommand::List {
+                    target,
+                    provider,
+                    all,
+                } => {
+                    let principal_id = target
+                        .as_deref()
+                        .map(|target| app.state().principal(target).map(|value| value.id.clone()))
+                        .transpose()?;
+                    let provider = provider.map(|value| value.trim().to_ascii_lowercase());
+                    let mut bindings = app
+                        .state()
+                        .external_identities
+                        .values()
+                        .filter(|binding| all || binding.is_active())
+                        .filter(|binding| {
+                            principal_id
+                                .as_deref()
+                                .is_none_or(|id| binding.principal_id == id)
+                        })
+                        .filter(|binding| {
+                            provider
+                                .as_deref()
+                                .is_none_or(|value| binding.provider == value)
+                        })
+                        .collect::<Vec<_>>();
+                    bindings.sort_by_key(|binding| binding.bound_at);
+                    let text = bindings
+                        .iter()
+                        .map(|binding| {
+                            format!(
+                                "{}\t{}\t{}:{}\t{}",
+                                binding.id,
+                                if binding.is_active() {
+                                    "ACTIVE"
+                                } else {
+                                    "UNBOUND"
+                                },
+                                binding.provider,
+                                binding.external_user_id,
+                                binding.principal_id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    output(&bindings, cli.json, text);
+                }
+                IdentityCommand::Unbind { binding, by } => {
+                    let binding = app.unbind_external_identity(&binding, &by)?;
+                    output(
+                        &binding,
+                        cli.json,
+                        format!("{} 已解绑，历史交互回执保留", binding.id),
+                    );
                 }
             },
         },

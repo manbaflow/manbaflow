@@ -1843,6 +1843,18 @@ fn render_tower_brief(frame: &mut Frame, app: &MambaApp, flow: Option<&Flow>, ar
         .action_items
         .iter()
         .find(|action| action.flow_id == flow.id);
+    let external_actions = app
+        .state()
+        .external_interactions
+        .values()
+        .filter(|receipt| receipt.flow_id.as_deref() == Some(flow.id.as_str()))
+        .count();
+    let active_identities = app
+        .state()
+        .external_identities
+        .values()
+        .filter(|binding| binding.is_active())
+        .count();
     let [brief, gauge] = Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).areas(area);
     let lines = vec![
         Line::styled(flow.prd.title.clone(), Style::new().fg(TEXT).bold()),
@@ -1874,6 +1886,13 @@ fn render_tower_brief(frame: &mut Frame, app: &MambaApp, flow: Option<&Flow>, ar
                     })
                     .unwrap_or_else(|| "无需管理动作".into()),
                 Style::new().fg(if next_action.is_some() { ORANGE } else { GREEN }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("场外回执  ", Style::new().fg(MUTED)),
+            Span::styled(
+                format!("{external_actions} verified · {active_identities} identities"),
+                Style::new().fg(if external_actions == 0 { MUTED } else { GREEN }),
             ),
         ]),
         Line::from(vec![
@@ -3373,6 +3392,7 @@ fn event_style(kind: &str) -> Style {
         || kind.contains("finished")
         || kind.contains("landed")
         || kind.contains("delivered")
+        || kind.contains("external_interaction.processed")
         || kind.contains("attention_resolved")
     {
         GREEN

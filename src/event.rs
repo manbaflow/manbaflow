@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     ApiCredential, Assignment, AttentionKind, AvailabilityBlock, Demand, Estimate, Evidence,
-    ExecutionRecord, ExternalArtifact, FlightLease, Flow, FlowChangeRequest, FlowMessage,
-    FlowScheduleRevision, MessageAcknowledgement, NotificationDelivery, NotificationEndpoint,
-    Organization, PrdDraft, Principal, RemoteFlightReport, Task, Team, TrackingAttention,
-    TrackingEscalation, WorkCalendar,
+    ExecutionRecord, ExternalArtifact, ExternalIdentityBinding, ExternalInteractionReceipt,
+    FlightLease, Flow, FlowChangeRequest, FlowMessage, FlowScheduleRevision,
+    MessageAcknowledgement, NotificationDelivery, NotificationEndpoint, Organization, PrdDraft,
+    Principal, RemoteFlightReport, Task, Team, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -20,6 +20,14 @@ pub enum DomainEvent {
     },
     PrincipalRegistered {
         principal: Principal,
+    },
+    ExternalIdentityBound {
+        binding: ExternalIdentityBinding,
+    },
+    ExternalIdentityUnbound {
+        binding_id: String,
+        unbound_by: String,
+        unbound_at: DateTime<Utc>,
     },
     WorkCalendarConfigured {
         calendar: WorkCalendar,
@@ -176,6 +184,9 @@ pub enum DomainEvent {
         occurred_at: DateTime<Utc>,
         processed_at: DateTime<Utc>,
     },
+    ExternalInteractionProcessed {
+        receipt: ExternalInteractionReceipt,
+    },
     TaskSubmitted {
         flow_id: String,
         task_id: String,
@@ -274,6 +285,8 @@ impl DomainEvent {
             Self::OrganizationInitialized { .. } => "organization.initialized",
             Self::TeamCreated { .. } => "team.created",
             Self::PrincipalRegistered { .. } => "principal.registered",
+            Self::ExternalIdentityBound { .. } => "external_identity.bound",
+            Self::ExternalIdentityUnbound { .. } => "external_identity.unbound",
             Self::WorkCalendarConfigured { .. } => "calendar.configured",
             Self::TimeOffAdded { .. } => "calendar.time_off_added",
             Self::TimeOffCancelled { .. } => "calendar.time_off_cancelled",
@@ -304,6 +317,7 @@ impl DomainEvent {
             Self::EvidenceAdded { .. } => "task.evidence_added",
             Self::ExternalArtifactSynced { .. } => "task.external_artifact_synced",
             Self::ExternalDeliveryProcessed { .. } => "external.delivery_processed",
+            Self::ExternalInteractionProcessed { .. } => "external_interaction.processed",
             Self::TaskSubmitted { .. } => "task.submitted",
             Self::TaskCompleted { .. } => "task.completed",
             Self::TrackingAttentionRaised { .. } => "tracking.attention_raised",
@@ -362,9 +376,12 @@ impl DomainEvent {
             Self::FlowChangeProposed { request } => Some(&request.flow_id),
             Self::ExecutorFinished { record } => Some(&record.flow_id),
             Self::RemoteFlightAuthorized { lease } => Some(&lease.flow_id),
+            Self::ExternalInteractionProcessed { receipt } => receipt.flow_id.as_deref(),
             Self::OrganizationInitialized { .. }
             | Self::TeamCreated { .. }
             | Self::PrincipalRegistered { .. }
+            | Self::ExternalIdentityBound { .. }
+            | Self::ExternalIdentityUnbound { .. }
             | Self::WorkCalendarConfigured { .. }
             | Self::TimeOffAdded { .. }
             | Self::TimeOffCancelled { .. }
