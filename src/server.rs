@@ -15,7 +15,10 @@ use tokio::sync::Mutex;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::MambaApp;
-use crate::domain::{Evidence, Flow, Principal, Task, TrackingEscalation};
+use crate::domain::{
+    Evidence, ExecutorKind, FlightLease, Flow, Principal, PrincipalKind, RemoteFlightReport, Task,
+    TrackingEscalation,
+};
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
 
@@ -107,6 +110,25 @@ struct EvidenceInput {
     summary: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct AuthorizeFlightInput {
+    agent: String,
+    executor: ExecutorKind,
+    #[serde(default = "default_lease_ttl_seconds")]
+    ttl_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ClaimFlightInput {
+    run_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct FinishFlightInput {
+    landed: bool,
+    report: RemoteFlightReport,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct GitLabWebhookResponse {
     status: &'static str,
@@ -151,6 +173,11 @@ fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAu
         .route("/api/v1/tasks/{id}/heartbeat", post(heartbeat_task))
         .route("/api/v1/tasks/{id}/block", post(block_task))
         .route("/api/v1/tasks/{id}/evidence", post(add_evidence))
+        .route("/api/v1/tasks/{id}/flight-leases", post(authorize_flight))
+        .route("/api/v1/flight-leases", get(flight_leases))
+        .route("/api/v1/flight-leases/{id}/claim", post(claim_flight))
+        .route("/api/v1/flight-leases/{id}/revoke", post(revoke_flight))
+        .route("/api/v1/flight-leases/{id}/finish", post(finish_flight))
         .route("/api/v1/tasks/{id}/submit", post(submit_task))
         .route("/api/v1/tasks/{id}/complete", post(complete_task))
         .route("/api/v1/connectors/gitlab/webhook", post(gitlab_webhook))
@@ -309,6 +336,71 @@ async fn add_evidence(
     .await
 }
 
+async fn authorize_flight(
+    State(state): State<ApiState>,
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<AuthorizeFlightInput>,
+) -> ApiResult<Json<FlightLease>> {
+    mutate(&state, &headers, |app, actor| {
+        app.authorize_remote_flight(
+            &task_id,
+            actor,
+            &input.agent,
+            input.executor,
+            input.ttl_seconds,
+        )
+    })
+    .await
+}
+
+async fn flight_leases(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<FlightLease>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.remote_flight_leases(
+        &principal.id,
+        principal.kind == PrincipalKind::Human,
+    )?))
+}
+
+async fn claim_flight(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<ClaimFlightInput>,
+) -> ApiResult<Json<FlightLease>> {
+    mutate(&state, &headers, |app, actor| {
+        app.claim_remote_flight(&lease_id, actor, &input.run_id)
+    })
+    .await
+}
+
+async fn finish_flight(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<FinishFlightInput>,
+) -> ApiResult<Json<FlightLease>> {
+    mutate(&state, &headers, |app, actor| {
+        app.finish_remote_flight(&lease_id, actor, input.landed, input.report)
+    })
+    .await
+}
+
+async fn revoke_flight(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<FlightLease>> {
+    mutate(&state, &headers, |app, actor| {
+        app.revoke_remote_flight(&lease_id, actor)
+    })
+    .await
+}
+
 async fn submit_task(
     State(state): State<ApiState>,
     Path(task_id): Path<String>,
@@ -448,6 +540,10 @@ fn authenticate(app: &MambaApp, headers: &HeaderMap) -> ApiResult<Principal> {
 
 fn webhook_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn default_lease_ttl_seconds() -> u64 {
+    3_600
 }
 
 #[cfg(test)]
@@ -590,6 +686,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn human_and_agent_tokens_drive_remote_flight_lease_lifecycle() {
+        let directory = tempdir().unwrap();
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Delivery", "product,delivery", "admin")
+            .unwrap();
+        let human = app
+            .register_principal(
+                "Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let agent = app
+            .register_principal(
+                "Engineer Codex",
+                PrincipalKind::Agent,
+                Some(&team.id),
+                Some(&human.id),
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare a launch brief",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let task_id = flow.tasks[0].id.clone();
+        app.approve_flow(&flow.id, &human.name).unwrap();
+        app.accept_task(&task_id, &human.name).unwrap();
+        let human_token = app
+            .issue_api_credential(&human.id, "human", "admin")
+            .unwrap()
+            .token;
+        let agent_token = app
+            .issue_api_credential(&agent.id, "agent", "admin")
+            .unwrap()
+            .token;
+        let service = router(Arc::new(Mutex::new(app)), None);
+
+        let authorized = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                &format!("/api/v1/tasks/{task_id}/flight-leases"),
+                &human_token,
+                json!({"agent": agent.id, "executor": "codex", "ttl_seconds": 3600}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+        let body = to_bytes(authorized.into_body(), usize::MAX).await.unwrap();
+        let lease: FlightLease = serde_json::from_slice(&body).unwrap();
+
+        let claimed = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                &format!("/api/v1/flight-leases/{}/claim", lease.id),
+                &agent_token,
+                json!({"run_id": "WRUN-http"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let now = Utc::now();
+        let finished = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                &format!("/api/v1/flight-leases/{}/finish", lease.id),
+                &agent_token,
+                json!({
+                    "landed": true,
+                    "report": {
+                        "run_id": "WRUN-http",
+                        "executor": "codex",
+                        "summary": "patch ready",
+                        "base_revision": "abc123",
+                        "changed_files": ["src/lib.rs"],
+                        "patch_sha256": "a".repeat(64),
+                        "log_sha256": "b".repeat(64),
+                        "started_at": now,
+                        "finished_at": now,
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(finished.status(), StatusCode::OK);
+
+        let visible_to_requester = service
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/flight-leases",
+                &human_token,
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(visible_to_requester.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let leases: Vec<FlightLease> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(leases.len(), 1);
+        assert!(leases[0].report.is_some());
     }
 
     #[tokio::test]
@@ -769,6 +987,21 @@ mod tests {
             .uri(uri)
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
+            .unwrap()
+    }
+
+    fn authenticated_json_request(
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     }
 

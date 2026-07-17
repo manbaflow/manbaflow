@@ -400,3 +400,56 @@ pub struct ExecutionRecord {
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FlightLeaseStatus {
+    Authorized,
+    Active,
+    Landed,
+    Crashed,
+    Revoked,
+}
+
+impl FlightLeaseStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Landed | Self::Crashed | Self::Revoked)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteFlightReport {
+    pub run_id: String,
+    pub executor: ExecutorKind,
+    pub summary: String,
+    pub base_revision: String,
+    pub changed_files: Vec<String>,
+    pub patch_sha256: Option<String>,
+    pub log_sha256: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FlightLease {
+    pub id: String,
+    pub flow_id: String,
+    pub task_id: String,
+    pub principal_id: String,
+    pub principal_name: String,
+    pub authorized_by: String,
+    pub executor: ExecutorKind,
+    pub status: FlightLeaseStatus,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub run_id: Option<String>,
+    pub report: Option<RemoteFlightReport>,
+}
+
+impl FlightLease {
+    pub fn is_claimable_at(&self, now: DateTime<Utc>) -> bool {
+        self.status == FlightLeaseStatus::Authorized && self.expires_at > now
+    }
+}

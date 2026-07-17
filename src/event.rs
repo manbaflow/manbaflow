@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     ApiCredential, AttentionKind, Demand, Estimate, Evidence, ExecutionRecord, ExternalArtifact,
-    Flow, Organization, Principal, Team, TrackingAttention, TrackingEscalation,
+    FlightLease, Flow, Organization, Principal, RemoteFlightReport, Team, TrackingAttention,
+    TrackingEscalation,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -157,6 +158,31 @@ pub enum DomainEvent {
         log_path: Option<String>,
         at: DateTime<Utc>,
     },
+    RemoteFlightAuthorized {
+        lease: FlightLease,
+    },
+    RemoteFlightClaimed {
+        flow_id: String,
+        task_id: String,
+        lease_id: String,
+        run_id: String,
+        claimed_at: DateTime<Utc>,
+    },
+    RemoteFlightRevoked {
+        flow_id: String,
+        task_id: String,
+        lease_id: String,
+        revoked_by: String,
+        revoked_at: DateTime<Utc>,
+    },
+    RemoteFlightFinished {
+        flow_id: String,
+        task_id: String,
+        lease_id: String,
+        landed: bool,
+        report: RemoteFlightReport,
+        finished_at: DateTime<Utc>,
+    },
     FlowCompleted {
         flow_id: String,
         completed_by: String,
@@ -195,6 +221,11 @@ impl DomainEvent {
             Self::ExecutorStarted { .. } => "executor.started",
             Self::ExecutorFinished { .. } => "executor.finished",
             Self::ExecutorFailed { .. } => "executor.failed",
+            Self::RemoteFlightAuthorized { .. } => "remote_flight.authorized",
+            Self::RemoteFlightClaimed { .. } => "remote_flight.claimed",
+            Self::RemoteFlightRevoked { .. } => "remote_flight.revoked",
+            Self::RemoteFlightFinished { landed: true, .. } => "remote_flight.landed",
+            Self::RemoteFlightFinished { landed: false, .. } => "remote_flight.crashed",
             Self::FlowCompleted { .. } => "flow.completed",
         }
     }
@@ -220,10 +251,14 @@ impl DomainEvent {
             | Self::TrackingEscalationResolved { flow_id, .. }
             | Self::ExecutorStarted { flow_id, .. }
             | Self::ExecutorFailed { flow_id, .. }
+            | Self::RemoteFlightClaimed { flow_id, .. }
+            | Self::RemoteFlightRevoked { flow_id, .. }
+            | Self::RemoteFlightFinished { flow_id, .. }
             | Self::FlowCompleted { flow_id, .. } => Some(flow_id),
             Self::TrackingAttentionRaised { attention } => Some(&attention.flow_id),
             Self::TrackingEscalationRaised { escalation } => Some(&escalation.flow_id),
             Self::ExecutorFinished { record } => Some(&record.flow_id),
+            Self::RemoteFlightAuthorized { lease } => Some(&lease.flow_id),
             Self::OrganizationInitialized { .. }
             | Self::TeamCreated { .. }
             | Self::PrincipalRegistered { .. }

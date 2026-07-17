@@ -8,9 +8,9 @@ use uuid::Uuid;
 
 use crate::domain::{
     ApiCredential, AttentionSeverity, Demand, Evidence, ExecutionRecord, ExecutorConfig,
-    ExecutorMode, ExternalArtifact, Flow, FlowStatus, IssuedCredential, Organization, Principal,
-    PrincipalKind, TargetKind, Task, TaskStatus, Team, TrackingAttention, TrackingEscalation,
-    TrackingScan,
+    ExecutorKind, ExecutorMode, ExternalArtifact, FlightLease, FlightLeaseStatus, Flow, FlowStatus,
+    IssuedCredential, Organization, Principal, PrincipalKind, RemoteFlightReport, TargetKind, Task,
+    TaskStatus, Team, TrackingAttention, TrackingEscalation, TrackingScan,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -1085,6 +1085,325 @@ impl MambaApp {
         self.ensure_task_actor(task, actor)
     }
 
+    pub fn authorize_remote_flight(
+        &mut self,
+        task_id: &str,
+        authorized_by: &str,
+        worker: &str,
+        executor: ExecutorKind,
+        ttl_seconds: u64,
+    ) -> Result<FlightLease> {
+        if !(60..=86_400).contains(&ttl_seconds) {
+            return Err(MambaError::Validation(
+                "flight lease TTL must be between 60 and 86400 seconds".into(),
+            ));
+        }
+        let (flow, task) = self.task_snapshot(task_id)?;
+        ensure_status(
+            &task,
+            &[
+                TaskStatus::Accepted,
+                TaskStatus::InProgress,
+                TaskStatus::Blocked,
+            ],
+        )?;
+        self.ensure_dependencies_complete(&flow, &task)?;
+        self.ensure_task_actor(&task, authorized_by)?;
+        let human = self.state.principal(authorized_by)?.clone();
+        if human.kind != PrincipalKind::Human {
+            return Err(MambaError::PermissionDenied(
+                "remote write authorization requires a human".into(),
+            ));
+        }
+        let worker = self.state.principal(worker)?.clone();
+        if worker.kind != PrincipalKind::Agent {
+            return Err(MambaError::Validation(
+                "a remote flight lease can only target an agent".into(),
+            ));
+        }
+        if worker.owner_id.as_deref() != Some(human.id.as_str()) {
+            return Err(MambaError::PermissionDenied(format!(
+                "{} can only authorize a personal agent they own",
+                human.name
+            )));
+        }
+        self.ensure_task_actor(&task, &worker.name)?;
+        let now = Utc::now();
+        if self.state.flight_leases.values().any(|lease| {
+            lease.task_id == task.id
+                && lease.principal_id == worker.id
+                && (lease.status == FlightLeaseStatus::Active || lease.is_claimable_at(now))
+        }) {
+            return Err(MambaError::InvalidTransition(format!(
+                "task {} already has an open flight lease for {}",
+                task.id, worker.name
+            )));
+        }
+        let lease = FlightLease {
+            id: new_id("LEASE"),
+            flow_id: flow.id,
+            task_id: task.id,
+            principal_id: worker.id,
+            principal_name: worker.name,
+            authorized_by: human.name.clone(),
+            executor,
+            status: FlightLeaseStatus::Authorized,
+            issued_at: now,
+            expires_at: now + Duration::seconds(ttl_seconds as i64),
+            claimed_at: None,
+            finished_at: None,
+            run_id: None,
+            report: None,
+        };
+        self.commit(
+            &human.name,
+            vec![DomainEvent::RemoteFlightAuthorized {
+                lease: lease.clone(),
+            }],
+        )?;
+        Ok(lease)
+    }
+
+    pub fn remote_flight_leases(
+        &self,
+        principal: &str,
+        include_terminal: bool,
+    ) -> Result<Vec<FlightLease>> {
+        let principal = self.state.principal(principal)?;
+        let now = Utc::now();
+        let mut leases = self
+            .state
+            .flight_leases
+            .values()
+            .filter(|lease| match principal.kind {
+                PrincipalKind::Agent => lease.principal_id == principal.id,
+                PrincipalKind::Human => {
+                    lease.authorized_by == principal.name
+                        || self
+                            .state
+                            .principals
+                            .get(&lease.principal_id)
+                            .and_then(|worker| worker.owner_id.as_deref())
+                            == Some(principal.id.as_str())
+                        || self.state.flows.get(&lease.flow_id).is_some_and(|flow| {
+                            flow.demand.requester == principal.name
+                                || flow.demand.requester == principal.id
+                        })
+                }
+            })
+            .filter(|lease| {
+                include_terminal
+                    || lease.status == FlightLeaseStatus::Active
+                    || lease.is_claimable_at(now)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        leases.sort_by_key(|lease| std::cmp::Reverse(lease.issued_at));
+        Ok(leases)
+    }
+
+    pub fn revoke_remote_flight(&mut self, lease_id: &str, actor: &str) -> Result<FlightLease> {
+        let principal = self.state.principal(actor)?.clone();
+        if principal.kind != PrincipalKind::Human {
+            return Err(MambaError::PermissionDenied(
+                "flight lease revocation requires a human".into(),
+            ));
+        }
+        let lease = self
+            .state
+            .flight_leases
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "flight lease",
+                id: lease_id.to_string(),
+            })?;
+        if lease.authorized_by != principal.name {
+            return Err(MambaError::PermissionDenied(format!(
+                "only {} can revoke flight lease {}",
+                lease.authorized_by, lease.id
+            )));
+        }
+        if lease.status != FlightLeaseStatus::Authorized {
+            return Err(MambaError::InvalidTransition(format!(
+                "flight lease {} is {:?}; only an unclaimed lease can be revoked",
+                lease.id, lease.status
+            )));
+        }
+        let revoked_at = Utc::now();
+        self.commit(
+            &principal.name,
+            vec![DomainEvent::RemoteFlightRevoked {
+                flow_id: lease.flow_id,
+                task_id: lease.task_id,
+                lease_id: lease.id.clone(),
+                revoked_by: principal.name.clone(),
+                revoked_at,
+            }],
+        )?;
+        Ok(self.state.flight_leases[lease_id].clone())
+    }
+
+    pub fn claim_remote_flight(
+        &mut self,
+        lease_id: &str,
+        actor: &str,
+        run_id: &str,
+    ) -> Result<FlightLease> {
+        validate_run_id(run_id)?;
+        let principal = self.state.principal(actor)?.clone();
+        if principal.kind != PrincipalKind::Agent {
+            return Err(MambaError::PermissionDenied(
+                "only the authorized remote agent can claim a flight lease".into(),
+            ));
+        }
+        let lease = self
+            .state
+            .flight_leases
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "flight lease",
+                id: lease_id.to_string(),
+            })?;
+        if lease.principal_id != principal.id {
+            return Err(MambaError::PermissionDenied(format!(
+                "flight lease {} belongs to another agent",
+                lease.id
+            )));
+        }
+        let now = Utc::now();
+        if !lease.is_claimable_at(now) {
+            return Err(MambaError::InvalidTransition(if lease.expires_at <= now {
+                format!("flight lease {} has expired", lease.id)
+            } else {
+                format!("flight lease {} is {:?}", lease.id, lease.status)
+            }));
+        }
+        let (flow, task) = self.task_snapshot(&lease.task_id)?;
+        ensure_status(
+            &task,
+            &[
+                TaskStatus::Accepted,
+                TaskStatus::InProgress,
+                TaskStatus::Blocked,
+            ],
+        )?;
+        self.ensure_dependencies_complete(&flow, &task)?;
+        self.ensure_task_actor(&task, &principal.name)?;
+        let mut events = Vec::new();
+        if task.status != TaskStatus::InProgress {
+            events.push(DomainEvent::TaskStarted {
+                flow_id: flow.id.clone(),
+                task_id: task.id.clone(),
+                started_by: principal.name.clone(),
+                started_at: now,
+            });
+        }
+        events.push(DomainEvent::RemoteFlightClaimed {
+            flow_id: lease.flow_id.clone(),
+            task_id: lease.task_id.clone(),
+            lease_id: lease.id.clone(),
+            run_id: run_id.to_string(),
+            claimed_at: now,
+        });
+        self.commit(&principal.name, events)?;
+        Ok(self.state.flight_leases[lease_id].clone())
+    }
+
+    pub fn finish_remote_flight(
+        &mut self,
+        lease_id: &str,
+        actor: &str,
+        landed: bool,
+        report: RemoteFlightReport,
+    ) -> Result<FlightLease> {
+        let principal = self.state.principal(actor)?.clone();
+        let lease = self
+            .state
+            .flight_leases
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "flight lease",
+                id: lease_id.to_string(),
+            })?;
+        if lease.principal_id != principal.id {
+            return Err(MambaError::PermissionDenied(format!(
+                "flight lease {} belongs to another agent",
+                lease.id
+            )));
+        }
+        if matches!(
+            lease.status,
+            FlightLeaseStatus::Landed | FlightLeaseStatus::Crashed
+        ) && lease.report.as_ref() == Some(&report)
+            && landed == (lease.status == FlightLeaseStatus::Landed)
+        {
+            return Ok(lease);
+        }
+        if lease.status != FlightLeaseStatus::Active {
+            return Err(MambaError::InvalidTransition(format!(
+                "flight lease {} is {:?}, expected active",
+                lease.id, lease.status
+            )));
+        }
+        validate_remote_flight_report(&lease, &report)?;
+        let finished_at = Utc::now();
+        let evidence = Evidence {
+            id: new_id("EVD"),
+            kind: if landed && report.patch_sha256.is_some() {
+                "remote_patch"
+            } else if landed {
+                "remote_flight"
+            } else {
+                "worker_blackbox"
+            }
+            .into(),
+            uri: format!("flight://{}", lease.id),
+            summary: report.summary.clone(),
+            created_by: principal.name.clone(),
+            created_at: finished_at,
+        };
+        let mut events = vec![
+            DomainEvent::RemoteFlightFinished {
+                flow_id: lease.flow_id.clone(),
+                task_id: lease.task_id.clone(),
+                lease_id: lease.id.clone(),
+                landed,
+                report: report.clone(),
+                finished_at,
+            },
+            DomainEvent::EvidenceAdded {
+                flow_id: lease.flow_id.clone(),
+                task_id: lease.task_id.clone(),
+                evidence,
+            },
+        ];
+        if landed {
+            events.push(DomainEvent::TaskHeartbeat {
+                flow_id: lease.flow_id,
+                task_id: lease.task_id,
+                actor: principal.name.clone(),
+                note: Some(format!(
+                    "remote flight {} landed for Human review",
+                    lease.id
+                )),
+                at: finished_at,
+            });
+        } else {
+            events.push(DomainEvent::TaskBlocked {
+                flow_id: lease.flow_id,
+                task_id: lease.task_id,
+                actor: principal.name.clone(),
+                reason: format!("remote execution flight crashed: {}", report.summary),
+                at: finished_at,
+            });
+        }
+        self.commit(&principal.name, events)?;
+        Ok(self.state.flight_leases[lease_id].clone())
+    }
+
     pub fn submit_task(&mut self, task_id: &str, actor: &str) -> Result<Task> {
         let (flow, task) = self.task_snapshot(task_id)?;
         ensure_status(&task, &[TaskStatus::InProgress])?;
@@ -1413,6 +1732,86 @@ fn ensure_status(task: &Task, expected: &[TaskStatus]) -> Result<()> {
     }
 }
 
+fn validate_run_id(run_id: &str) -> Result<()> {
+    if run_id.is_empty()
+        || run_id.len() > 100
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(MambaError::Validation(
+            "invalid remote flight run ID".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_flight_report(lease: &FlightLease, report: &RemoteFlightReport) -> Result<()> {
+    validate_run_id(&report.run_id)?;
+    if lease.run_id.as_deref() != Some(report.run_id.as_str()) {
+        return Err(MambaError::Validation(
+            "remote flight report run ID does not match its lease".into(),
+        ));
+    }
+    if lease.executor != report.executor {
+        return Err(MambaError::Validation(
+            "remote flight report executor does not match its lease".into(),
+        ));
+    }
+    if report.summary.trim().is_empty() || report.summary.chars().count() > 4_000 {
+        return Err(MambaError::Validation(
+            "remote flight report summary must contain 1 to 4000 characters".into(),
+        ));
+    }
+    if report.base_revision.trim().is_empty() || report.base_revision.len() > 128 {
+        return Err(MambaError::Validation(
+            "remote flight report has an invalid base revision".into(),
+        ));
+    }
+    if report.started_at > report.finished_at {
+        return Err(MambaError::Validation(
+            "remote flight report finishes before it starts".into(),
+        ));
+    }
+    if !is_sha256(&report.log_sha256)
+        || report
+            .patch_sha256
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+    {
+        return Err(MambaError::Validation(
+            "remote flight report contains an invalid SHA-256 digest".into(),
+        ));
+    }
+    if report.patch_sha256.is_some() == report.changed_files.is_empty() {
+        return Err(MambaError::Validation(
+            "remote flight patch digest and changed-file list do not agree".into(),
+        ));
+    }
+    if report.changed_files.len() > 1_000
+        || report.changed_files.iter().any(|path| {
+            path.is_empty()
+                || path.len() > 1_024
+                || Path::new(path).is_absolute()
+                || Path::new(path)
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+        })
+    {
+        return Err(MambaError::Validation(
+            "remote flight report contains an unsafe changed-file path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn validate_external_artifact(artifact: &ExternalArtifact) -> Result<()> {
     if artifact.id.trim().is_empty()
         || artifact.provider.trim().is_empty()
@@ -1511,6 +1910,158 @@ mod tests {
             .unwrap();
         assert!(agent.executor.is_none());
         assert_eq!(agent.owner_id.as_deref(), Some(human.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn human_authorized_remote_flight_is_single_use_and_replays() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Delivery", "product,delivery", "admin")
+            .unwrap();
+        let human = app
+            .register_principal(
+                "Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let agent = app
+            .register_principal(
+                "Engineer Personal Agent",
+                PrincipalKind::Agent,
+                Some(&team.id),
+                Some(&human.id),
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare a launch brief",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let task_id = flow.tasks[0].id.clone();
+        app.approve_flow(&flow.id, &human.name).unwrap();
+        app.accept_task(&task_id, &human.name).unwrap();
+
+        let agent_authorization = app.authorize_remote_flight(
+            &task_id,
+            &agent.name,
+            &agent.name,
+            ExecutorKind::Codex,
+            3_600,
+        );
+        assert!(matches!(
+            agent_authorization,
+            Err(MambaError::PermissionDenied(_))
+        ));
+        let lease = app
+            .authorize_remote_flight(
+                &task_id,
+                &human.name,
+                &agent.name,
+                ExecutorKind::Codex,
+                3_600,
+            )
+            .unwrap();
+        assert_eq!(lease.status, FlightLeaseStatus::Authorized);
+        assert!(
+            app.authorize_remote_flight(
+                &task_id,
+                &human.name,
+                &agent.name,
+                ExecutorKind::Codex,
+                3_600,
+            )
+            .is_err()
+        );
+
+        let active = app
+            .claim_remote_flight(&lease.id, &agent.name, "WRUN-test")
+            .unwrap();
+        assert_eq!(active.status, FlightLeaseStatus::Active);
+        assert!(
+            app.claim_remote_flight(&lease.id, &agent.name, "WRUN-second")
+                .is_err()
+        );
+        let now = Utc::now();
+        let report = RemoteFlightReport {
+            run_id: "WRUN-test".into(),
+            executor: ExecutorKind::Codex,
+            summary: "implementation patch is ready for Human review".into(),
+            base_revision: "abc123".into(),
+            changed_files: vec!["src/gateway.rs".into()],
+            patch_sha256: Some("a".repeat(64)),
+            log_sha256: "b".repeat(64),
+            started_at: now,
+            finished_at: now,
+        };
+        let landed = app
+            .finish_remote_flight(&lease.id, &agent.name, true, report.clone())
+            .unwrap();
+        assert_eq!(landed.status, FlightLeaseStatus::Landed);
+        assert_eq!(landed.report, Some(report));
+        assert!(
+            app.state()
+                .find_task(&task_id)
+                .unwrap()
+                .1
+                .evidence
+                .iter()
+                .any(|evidence| evidence.kind == "remote_patch")
+        );
+        assert_eq!(
+            app.finish_remote_flight(&lease.id, &agent.name, true, landed.report.clone().unwrap(),)
+                .unwrap(),
+            landed
+        );
+        let revoked = app
+            .authorize_remote_flight(
+                &task_id,
+                &human.name,
+                &agent.name,
+                ExecutorKind::ClaudeCode,
+                3_600,
+            )
+            .and_then(|lease| app.revoke_remote_flight(&lease.id, &human.name))
+            .unwrap();
+        assert_eq!(revoked.status, FlightLeaseStatus::Revoked);
+        assert!(
+            app.claim_remote_flight(&revoked.id, &agent.name, "WRUN-revoked")
+                .is_err()
+        );
+        drop(app);
+
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed_lease = &replayed.state().flight_leases[&lease.id];
+        assert_eq!(replayed_lease.status, FlightLeaseStatus::Landed);
+        assert_eq!(replayed_lease.run_id.as_deref(), Some("WRUN-test"));
+        assert_eq!(
+            replayed.state().flight_leases[&revoked.id].status,
+            FlightLeaseStatus::Revoked
+        );
+        assert!(
+            replayed
+                .timeline(&flow.id)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "remote_flight.landed")
+        );
     }
 
     #[test]

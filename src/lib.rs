@@ -14,6 +14,7 @@ pub mod store;
 mod tracker;
 pub mod tui;
 pub mod worker;
+pub mod worktree;
 
 pub use app::MambaApp;
 pub use error::{MambaError, Result};

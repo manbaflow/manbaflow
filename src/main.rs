@@ -95,7 +95,7 @@ enum Command {
         #[command(subcommand)]
         command: GitLabCommand,
     },
-    /// 在同事工作站运行只读 Personal Agent 航班
+    /// 在同事工作站运行 Personal Agent 航班
     Worker {
         #[command(subcommand)]
         command: WorkerCommand,
@@ -209,9 +209,9 @@ enum GitLabCommand {
 
 #[derive(Subcommand)]
 enum WorkerCommand {
-    /// 领取并规划一个远程任务后退出
+    /// 领取并执行一个远程规划或写入航班后退出
     Once(WorkerArgs),
-    /// 持续轮询远程 Inbox，串行执行只读规划航班
+    /// 持续轮询远程 Inbox 或 Flight Lease，串行执行航班
     Run {
         #[command(flatten)]
         worker: WorkerArgs,
@@ -227,13 +227,16 @@ struct WorkerArgs {
     server: Option<String>,
     #[arg(long, value_enum)]
     executor: ExecutorKindArg,
+    /// 只读规划或消费 Human 授权的写入租约
+    #[arg(long, value_enum, default_value = "plan")]
+    mode: ExecutorModeArg,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     #[arg(long)]
     model: Option<String>,
     #[arg(long)]
     executable: Option<PathBuf>,
-    /// 只处理指定 Task；默认选择第一个尚未规划的任务
+    /// 只处理指定 Task；默认选择第一个可执行任务
     #[arg(long)]
     task: Option<String>,
     #[arg(long, default_value_t = 900)]
@@ -367,6 +370,24 @@ enum TaskCommand {
         mode: ExecutorModeArg,
         #[arg(long, default_value_t = 900)]
         timeout: u64,
+    },
+    /// Human 为自己的远程 Agent 签发一次性写入 Flight Lease
+    Authorize {
+        task: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long, value_enum)]
+        executor: ExecutorKindArg,
+        #[arg(long, default_value_t = 3_600)]
+        ttl_seconds: u64,
+    },
+    /// Human 在远程 Agent 起飞前撤销写入租约
+    RevokeLease {
+        lease: String,
+        #[arg(long)]
+        by: String,
     },
     /// 带 Evidence 提交人工验收
     Submit {
@@ -756,6 +777,31 @@ async fn run(cli: Cli) -> Result<()> {
                         record.summary
                     ),
                 );
+            }
+            TaskCommand::Authorize {
+                task,
+                by,
+                agent,
+                executor,
+                ttl_seconds,
+            } => {
+                let lease =
+                    app.authorize_remote_flight(&task, &by, &agent, executor.into(), ttl_seconds)?;
+                output(
+                    &lease,
+                    cli.json,
+                    format!(
+                        "{} 已放行 {}，租约 {}，{} 前必须起飞",
+                        lease.authorized_by,
+                        lease.principal_name,
+                        lease.id,
+                        lease.expires_at.format("%Y-%m-%d %H:%M:%S UTC")
+                    ),
+                );
+            }
+            TaskCommand::RevokeLease { lease, by } => {
+                let lease = app.revoke_remote_flight(&lease, &by)?;
+                output(&lease, cli.json, format!("{} 已撤销租约 {}", by, lease.id));
             }
             TaskCommand::Submit { task, by } => {
                 let task = app.submit_task(&task, &by)?;
@@ -1160,6 +1206,7 @@ fn remote_worker(args: WorkerArgs, data_dir: &Path) -> Result<RemoteWorker> {
         server_url,
         token,
         executor: args.executor.into(),
+        mode: args.mode.into(),
         workspace: absolute_path(args.workspace)?,
         model: args.model,
         command: args.executable,
@@ -1184,8 +1231,19 @@ fn worker_outcome_text(outcome: &WorkerOutcome) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "-".into())
         ),
+        WorkerOutcomeStatus::Executed => format!(
+            "{} 写入航班安全落地 · {}\n{}\n隔离黑匣子：{}",
+            outcome.principal,
+            task,
+            outcome.summary,
+            outcome
+                .log_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".into())
+        ),
         WorkerOutcomeStatus::Crashed => format!(
-            "{} 规划航班坠机 · {}\n{}\n黑匣子：{}",
+            "{} 航班坠机 · {}\n{}\n黑匣子：{}",
             outcome.principal,
             task,
             outcome.summary,

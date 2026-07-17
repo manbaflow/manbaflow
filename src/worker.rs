@@ -2,20 +2,26 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chrono::Utc;
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::domain::{Evidence, ExecutorKind, ExecutorMode, Principal, Task, TaskStatus};
+use crate::domain::{
+    Evidence, ExecutorKind, ExecutorMode, FlightLease, FlightLeaseStatus, Principal,
+    RemoteFlightReport, Task, TaskStatus,
+};
 use crate::error::{MambaError, Result};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
+use crate::worktree::{IsolatedWorktree, WorktreeArtifact, sha256_file};
 
 #[derive(Clone)]
 pub struct WorkerOptions {
     pub server_url: String,
     pub token: String,
     pub executor: ExecutorKind,
+    pub mode: ExecutorMode,
     pub workspace: PathBuf,
     pub model: Option<String>,
     pub command: Option<PathBuf>,
@@ -29,6 +35,7 @@ pub struct WorkerOptions {
 pub enum WorkerOutcomeStatus {
     Idle,
     Planned,
+    Executed,
     Crashed,
 }
 
@@ -40,6 +47,12 @@ pub struct WorkerOutcome {
     pub run_id: Option<String>,
     pub summary: String,
     pub log_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingFlightResult {
+    landed: bool,
+    report: RemoteFlightReport,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -80,6 +93,13 @@ impl RemoteWorker {
     }
 
     pub async fn run_once(&self) -> Result<WorkerOutcome> {
+        match self.options.mode {
+            ExecutorMode::Plan => self.run_plan_once().await,
+            ExecutorMode::Execute => self.run_execute_once().await,
+        }
+    }
+
+    async fn run_plan_once(&self) -> Result<WorkerOutcome> {
         let principal = self.control_plane.me().await?;
         let inbox = self.control_plane.inbox().await?;
         let Some(item) = select_task(&inbox, &principal, self.options.task_id.as_deref()) else {
@@ -181,6 +201,197 @@ impl RemoteWorker {
             }
         }
     }
+
+    async fn run_execute_once(&self) -> Result<WorkerOutcome> {
+        let principal = self.control_plane.me().await?;
+        let leases = self.control_plane.flight_leases().await?;
+        let Some(selected_lease) = select_lease(
+            &leases,
+            &self.options.executor,
+            self.options.task_id.as_deref(),
+        ) else {
+            return Ok(WorkerOutcome {
+                status: WorkerOutcomeStatus::Idle,
+                principal: principal.name,
+                task_id: self.options.task_id.clone(),
+                run_id: None,
+                summary: "no authorized write flight lease for this worker and executor".into(),
+                log_path: None,
+            });
+        };
+        let inbox = self.control_plane.inbox().await?;
+        let mut lease = selected_lease.clone();
+        let item = inbox
+            .iter()
+            .find(|item| item.task.id == lease.task_id)
+            .ok_or_else(|| {
+                MambaError::InvalidTransition(format!(
+                    "leased task {} is not in the worker inbox",
+                    lease.task_id
+                ))
+            })?;
+        if !item.blocked_by.is_empty() {
+            return Err(MambaError::InvalidTransition(format!(
+                "leased task {} still has incomplete dependencies",
+                lease.task_id
+            )));
+        }
+
+        let run_id = match lease.status {
+            FlightLeaseStatus::Authorized => {
+                let run_id = format!("WRUN-{}", Uuid::new_v4().simple());
+                lease = self.control_plane.claim_flight(&lease.id, &run_id).await?;
+                run_id
+            }
+            FlightLeaseStatus::Active => lease.run_id.clone().ok_or_else(|| {
+                MambaError::InvalidTransition(format!(
+                    "active flight lease {} has no run ID",
+                    lease.id
+                ))
+            })?,
+            _ => unreachable!("select_lease only returns open leases"),
+        };
+        let run_dir = self
+            .options
+            .data_dir
+            .join("worker-runs")
+            .join(&lease.task_id)
+            .join(&run_id);
+        fs::create_dir_all(&run_dir)?;
+        let log_path = run_dir.join("blackbox.json");
+        let patch_path = run_dir.join("changes.patch");
+        let pending_path = run_dir.join("flight-report.json");
+        if pending_path.is_file() {
+            let pending: PendingFlightResult = serde_json::from_slice(&fs::read(&pending_path)?)?;
+            self.control_plane
+                .finish_flight(&lease.id, pending.landed, &pending.report)
+                .await?;
+            return Ok(WorkerOutcome {
+                status: if pending.landed {
+                    WorkerOutcomeStatus::Executed
+                } else {
+                    WorkerOutcomeStatus::Crashed
+                },
+                principal: principal.name,
+                task_id: Some(lease.task_id),
+                run_id: Some(run_id),
+                summary: pending.report.summary,
+                log_path: log_path.is_file().then_some(log_path),
+            });
+        }
+        let worktree_root = self
+            .options
+            .data_dir
+            .join("worker-worktrees")
+            .join(format!("{}-{run_id}", lease.id));
+        let started_at = Utc::now();
+
+        let (result, artifact) = {
+            let worktree = if worktree_root.exists() {
+                IsolatedWorktree::resume(&self.options.workspace, worktree_root)
+            } else {
+                IsolatedWorktree::create(&self.options.workspace, worktree_root)
+            };
+            match worktree {
+                Ok(mut worktree) => {
+                    let prompt = execute_prompt(&principal, item, &lease);
+                    let execution = TerminalExecutor::run(ExecutionRequest {
+                        kind: self.options.executor.clone(),
+                        command: self.options.command.clone(),
+                        workspace: worktree.workspace().to_path_buf(),
+                        model: self.options.model.clone(),
+                        mode: ExecutorMode::Execute,
+                        prompt,
+                        output_schema: None,
+                        timeout_seconds: self.options.timeout_seconds,
+                        log_path: log_path.clone(),
+                    })
+                    .await;
+                    let collected = worktree.collect(&patch_path);
+                    let cleanup = worktree.cleanup();
+                    let artifact = collected.and_then(|artifact| cleanup.map(|_| artifact));
+                    (execution, artifact)
+                }
+                Err(error) => {
+                    write_setup_blackbox(&log_path, &run_id, &error)?;
+                    (
+                        Err(error),
+                        Ok(WorktreeArtifact {
+                            base_revision: "unavailable".into(),
+                            changed_files: vec![],
+                            patch_path: None,
+                            patch_sha256: None,
+                        }),
+                    )
+                }
+            }
+        };
+
+        let (landed, summary, artifact) = match (result, artifact) {
+            (Ok(output), Ok(artifact)) => {
+                let suffix = match artifact.changed_files.len() {
+                    0 => "no file changes".to_string(),
+                    1 => "1 changed file captured in the isolated patch".to_string(),
+                    count => format!("{count} changed files captured in the isolated patch"),
+                };
+                (
+                    true,
+                    truncate(&format!("{}; {suffix}", output.summary), 4_000),
+                    artifact,
+                )
+            }
+            (Err(error), Ok(artifact)) => (false, truncate(&error.to_string(), 4_000), artifact),
+            (Ok(_), Err(error)) => (
+                false,
+                truncate(&format!("artifact collection failed: {error}"), 4_000),
+                empty_artifact(),
+            ),
+            (Err(execution), Err(collection)) => (
+                false,
+                truncate(
+                    &format!("{execution}; artifact collection failed: {collection}"),
+                    4_000,
+                ),
+                empty_artifact(),
+            ),
+        };
+        if !log_path.is_file() {
+            write_setup_blackbox(&log_path, &run_id, &MambaError::Validation(summary.clone()))?;
+        }
+        let report = RemoteFlightReport {
+            run_id: run_id.clone(),
+            executor: self.options.executor.clone(),
+            summary: summary.clone(),
+            base_revision: artifact.base_revision,
+            changed_files: artifact.changed_files,
+            patch_sha256: artifact.patch_sha256,
+            log_sha256: sha256_file(&log_path)?,
+            started_at,
+            finished_at: Utc::now(),
+        };
+        fs::write(
+            &pending_path,
+            serde_json::to_vec_pretty(&PendingFlightResult {
+                landed,
+                report: report.clone(),
+            })?,
+        )?;
+        self.control_plane
+            .finish_flight(&lease.id, landed, &report)
+            .await?;
+        Ok(WorkerOutcome {
+            status: if landed {
+                WorkerOutcomeStatus::Executed
+            } else {
+                WorkerOutcomeStatus::Crashed
+            },
+            principal: principal.name,
+            task_id: Some(lease.task_id),
+            run_id: Some(run_id),
+            summary,
+            log_path: Some(log_path),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -277,6 +488,33 @@ impl ControlPlaneClient {
         .await
     }
 
+    async fn flight_leases(&self) -> Result<Vec<FlightLease>> {
+        self.request(Method::GET, &["flight-leases"], None).await
+    }
+
+    async fn claim_flight(&self, lease_id: &str, run_id: &str) -> Result<FlightLease> {
+        self.request(
+            Method::POST,
+            &["flight-leases", lease_id, "claim"],
+            Some(json!({ "run_id": run_id })),
+        )
+        .await
+    }
+
+    async fn finish_flight(
+        &self,
+        lease_id: &str,
+        landed: bool,
+        report: &RemoteFlightReport,
+    ) -> Result<FlightLease> {
+        self.request(
+            Method::POST,
+            &["flight-leases", lease_id, "finish"],
+            Some(json!({ "landed": landed, "report": report })),
+        )
+        .await
+    }
+
     async fn request<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -344,6 +582,33 @@ fn select_task<'a>(
         })
 }
 
+fn select_lease<'a>(
+    leases: &'a [FlightLease],
+    executor: &ExecutorKind,
+    requested_task: Option<&str>,
+) -> Option<&'a FlightLease> {
+    leases
+        .iter()
+        .filter(|lease| {
+            matches!(
+                lease.status,
+                FlightLeaseStatus::Authorized | FlightLeaseStatus::Active
+            )
+        })
+        .filter(|lease| &lease.executor == executor)
+        .filter(|lease| requested_task.is_none_or(|task| lease.task_id == task))
+        .min_by_key(|lease| {
+            (
+                if lease.status == FlightLeaseStatus::Active {
+                    0
+                } else {
+                    1
+                },
+                lease.issued_at,
+            )
+        })
+}
+
 fn worker_prompt(principal: &Principal, item: &InboxItem, task: &Task) -> String {
     format!(
         "MambaFlow remote PASS for a read-only planning flight.\n\
@@ -362,6 +627,32 @@ fn worker_prompt(principal: &Principal, item: &InboxItem, task: &Task) -> String
         task.title,
         task.description,
         task.acceptance_criteria.join("\n- ")
+    )
+}
+
+fn execute_prompt(principal: &Principal, item: &InboxItem, lease: &FlightLease) -> String {
+    format!(
+        "MambaFlow remote PASS for a Human-authorized coding flight.\n\
+         Flight lease: {}\n\
+         Authorized by: {}\n\
+         Worker principal: {} ({})\n\
+         Flow: {} - {}\n\
+         Task: {} - {}\n\
+         Description: {}\n\
+         Acceptance criteria:\n- {}\n\n\
+         Implement only this task inside the isolated Git worktree. Run relevant checks. Do not \
+         push, merge, change remotes, or access credentials. Report the changes, verification, and \
+         remaining risks for Human review.",
+        lease.id,
+        lease.authorized_by,
+        principal.name,
+        principal.id,
+        item.flow_id,
+        item.flow_title,
+        item.task.id,
+        item.task.title,
+        item.task.description,
+        item.task.acceptance_criteria.join("\n- ")
     )
 }
 
@@ -392,6 +683,31 @@ fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn write_setup_blackbox(path: &std::path::Path, run_id: &str, error: &MambaError) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "run_id": run_id,
+            "phase": "isolated_worktree_setup",
+            "error": error.to_string(),
+            "at": Utc::now(),
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn empty_artifact() -> WorktreeArtifact {
+    WorktreeArtifact {
+        base_revision: "unavailable".into(),
+        changed_files: vec![],
+        patch_path: None,
+        patch_sha256: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -411,6 +727,7 @@ mod tests {
         principal: Principal,
         task: Arc<Mutex<Task>>,
         actions: Arc<Mutex<Vec<String>>>,
+        lease: Arc<Mutex<Option<FlightLease>>>,
     }
 
     #[cfg(unix)]
@@ -425,6 +742,7 @@ mod tests {
             principal: principal.clone(),
             task: Arc::new(Mutex::new(task)),
             actions: Arc::new(Mutex::new(Vec::new())),
+            lease: Arc::new(Mutex::new(None)),
         };
         let router = Router::new()
             .route("/api/v1/me", get(mock_me))
@@ -458,6 +776,7 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
             server_url: format!("http://{address}"),
             token: "worker-token".into(),
             executor: ExecutorKind::Codex,
+            mode: ExecutorMode::Plan,
             workspace: directory.path().to_path_buf(),
             model: None,
             command: Some(executable),
@@ -481,6 +800,172 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
         server.abort();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_executes_in_isolated_worktree_and_finishes_lease() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["config", "user.name", "Test"])
+            .status()
+            .unwrap();
+        fs::write(repository.join("README.md"), "base\n").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["commit", "-qm", "base"])
+            .status()
+            .unwrap();
+
+        let principal = test_principal();
+        let mut task = test_task(&principal);
+        task.status = TaskStatus::Accepted;
+        let now = Utc::now();
+        let lease = FlightLease {
+            id: "LEASE-1".into(),
+            flow_id: "FLOW-1".into(),
+            task_id: task.id.clone(),
+            principal_id: principal.id.clone(),
+            principal_name: principal.name.clone(),
+            authorized_by: "Engineer".into(),
+            executor: ExecutorKind::Codex,
+            status: FlightLeaseStatus::Authorized,
+            issued_at: now,
+            expires_at: now + ChronoDuration::hours(1),
+            claimed_at: None,
+            finished_at: None,
+            run_id: None,
+            report: None,
+        };
+        let state = MockState {
+            principal: principal.clone(),
+            task: Arc::new(Mutex::new(task)),
+            actions: Arc::new(Mutex::new(Vec::new())),
+            lease: Arc::new(Mutex::new(Some(lease))),
+        };
+        let router = Router::new()
+            .route("/api/v1/me", get(mock_me))
+            .route("/api/v1/inbox", get(mock_inbox))
+            .route("/api/v1/flight-leases", get(mock_flight_leases))
+            .route(
+                "/api/v1/flight-leases/{lease}/claim",
+                post(mock_claim_flight),
+            )
+            .route(
+                "/api/v1/flight-leases/{lease}/finish",
+                post(mock_finish_flight),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let executable = directory.path().join("fake-codex");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+result=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    result="$1"
+  fi
+  shift
+done
+printf '%s\n' 'isolated change' > generated.txt
+printf '%s' 'Implemented the authorized task and ran checks.' > "$result"
+printf '%s\n' '{"thread_id":"execute-thread"}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let data_dir = directory.path().join("worker-data");
+        let worker = RemoteWorker::new(WorkerOptions {
+            server_url: format!("http://{address}"),
+            token: "worker-token".into(),
+            executor: ExecutorKind::Codex,
+            mode: ExecutorMode::Execute,
+            workspace: repository.clone(),
+            model: None,
+            command: Some(executable),
+            task_id: None,
+            timeout_seconds: 10,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let outcome = worker.run_once().await.unwrap();
+
+        assert_eq!(outcome.status, WorkerOutcomeStatus::Executed);
+        assert!(!repository.join("generated.txt").exists());
+        assert!(
+            outcome
+                .log_path
+                .as_ref()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("changes.patch")
+                .is_file()
+        );
+        assert_eq!(
+            state.actions.lock().unwrap().as_slice(),
+            ["claim", "finish"]
+        );
+        let lease = state.lease.lock().unwrap().clone().unwrap();
+        assert_eq!(lease.status, FlightLeaseStatus::Landed);
+        let report = lease.report.unwrap();
+        assert_eq!(report.changed_files, ["generated.txt"]);
+        assert!(report.patch_sha256.is_some());
+        assert_eq!(report.log_sha256.len(), 64);
+        assert_eq!(
+            fs::read_dir(data_dir.join("worker-worktrees"))
+                .unwrap()
+                .count(),
+            0
+        );
+
+        {
+            let mut lease = state.lease.lock().unwrap();
+            let lease = lease.as_mut().unwrap();
+            lease.status = FlightLeaseStatus::Active;
+            lease.finished_at = None;
+            lease.report = None;
+        }
+        state.actions.lock().unwrap().clear();
+        let resumed = worker.run_once().await.unwrap();
+        assert_eq!(resumed.status, WorkerOutcomeStatus::Executed);
+        assert_eq!(state.actions.lock().unwrap().as_slice(), ["finish"]);
+        assert_eq!(
+            state.lease.lock().unwrap().as_ref().unwrap().status,
+            FlightLeaseStatus::Landed
+        );
+        server.abort();
+    }
+
     async fn mock_me(State(state): State<MockState>, headers: HeaderMap) -> Json<Principal> {
         assert_eq!(
             headers
@@ -497,6 +982,50 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
             "flow_title": "Ship gateway",
             "task": state.task.lock().unwrap().clone()
         }]))
+    }
+
+    async fn mock_flight_leases(State(state): State<MockState>) -> Json<Vec<FlightLease>> {
+        Json(state.lease.lock().unwrap().clone().into_iter().collect())
+    }
+
+    async fn mock_claim_flight(
+        State(state): State<MockState>,
+        Path(lease_id): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<FlightLease> {
+        state.actions.lock().unwrap().push("claim".into());
+        let mut guard = state.lease.lock().unwrap();
+        let lease = guard.as_mut().unwrap();
+        assert_eq!(lease.id, lease_id);
+        lease.status = FlightLeaseStatus::Active;
+        lease.run_id = body["run_id"].as_str().map(str::to_string);
+        lease.claimed_at = Some(Utc::now());
+        Json(lease.clone())
+    }
+
+    #[derive(Deserialize)]
+    struct MockFinishInput {
+        landed: bool,
+        report: RemoteFlightReport,
+    }
+
+    async fn mock_finish_flight(
+        State(state): State<MockState>,
+        Path(lease_id): Path<String>,
+        Json(body): Json<MockFinishInput>,
+    ) -> Json<FlightLease> {
+        state.actions.lock().unwrap().push("finish".into());
+        let mut guard = state.lease.lock().unwrap();
+        let lease = guard.as_mut().unwrap();
+        assert_eq!(lease.id, lease_id);
+        lease.status = if body.landed {
+            FlightLeaseStatus::Landed
+        } else {
+            FlightLeaseStatus::Crashed
+        };
+        lease.finished_at = Some(Utc::now());
+        lease.report = Some(body.report);
+        Json(lease.clone())
     }
 
     async fn mock_task_action(

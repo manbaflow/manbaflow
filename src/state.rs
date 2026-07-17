@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    ApiCredential, ExecutionRecord, Flow, FlowStatus, Organization, Principal, TaskStatus, Team,
-    TrackingAttention, TrackingEscalation,
+    ApiCredential, ExecutionRecord, FlightLease, FlightLeaseStatus, Flow, FlowStatus, Organization,
+    Principal, TaskStatus, Team, TrackingAttention, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -19,6 +19,7 @@ pub struct OrganizationState {
     pub external_binding_clocks: BTreeMap<String, DateTime<Utc>>,
     pub flows: BTreeMap<String, Flow>,
     pub executions: BTreeMap<String, ExecutionRecord>,
+    pub flight_leases: BTreeMap<String, FlightLease>,
     pub attentions: BTreeMap<String, TrackingAttention>,
     pub escalations: BTreeMap<String, TrackingEscalation>,
     pub last_sequence: i64,
@@ -308,6 +309,56 @@ impl OrganizationState {
             DomainEvent::ExecutorFinished { record } => {
                 self.executions.insert(record.id.clone(), record.clone());
             }
+            DomainEvent::RemoteFlightAuthorized { lease } => {
+                self.flow(&lease.flow_id)?
+                    .task(&lease.task_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "task",
+                        id: lease.task_id.clone(),
+                    })?;
+                self.principal(&lease.principal_id)?;
+                self.flight_leases.insert(lease.id.clone(), lease.clone());
+            }
+            DomainEvent::RemoteFlightClaimed {
+                flow_id,
+                task_id,
+                lease_id,
+                run_id,
+                claimed_at,
+            } => {
+                let lease = self.flight_lease_mut(lease_id, flow_id, task_id)?;
+                lease.status = FlightLeaseStatus::Active;
+                lease.run_id = Some(run_id.clone());
+                lease.claimed_at = Some(*claimed_at);
+            }
+            DomainEvent::RemoteFlightRevoked {
+                flow_id,
+                task_id,
+                lease_id,
+                revoked_at,
+                ..
+            } => {
+                let lease = self.flight_lease_mut(lease_id, flow_id, task_id)?;
+                lease.status = FlightLeaseStatus::Revoked;
+                lease.finished_at = Some(*revoked_at);
+            }
+            DomainEvent::RemoteFlightFinished {
+                flow_id,
+                task_id,
+                lease_id,
+                landed,
+                report,
+                finished_at,
+            } => {
+                let lease = self.flight_lease_mut(lease_id, flow_id, task_id)?;
+                lease.status = if *landed {
+                    FlightLeaseStatus::Landed
+                } else {
+                    FlightLeaseStatus::Crashed
+                };
+                lease.finished_at = Some(*finished_at);
+                lease.report = Some(report.clone());
+            }
             DomainEvent::FlowCompleted { flow_id, at, .. } => {
                 let flow = self.flow_mut(flow_id)?;
                 flow.status = FlowStatus::Completed;
@@ -387,6 +438,27 @@ impl OrganizationState {
         self.escalations
             .values()
             .filter(|escalation| escalation.is_active())
+    }
+
+    fn flight_lease_mut(
+        &mut self,
+        lease_id: &str,
+        flow_id: &str,
+        task_id: &str,
+    ) -> Result<&mut FlightLease> {
+        let lease = self
+            .flight_leases
+            .get_mut(lease_id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "flight lease",
+                id: lease_id.to_string(),
+            })?;
+        if lease.flow_id != flow_id || lease.task_id != task_id {
+            return Err(MambaError::Validation(format!(
+                "flight lease {lease_id} does not match its task"
+            )));
+        }
+        Ok(lease)
     }
 
     fn escalation_mut(
