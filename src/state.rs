@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    ApiCredential, ExecutionRecord, FlightLease, FlightLeaseStatus, Flow, FlowStatus, Organization,
-    Principal, TaskStatus, Team, TrackingAttention, TrackingEscalation,
+    ApiCredential, ExecutionRecord, FlightLease, FlightLeaseStatus, Flow, FlowMessage, FlowStatus,
+    Organization, Principal, TargetKind, TaskStatus, Team, TrackingAttention, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -18,6 +18,7 @@ pub struct OrganizationState {
     pub external_deliveries: BTreeMap<String, DateTime<Utc>>,
     pub external_binding_clocks: BTreeMap<String, DateTime<Utc>>,
     pub flows: BTreeMap<String, Flow>,
+    pub messages: BTreeMap<String, FlowMessage>,
     pub executions: BTreeMap<String, ExecutionRecord>,
     pub flight_leases: BTreeMap<String, FlightLease>,
     pub attentions: BTreeMap<String, TrackingAttention>,
@@ -97,6 +98,71 @@ impl OrganizationState {
                 flow_id, task_id, ..
             } => {
                 self.task_mut(flow_id, task_id)?.status = TaskStatus::Assigned;
+            }
+            DomainEvent::FlowMessagePosted { message } => {
+                self.flow(&message.flow_id)?;
+                if let Some(task_id) = &message.task_id {
+                    self.flow(&message.flow_id)?.task(task_id).ok_or_else(|| {
+                        MambaError::NotFound {
+                            entity: "task",
+                            id: task_id.clone(),
+                        }
+                    })?;
+                }
+                self.principal(&message.sender_id)?;
+                for recipient in &message.recipients {
+                    match recipient.kind {
+                        TargetKind::Human | TargetKind::Agent => {
+                            self.principal(&recipient.id)?;
+                        }
+                        TargetKind::Team => {
+                            self.team(&recipient.id)?;
+                        }
+                    }
+                }
+                self.messages.insert(message.id.clone(), message.clone());
+            }
+            DomainEvent::FlowMessageAcknowledged {
+                flow_id,
+                message_id,
+                acknowledgements,
+            } => {
+                for acknowledgement in acknowledgements {
+                    self.principal(&acknowledgement.acknowledged_by_id)?;
+                }
+                let message =
+                    self.messages
+                        .get_mut(message_id)
+                        .ok_or_else(|| MambaError::NotFound {
+                            entity: "flow message",
+                            id: message_id.clone(),
+                        })?;
+                if message.flow_id != *flow_id {
+                    return Err(MambaError::Validation(format!(
+                        "flow message {message_id} does not belong to flow {flow_id}"
+                    )));
+                }
+                for acknowledgement in acknowledgements {
+                    if !message
+                        .recipients
+                        .iter()
+                        .any(|recipient| recipient.id == acknowledgement.recipient_id)
+                    {
+                        return Err(MambaError::Validation(format!(
+                            "flow message {message_id} has no recipient {}",
+                            acknowledgement.recipient_id
+                        )));
+                    }
+                    if let Some(existing) = message
+                        .acknowledgements
+                        .iter_mut()
+                        .find(|existing| existing.recipient_id == acknowledgement.recipient_id)
+                    {
+                        *existing = acknowledgement.clone();
+                    } else {
+                        message.acknowledgements.push(acknowledgement.clone());
+                    }
+                }
             }
             DomainEvent::TaskAccepted {
                 flow_id,

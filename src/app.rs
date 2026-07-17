@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,8 +9,9 @@ use uuid::Uuid;
 use crate::dashboard::{DashboardSnapshot, build_dashboard};
 use crate::domain::{
     ApiCredential, AttentionSeverity, Demand, Evidence, ExecutionRecord, ExecutorConfig,
-    ExecutorKind, ExecutorMode, ExternalArtifact, FlightLease, FlightLeaseStatus, Flow, FlowStatus,
-    IssuedCredential, Organization, Principal, PrincipalKind, RemoteFlightReport, TargetKind, Task,
+    ExecutorKind, ExecutorMode, ExternalArtifact, FlightLease, FlightLeaseStatus, Flow,
+    FlowMessage, FlowMessageKind, FlowStatus, IssuedCredential, MessageAcknowledgement,
+    MessageInboxItem, Organization, Principal, PrincipalKind, RemoteFlightReport, TargetKind, Task,
     TaskStatus, Team, TrackingAttention, TrackingEscalation, TrackingScan,
 };
 use crate::error::{MambaError, Result};
@@ -458,6 +459,235 @@ impl MambaApp {
             })
             .collect();
         Ok(items)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_flow_message(
+        &mut self,
+        flow_id: &str,
+        task_id: Option<&str>,
+        sender: &str,
+        kind: FlowMessageKind,
+        recipients: &[String],
+        body: &str,
+        requires_ack: bool,
+    ) -> Result<FlowMessage> {
+        let sender = self.state.principal(sender)?.clone();
+        if !sender.active {
+            return Err(MambaError::PermissionDenied(format!(
+                "principal {} is inactive",
+                sender.name
+            )));
+        }
+        let flow = self.state.flow(flow_id)?.clone();
+        if !self.principal_has_flow_access(&flow, &sender) {
+            return Err(MambaError::PermissionDenied(format!(
+                "{} cannot access flow {}",
+                sender.name, flow.id
+            )));
+        }
+        let task_id = task_id
+            .map(|value| {
+                flow.task(value)
+                    .map(|task| task.id.clone())
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "task",
+                        id: value.to_string(),
+                    })
+            })
+            .transpose()?;
+        let body = body.trim();
+        if body.is_empty() || body.chars().count() > 4_000 {
+            return Err(MambaError::Validation(
+                "flow message body must contain 1 to 4000 characters".into(),
+            ));
+        }
+        if recipients.is_empty() || recipients.len() > 32 {
+            return Err(MambaError::Validation(
+                "flow message must target between 1 and 32 recipients".into(),
+            ));
+        }
+
+        let requester = self.state.principal(&flow.demand.requester)?;
+        let sender_is_requester = sender.id == requester.id;
+        let mut recipient_ids = BTreeSet::new();
+        let mut resolved = Vec::new();
+        for recipient in recipients {
+            let target = if let Ok(principal) = self.state.principal(recipient) {
+                if !principal.active {
+                    return Err(MambaError::Validation(format!(
+                        "recipient {} is inactive",
+                        principal.name
+                    )));
+                }
+                crate::domain::AssignmentTarget {
+                    kind: match principal.kind {
+                        PrincipalKind::Human => TargetKind::Human,
+                        PrincipalKind::Agent => TargetKind::Agent,
+                    },
+                    id: principal.id.clone(),
+                    name: principal.name.clone(),
+                }
+            } else {
+                let team = self.state.team(recipient)?;
+                if !team.active {
+                    return Err(MambaError::Validation(format!(
+                        "recipient team {} is inactive",
+                        team.name
+                    )));
+                }
+                crate::domain::AssignmentTarget {
+                    kind: TargetKind::Team,
+                    id: team.id.clone(),
+                    name: team.name.clone(),
+                }
+            };
+            if !sender_is_requester && !self.message_target_is_flow_participant(&flow, &target) {
+                return Err(MambaError::PermissionDenied(format!(
+                    "only demand requester {} can bring {} into flow {}",
+                    requester.name, target.name, flow.id
+                )));
+            }
+            if recipient_ids.insert(target.id.clone()) {
+                resolved.push(target);
+            }
+        }
+        let message = FlowMessage {
+            id: new_id("MSG"),
+            flow_id: flow.id,
+            task_id,
+            kind,
+            sender_id: sender.id,
+            sender_name: sender.name.clone(),
+            recipients: resolved,
+            body: body.to_string(),
+            requires_ack,
+            acknowledgements: Vec::new(),
+            created_at: Utc::now(),
+        };
+        self.commit(
+            &sender.name,
+            vec![DomainEvent::FlowMessagePosted {
+                message: message.clone(),
+            }],
+        )?;
+        Ok(message)
+    }
+
+    pub fn message_inbox(
+        &self,
+        target: &str,
+        include_acknowledged: bool,
+    ) -> Result<Vec<MessageInboxItem>> {
+        let principal = self.state.principal(target)?;
+        let mut items = self
+            .state
+            .messages
+            .values()
+            .filter_map(|message| {
+                let represented = self.message_recipient_ids(message, principal);
+                if represented.is_empty() {
+                    return None;
+                }
+                let pending_recipient_ids = represented
+                    .into_iter()
+                    .filter(|recipient_id| !message.recipient_is_acknowledged(recipient_id))
+                    .collect::<Vec<_>>();
+                if message.requires_ack && pending_recipient_ids.is_empty() && !include_acknowledged
+                {
+                    return None;
+                }
+                Some(MessageInboxItem {
+                    message: message.clone(),
+                    pending_recipient_ids,
+                })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by_key(|item| std::cmp::Reverse(item.message.created_at));
+        Ok(items)
+    }
+
+    pub fn flow_messages(&self, flow_id: &str, actor: &str) -> Result<Vec<FlowMessage>> {
+        let flow = self.state.flow(flow_id)?;
+        let principal = self.state.principal(actor)?;
+        if !self.principal_has_flow_access(flow, principal) {
+            return Err(MambaError::PermissionDenied(format!(
+                "{} cannot access flow {}",
+                principal.name, flow.id
+            )));
+        }
+        let requester = self.state.principal(&flow.demand.requester)?;
+        let mut messages = self
+            .state
+            .messages
+            .values()
+            .filter(|message| message.flow_id == flow.id)
+            .filter(|message| {
+                principal.id == requester.id
+                    || message.sender_id == principal.id
+                    || !self.message_recipient_ids(message, principal).is_empty()
+                    || message.task_id.as_deref().is_some_and(|task_id| {
+                        flow.task(task_id)
+                            .is_some_and(|task| self.principal_is_task_actor(task, principal))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        messages.sort_by_key(|message| message.created_at);
+        Ok(messages)
+    }
+
+    pub fn acknowledge_flow_message(
+        &mut self,
+        message_id: &str,
+        actor: &str,
+    ) -> Result<FlowMessage> {
+        let principal = self.state.principal(actor)?.clone();
+        let message = self
+            .state
+            .messages
+            .get(message_id)
+            .cloned()
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "flow message",
+                id: message_id.to_string(),
+            })?;
+        if !message.requires_ack {
+            return Err(MambaError::InvalidTransition(format!(
+                "flow message {} does not require acknowledgement",
+                message.id
+            )));
+        }
+        let represented = self.message_recipient_ids(&message, &principal);
+        if represented.is_empty() {
+            return Err(MambaError::PermissionDenied(format!(
+                "{} is not a recipient of flow message {}",
+                principal.name, message.id
+            )));
+        }
+        let at = Utc::now();
+        let acknowledgements = represented
+            .into_iter()
+            .filter(|recipient_id| !message.recipient_is_acknowledged(recipient_id))
+            .map(|recipient_id| MessageAcknowledgement {
+                recipient_id,
+                acknowledged_by_id: principal.id.clone(),
+                acknowledged_by_name: principal.name.clone(),
+                acknowledged_at: at,
+            })
+            .collect::<Vec<_>>();
+        if acknowledgements.is_empty() {
+            return Ok(message);
+        }
+        self.commit(
+            &principal.name,
+            vec![DomainEvent::FlowMessageAcknowledged {
+                flow_id: message.flow_id,
+                message_id: message.id.clone(),
+                acknowledgements,
+            }],
+        )?;
+        Ok(self.state.messages[message_id].clone())
     }
 
     pub fn scan_tracking(&mut self, stale_after_hours: u64, actor: &str) -> Result<TrackingScan> {
@@ -1659,27 +1889,101 @@ impl MambaApp {
             })
     }
 
-    fn ensure_task_actor(&self, task: &Task, actor: &str) -> Result<()> {
-        let principal = self.state.principal(actor)?;
-        let assignment = task
-            .assignment
-            .as_ref()
-            .ok_or_else(|| MambaError::NoEligibleAssignee(task.title.clone()))?;
-        let allowed = assignment.owner.id == principal.id
-            || (assignment.owner.kind == TargetKind::Team
-                && principal.team_id.as_deref() == Some(assignment.owner.id.as_str()))
-            || assignment
-                .copilots
+    fn principal_has_flow_access(&self, flow: &Flow, principal: &Principal) -> bool {
+        self.principal_is_flow_participant(flow, principal)
+            || self.state.messages.values().any(|message| {
+                message.flow_id == flow.id
+                    && (message.sender_id == principal.id
+                        || !self.message_recipient_ids(message, principal).is_empty())
+            })
+    }
+
+    fn principal_is_flow_participant(&self, flow: &Flow, principal: &Principal) -> bool {
+        flow.demand.requester == principal.id
+            || flow.demand.requester == principal.name
+            || flow
+                .tasks
                 .iter()
-                .any(|copilot| copilot.id == principal.id)
-            || principal.owner_id.as_deref() == Some(assignment.owner.id.as_str())
-            || self
+                .any(|task| self.principal_is_task_actor(task, principal))
+    }
+
+    fn principal_is_task_actor(&self, task: &Task, principal: &Principal) -> bool {
+        task.assignment.as_ref().is_some_and(|assignment| {
+            assignment.owner.id == principal.id
+                || (assignment.owner.kind == TargetKind::Team
+                    && principal.team_id.as_deref() == Some(assignment.owner.id.as_str()))
+                || assignment
+                    .copilots
+                    .iter()
+                    .any(|copilot| copilot.id == principal.id)
+                || principal.owner_id.as_deref() == Some(assignment.owner.id.as_str())
+                || self
+                    .state
+                    .principals
+                    .get(&assignment.owner.id)
+                    .and_then(|owner| owner.owner_id.as_deref())
+                    == Some(principal.id.as_str())
+        })
+    }
+
+    fn message_target_is_flow_participant(
+        &self,
+        flow: &Flow,
+        target: &crate::domain::AssignmentTarget,
+    ) -> bool {
+        match target.kind {
+            TargetKind::Human | TargetKind::Agent => self
                 .state
                 .principals
-                .get(&assignment.owner.id)
-                .and_then(|owner| owner.owner_id.as_deref())
-                == Some(principal.id.as_str());
-        if allowed {
+                .get(&target.id)
+                .is_some_and(|principal| self.principal_is_flow_participant(flow, principal)),
+            TargetKind::Team => {
+                flow.tasks.iter().any(|task| {
+                    task.assignment.as_ref().is_some_and(|assignment| {
+                        assignment.owner.id == target.id
+                            || assignment
+                                .copilots
+                                .iter()
+                                .any(|copilot| copilot.id == target.id)
+                    })
+                }) || self
+                    .state
+                    .principal(&flow.demand.requester)
+                    .ok()
+                    .and_then(|requester| requester.team_id.as_deref())
+                    == Some(target.id.as_str())
+            }
+        }
+    }
+
+    fn message_recipient_ids(&self, message: &FlowMessage, principal: &Principal) -> Vec<String> {
+        message
+            .recipients
+            .iter()
+            .filter(|recipient| match recipient.kind {
+                TargetKind::Human => recipient.id == principal.id,
+                TargetKind::Agent => {
+                    recipient.id == principal.id
+                        || (principal.kind == PrincipalKind::Human
+                            && self
+                                .state
+                                .principals
+                                .get(&recipient.id)
+                                .and_then(|agent| agent.owner_id.as_deref())
+                                == Some(principal.id.as_str()))
+                }
+                TargetKind::Team => principal.team_id.as_deref() == Some(recipient.id.as_str()),
+            })
+            .map(|recipient| recipient.id.clone())
+            .collect()
+    }
+
+    fn ensure_task_actor(&self, task: &Task, actor: &str) -> Result<()> {
+        if task.assignment.is_none() {
+            return Err(MambaError::NoEligibleAssignee(task.title.clone()));
+        }
+        let principal = self.state.principal(actor)?;
+        if self.principal_is_task_actor(task, principal) {
             Ok(())
         } else {
             Err(MambaError::PermissionDenied(format!(
@@ -2250,6 +2554,139 @@ mod tests {
             TaskStatus::Completed
         );
         assert!(replayed.timeline(&flow.id).unwrap().len() >= 10);
+    }
+
+    #[tokio::test]
+    async fn flow_messages_route_to_humans_agents_and_teams_with_replayable_receipts() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let product = app
+            .create_team("Product", "product,delivery", "admin")
+            .unwrap();
+        let security = app
+            .create_team("Security", "security,operations", "admin")
+            .unwrap();
+        let legal = app.create_team("Legal", "legal", "admin").unwrap();
+        let manager = app
+            .register_principal(
+                "Manager",
+                PrincipalKind::Human,
+                Some(&product.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let engineer = app
+            .register_principal(
+                "Security Engineer",
+                PrincipalKind::Human,
+                Some(&security.id),
+                None,
+                "security,operations",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let agent = app
+            .register_principal(
+                "Security Copilot",
+                PrincipalKind::Agent,
+                Some(&security.id),
+                Some(&engineer.id),
+                "security,operations",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare a launch brief",
+                &manager.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let outsider = app
+            .register_principal(
+                "Outsider",
+                PrincipalKind::Human,
+                Some(&legal.id),
+                None,
+                "legal",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let task_id = flow.tasks[0].id.clone();
+        let message = app
+            .post_flow_message(
+                &flow.id,
+                Some(&task_id),
+                &manager.name,
+                FlowMessageKind::Command,
+                &[agent.name.clone(), security.name.clone()],
+                "Confirm the production secret rotation boundary",
+                true,
+            )
+            .unwrap();
+
+        let engineer_inbox = app.message_inbox(&engineer.name, false).unwrap();
+        assert_eq!(engineer_inbox.len(), 1);
+        assert_eq!(engineer_inbox[0].pending_recipient_ids.len(), 2);
+        assert!(engineer_inbox[0].needs_acknowledgement());
+        assert_eq!(app.message_inbox(&agent.name, false).unwrap().len(), 1);
+        assert!(app.flow_messages(&flow.id, &outsider.name).is_err());
+
+        let reply = app
+            .post_flow_message(
+                &flow.id,
+                Some(&task_id),
+                &engineer.name,
+                FlowMessageKind::Update,
+                std::slice::from_ref(&manager.name),
+                "Boundary confirmed; rollout can continue",
+                false,
+            )
+            .unwrap();
+        assert_eq!(app.message_inbox(&manager.name, false).unwrap().len(), 1);
+        assert_eq!(app.flow_messages(&flow.id, &manager.name).unwrap().len(), 2);
+        assert_eq!(reply.sender_id, engineer.id);
+
+        let acknowledged = app
+            .acknowledge_flow_message(&message.id, &engineer.name)
+            .unwrap();
+        assert_eq!(acknowledged.acknowledgements.len(), 2);
+        assert!(app.message_inbox(&engineer.name, false).unwrap().is_empty());
+        assert!(app.message_inbox(&agent.name, false).unwrap().is_empty());
+        assert_eq!(app.message_inbox(&engineer.name, true).unwrap().len(), 1);
+
+        drop(app);
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        assert_eq!(replayed.state().messages.len(), 2);
+        assert_eq!(
+            replayed.state().messages[&message.id]
+                .acknowledgements
+                .len(),
+            2
+        );
+        let kinds = replayed
+            .timeline(&flow.id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"flow_message.posted".to_string()));
+        assert!(kinds.contains(&"flow_message.acknowledged".to_string()));
     }
 
     #[tokio::test]

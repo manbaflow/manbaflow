@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::domain::{
-    Evidence, ExecutorKind, ExecutorMode, FlightLease, FlightLeaseStatus, Principal,
-    RemoteFlightReport, Task, TaskStatus,
+    Evidence, ExecutorKind, ExecutorMode, FlightLease, FlightLeaseStatus, FlowMessage,
+    MessageInboxItem, Principal, RemoteFlightReport, Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
@@ -125,6 +125,14 @@ impl RemoteWorker {
                 task.id, task.status
             )));
         }
+        let pending_messages = self.control_plane.messages().await?;
+        let thread = self.control_plane.flow_messages(&item.flow_id).await?;
+        let instructions = task_message_context(&thread, item);
+        for message in relevant_inbox_messages(&pending_messages, item)
+            .filter(|message| message.needs_acknowledgement())
+        {
+            self.control_plane.ack_message(&message.message.id).await?;
+        }
 
         let run_id = format!("WRUN-{}", Uuid::new_v4().simple());
         let log_path = self
@@ -142,7 +150,7 @@ impl RemoteWorker {
                 )),
             )
             .await?;
-        let prompt = worker_prompt(&principal, item, &task);
+        let prompt = worker_prompt(&principal, item, &task, &instructions);
         let result = TerminalExecutor::run(ExecutionRequest {
             kind: self.options.executor.clone(),
             command: self.options.command.clone(),
@@ -236,6 +244,14 @@ impl RemoteWorker {
                 lease.task_id
             )));
         }
+        let pending_messages = self.control_plane.messages().await?;
+        let thread = self.control_plane.flow_messages(&item.flow_id).await?;
+        let instructions = task_message_context(&thread, item);
+        for message in relevant_inbox_messages(&pending_messages, item)
+            .filter(|message| message.needs_acknowledgement())
+        {
+            self.control_plane.ack_message(&message.message.id).await?;
+        }
 
         let run_id = match lease.status {
             FlightLeaseStatus::Authorized => {
@@ -294,7 +310,7 @@ impl RemoteWorker {
             };
             match worktree {
                 Ok(mut worktree) => {
-                    let prompt = execute_prompt(&principal, item, &lease);
+                    let prompt = execute_prompt(&principal, item, &lease, &instructions);
                     let execution = TerminalExecutor::run(ExecutionRequest {
                         kind: self.options.executor.clone(),
                         command: self.options.command.clone(),
@@ -448,6 +464,24 @@ impl ControlPlaneClient {
 
     async fn inbox(&self) -> Result<Vec<InboxItem>> {
         self.request(Method::GET, &["inbox"], None).await
+    }
+
+    async fn messages(&self) -> Result<Vec<MessageInboxItem>> {
+        self.request(Method::GET, &["messages"], None).await
+    }
+
+    async fn flow_messages(&self, flow_id: &str) -> Result<Vec<FlowMessage>> {
+        self.request(Method::GET, &["flows", flow_id, "messages"], None)
+            .await
+    }
+
+    async fn ack_message(&self, message_id: &str) -> Result<crate::domain::FlowMessage> {
+        self.request(
+            Method::POST,
+            &["messages", message_id, "ack"],
+            Some(json!({})),
+        )
+        .await
     }
 
     async fn task_action(&self, task_id: &str, action: &str) -> Result<Task> {
@@ -609,13 +643,19 @@ fn select_lease<'a>(
         })
 }
 
-fn worker_prompt(principal: &Principal, item: &InboxItem, task: &Task) -> String {
+fn worker_prompt(
+    principal: &Principal,
+    item: &InboxItem,
+    task: &Task,
+    instructions: &str,
+) -> String {
     format!(
         "MambaFlow remote PASS for a read-only planning flight.\n\
          Worker principal: {} ({})\n\
          Flow: {} - {}\n\
          Task: {} - {}\n\
          Description: {}\n\
+         Explicit Flow instructions:\n{}\n\n\
          Acceptance criteria:\n- {}\n\n\
          Inspect the workspace read-only. Do not modify files. Return a concrete implementation \
          plan, affected files or documents, verification steps, risks, and questions for the human owner.",
@@ -626,11 +666,17 @@ fn worker_prompt(principal: &Principal, item: &InboxItem, task: &Task) -> String
         task.id,
         task.title,
         task.description,
+        instructions,
         task.acceptance_criteria.join("\n- ")
     )
 }
 
-fn execute_prompt(principal: &Principal, item: &InboxItem, lease: &FlightLease) -> String {
+fn execute_prompt(
+    principal: &Principal,
+    item: &InboxItem,
+    lease: &FlightLease,
+    instructions: &str,
+) -> String {
     format!(
         "MambaFlow remote PASS for a Human-authorized coding flight.\n\
          Flight lease: {}\n\
@@ -639,6 +685,7 @@ fn execute_prompt(principal: &Principal, item: &InboxItem, lease: &FlightLease) 
          Flow: {} - {}\n\
          Task: {} - {}\n\
          Description: {}\n\
+         Explicit Flow instructions:\n{}\n\n\
          Acceptance criteria:\n- {}\n\n\
          Implement only this task inside the isolated Git worktree. Run relevant checks. Do not \
          push, merge, change remotes, or access credentials. Report the changes, verification, and \
@@ -652,8 +699,47 @@ fn execute_prompt(principal: &Principal, item: &InboxItem, lease: &FlightLease) 
         item.task.id,
         item.task.title,
         item.task.description,
+        instructions,
         item.task.acceptance_criteria.join("\n- ")
     )
+}
+
+fn relevant_inbox_messages<'a>(
+    messages: &'a [MessageInboxItem],
+    item: &'a InboxItem,
+) -> impl Iterator<Item = &'a MessageInboxItem> {
+    messages.iter().filter(|message| {
+        message.message.flow_id == item.flow_id
+            && message
+                .message
+                .task_id
+                .as_deref()
+                .is_none_or(|task_id| task_id == item.task.id)
+    })
+}
+
+fn task_message_context(messages: &[FlowMessage], item: &InboxItem) -> String {
+    let lines = messages
+        .iter()
+        .filter(|message| {
+            message.flow_id == item.flow_id
+                && message
+                    .task_id
+                    .as_deref()
+                    .is_none_or(|task_id| task_id == item.task.id)
+        })
+        .map(|message| {
+            format!(
+                "- [{}] {}: {}",
+                message.kind, message.sender_name, message.body
+            )
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        "- No explicit instructions".into()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn plan_evidence_uri(principal: &Principal, task: &Task) -> String {
@@ -747,6 +833,8 @@ mod tests {
         let router = Router::new()
             .route("/api/v1/me", get(mock_me))
             .route("/api/v1/inbox", get(mock_inbox))
+            .route("/api/v1/messages", get(mock_messages))
+            .route("/api/v1/flows/{flow}/messages", get(mock_flow_messages))
             .route("/api/v1/tasks/{task}/{action}", post(mock_task_action))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -869,6 +957,8 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
         let router = Router::new()
             .route("/api/v1/me", get(mock_me))
             .route("/api/v1/inbox", get(mock_inbox))
+            .route("/api/v1/messages", get(mock_messages))
+            .route("/api/v1/flows/{flow}/messages", get(mock_flow_messages))
             .route("/api/v1/flight-leases", get(mock_flight_leases))
             .route(
                 "/api/v1/flight-leases/{lease}/claim",
@@ -982,6 +1072,14 @@ printf '%s\n' '{"thread_id":"execute-thread"}'
             "flow_title": "Ship gateway",
             "task": state.task.lock().unwrap().clone()
         }]))
+    }
+
+    async fn mock_messages() -> Json<Vec<MessageInboxItem>> {
+        Json(Vec::new())
+    }
+
+    async fn mock_flow_messages() -> Json<Vec<FlowMessage>> {
+        Json(Vec::new())
     }
 
     async fn mock_flight_leases(State(state): State<MockState>) -> Json<Vec<FlightLease>> {

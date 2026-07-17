@@ -4,7 +4,8 @@ use serde::Serialize;
 
 use crate::MambaApp;
 use crate::domain::{
-    ExecutorConfig, ExecutorKind, Flow, PrincipalKind, TargetKind, Task, TaskStatus,
+    ExecutorConfig, ExecutorKind, Flow, FlowMessageKind, PrincipalKind, TargetKind, Task,
+    TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::planner::PlannerKind;
@@ -16,6 +17,7 @@ pub struct ShowcaseSummary {
     pub in_progress_task_id: String,
     pub waiting_review_task_id: String,
     pub completed_flow_id: String,
+    pub command_message_id: Option<String>,
     pub flows: Vec<Flow>,
 }
 
@@ -127,6 +129,22 @@ pub async fn seed_showcase(
         &auth_actor,
         "等待安全负责人确认生产环境的 Provider Secret 轮换边界",
     )?;
+    let command_message_id = if app.state().principal("佐巴扬").is_ok() {
+        Some(
+            app.post_flow_message(
+                &gateway.id,
+                Some(&auth_policy.id),
+                requester,
+                FlowMessageKind::Command,
+                &["佐巴扬".to_string(), "Codex 副驾".to_string()],
+                "确认 Provider Secret 轮换边界，给出生产放行结论；收到后回传塔台",
+                true,
+            )?
+            .id,
+        )
+    } else {
+        None
+    };
 
     let review = app
         .create_demand(
@@ -171,6 +189,7 @@ pub async fn seed_showcase(
         in_progress_task_id: gateway_core.id,
         waiting_review_task_id: deliver.id,
         completed_flow_id: completed.id.clone(),
+        command_message_id,
         flows: [gateway.id, review.id, completed.id]
             .iter()
             .map(|id| app.state().flow(id).cloned())

@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::stdout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 use crate::MambaApp;
 use crate::dashboard::{ActionPriority, FlowHealth, build_dashboard};
 use crate::domain::{
-    AttentionSeverity, ExecutorMode, FlightLeaseStatus, Flow, FlowStatus, PrincipalKind, Task,
-    TaskStatus, TrackingEscalation,
+    AttentionSeverity, ExecutorMode, FlightLeaseStatus, Flow, FlowMessageKind, FlowStatus,
+    MessageInboxItem, PrincipalKind, Task, TaskStatus, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -153,6 +153,7 @@ enum MouseAction {
     Evidence,
     Block,
     Complete,
+    SendMessage,
     ScanTracker,
     AcknowledgeEscalation,
     CycleActor,
@@ -183,9 +184,23 @@ struct HitRegion {
 #[derive(Clone, Debug)]
 enum InputPurpose {
     Demand,
-    Evidence { task_id: String },
-    Block { task_id: String },
-    Run { task_id: String, mode: ExecutorMode },
+    Evidence {
+        task_id: String,
+    },
+    Block {
+        task_id: String,
+    },
+    Message {
+        flow_id: String,
+        task_id: String,
+        recipients: Vec<String>,
+        kind: FlowMessageKind,
+        requires_ack: bool,
+    },
+    Run {
+        task_id: String,
+        mode: ExecutorMode,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -370,10 +385,11 @@ impl UiState {
             KeyCode::Char('c') => self.complete_task(app),
             KeyCode::Char('e') => self.open_task_input(app, true),
             KeyCode::Char('b') => self.open_task_input(app, false),
+            KeyCode::Char('m') => self.open_message_input(app),
             KeyCode::Char('p') => self.open_run_confirmation(app, ExecutorMode::Plan),
             KeyCode::Char('x') => self.open_run_confirmation(app, ExecutorMode::Execute),
             KeyCode::Char('t') => self.scan_tracker(app, true),
-            KeyCode::Char('g') => self.acknowledge_next_escalation(app),
+            KeyCode::Char('g') => self.acknowledge_next_inbox(app),
             _ => {}
         }
         Ok(false)
@@ -469,8 +485,9 @@ impl UiState {
             MouseAction::Evidence => self.open_task_input(app, true),
             MouseAction::Block => self.open_task_input(app, false),
             MouseAction::Complete => self.complete_task(app),
+            MouseAction::SendMessage => self.open_message_input(app),
             MouseAction::ScanTracker => self.scan_tracker(app, true),
-            MouseAction::AcknowledgeEscalation => self.acknowledge_next_escalation(app),
+            MouseAction::AcknowledgeEscalation => self.acknowledge_next_inbox(app),
             MouseAction::CycleActor => self.cycle_actor(app),
             MouseAction::Help => self.show_help = true,
             MouseAction::Quit => return Ok(self.request_quit()),
@@ -577,6 +594,34 @@ impl UiState {
             InputPurpose::Block { task_id } => app
                 .block_task(&task_id, &actor, value)
                 .map(|task| format!("{} 已阻塞，塔台收到求助", task.id)),
+            InputPurpose::Message {
+                flow_id,
+                task_id,
+                recipients,
+                kind,
+                requires_ack,
+            } => app
+                .post_flow_message(
+                    &flow_id,
+                    Some(&task_id),
+                    &actor,
+                    kind,
+                    &recipients,
+                    value,
+                    requires_ack,
+                )
+                .map(|message| {
+                    format!(
+                        "{} 已传球给 {}",
+                        message.id,
+                        message
+                            .recipients
+                            .iter()
+                            .map(|recipient| recipient.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }),
             InputPurpose::Run { .. } => unreachable!(),
         };
         match result {
@@ -865,11 +910,26 @@ impl UiState {
         }
     }
 
-    fn acknowledge_next_escalation(&mut self, app: &mut MambaApp) {
+    fn acknowledge_next_inbox(&mut self, app: &mut MambaApp) {
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
             self.failure(MambaError::Validation("没有可用的 Human 操作人".into()));
             return;
         };
+        let message_id = self
+            .actor_messages(app)
+            .into_iter()
+            .find(MessageInboxItem::needs_acknowledgement)
+            .map(|item| item.message.id);
+        if let Some(message_id) = message_id {
+            match app.acknowledge_flow_message(&message_id, &actor) {
+                Ok(message) => {
+                    self.refresh_timeline(app);
+                    self.success(format!("{} 已收到指令 {}", actor, message.id));
+                }
+                Err(error) => self.failure(error),
+            }
+            return;
+        }
         let escalation_id = self
             .actor_escalations(app)
             .into_iter()
@@ -877,7 +937,7 @@ impl UiState {
             .map(|escalation| escalation.id.clone());
         let Some(escalation_id) = escalation_id else {
             self.failure(MambaError::Validation(
-                "当前没有等待确认的 Tower Call".into(),
+                "当前没有等待确认的指令或 Tower Call".into(),
             ));
             return;
         };
@@ -888,6 +948,55 @@ impl UiState {
             }
             Err(error) => self.failure(error),
         }
+    }
+
+    fn open_message_input(&mut self, app: &MambaApp) {
+        let Some(actor) = self.actor_name(app) else {
+            self.failure(MambaError::Validation("没有可用的 Human 操作人".into()));
+            return;
+        };
+        let Some((flow, task)) = self.selected_task_context(app) else {
+            self.failure(MambaError::Validation("请先选择一个任务再传球".into()));
+            return;
+        };
+        let requester = app.state().principal(&flow.demand.requester).ok();
+        let actor_is_requester = requester.is_some_and(|requester| requester.name == actor);
+        let (kind, requires_ack, recipients) = if actor_is_requester {
+            let recipients = task
+                .assignment
+                .iter()
+                .flat_map(|assignment| {
+                    std::iter::once(&assignment.owner).chain(assignment.copilots.iter())
+                })
+                .filter(|target| target.name != actor)
+                .map(|target| target.name.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            (FlowMessageKind::Command, true, recipients)
+        } else {
+            (
+                FlowMessageKind::Update,
+                false,
+                vec![flow.demand.requester.clone()],
+            )
+        };
+        if recipients.is_empty() {
+            self.failure(MambaError::Validation(
+                "当前任务没有可以接球的其他成员".into(),
+            ));
+            return;
+        }
+        self.modal = Some(InputModal {
+            purpose: InputPurpose::Message {
+                flow_id: flow.id.clone(),
+                task_id: task.id.clone(),
+                recipients,
+                kind,
+                requires_ack,
+            },
+            value: String::new(),
+        });
     }
 
     fn open_task_input(&mut self, app: &MambaApp, evidence: bool) {
@@ -1099,6 +1208,12 @@ impl UiState {
                 .then_with(|| right.raised_at.cmp(&left.raised_at))
         });
         escalations
+    }
+
+    fn actor_messages(&self, app: &MambaApp) -> Vec<MessageInboxItem> {
+        self.actor_name(app)
+            .and_then(|actor| app.message_inbox(actor, false).ok())
+            .unwrap_or_default()
     }
 
     fn selected_task_context<'a>(&self, app: &'a MambaApp) -> Option<(&'a Flow, &'a Task)> {
@@ -1770,7 +1885,8 @@ fn render_tasks(frame: &mut Frame, state: &mut UiState, app: &MambaApp, area: Re
 
 fn render_inbox(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
     let escalations = state.actor_escalations(app);
-    let (calls_area, table_area, detail_area) = if escalations.is_empty() {
+    let messages = state.actor_messages(app);
+    let (comms_area, table_area, detail_area) = if escalations.is_empty() && messages.is_empty() {
         let [table, detail] =
             Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)])
                 .spacing(1)
@@ -1786,8 +1902,8 @@ fn render_inbox(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Re
         .areas(area);
         (Some(calls), table, detail)
     };
-    if let Some(calls_area) = calls_area {
-        render_escalations(frame, app, &escalations, calls_area);
+    if let Some(comms_area) = comms_area {
+        render_inbox_comms(frame, app, &messages, &escalations, comms_area);
     }
     let items = state.inbox_items(app);
     let rows = items
@@ -1837,43 +1953,66 @@ fn render_inbox(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Re
     );
 }
 
-fn render_escalations(
+fn render_inbox_comms(
     frame: &mut Frame,
     app: &MambaApp,
+    messages: &[MessageInboxItem],
     escalations: &[&TrackingEscalation],
     area: Rect,
 ) {
-    let items = escalations
+    let mut items = messages
         .iter()
-        .take(area.height.saturating_sub(2) as usize)
-        .map(|escalation| {
-            let severity = app
-                .state()
-                .attentions
-                .get(&escalation.attention_id)
-                .map(|attention| attention.severity)
-                .unwrap_or(AttentionSeverity::Warning);
-            let (status, color) = if escalation.needs_acknowledgement() {
-                match severity {
-                    AttentionSeverity::Critical => ("! CRITICAL", RED),
-                    AttentionSeverity::Warning => ("! WARNING", ORANGE),
-                }
+        .map(|item| {
+            let (status, color) = if item.needs_acknowledgement() {
+                ("! 指令", GOLD)
             } else {
-                ("✓ RECEIVED", GREEN)
+                ("· 回传", CYAN)
             };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{status:<12}"), Style::new().fg(color).bold()),
-                Span::styled(format!("{}  ", escalation.task_id), Style::new().fg(MUTED)),
+                Span::styled(format!("{status:<9}"), Style::new().fg(color).bold()),
                 Span::styled(
-                    compact_summary(&escalation.reason, 52),
+                    format!("{}  ", item.message.sender_name),
+                    Style::new().fg(MUTED),
+                ),
+                Span::styled(
+                    compact_summary(&item.message.body, 56),
                     Style::new().fg(TEXT),
                 ),
             ]))
         })
         .collect::<Vec<_>>();
+    items.extend(escalations.iter().map(|escalation| {
+        let severity = app
+            .state()
+            .attentions
+            .get(&escalation.attention_id)
+            .map(|attention| attention.severity)
+            .unwrap_or(AttentionSeverity::Warning);
+        let (status, color) = if escalation.needs_acknowledgement() {
+            match severity {
+                AttentionSeverity::Critical => ("! CRITICAL", RED),
+                AttentionSeverity::Warning => ("! WARNING", ORANGE),
+            }
+        } else {
+            ("✓ RECEIVED", GREEN)
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("{status:<12}"), Style::new().fg(color).bold()),
+            Span::styled(format!("{}  ", escalation.task_id), Style::new().fg(MUTED)),
+            Span::styled(
+                compact_summary(&escalation.reason, 52),
+                Style::new().fg(TEXT),
+            ),
+        ]))
+    }));
+    items.truncate(area.height.saturating_sub(2) as usize);
     frame.render_widget(
         List::new(items).block(panel_block(
-            &format!("TOWER CALLS / {} · g 收到", escalations.len()),
+            &format!(
+                "TOWER COMMS / {} 指令 · {} 呼叫 · g 收到",
+                messages.len(),
+                escalations.len()
+            ),
             false,
         )),
         area,
@@ -2312,12 +2451,14 @@ fn render_shortcuts(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area
         View::Flows => vec![
             ("批准/接单", MouseAction::ApproveOrAccept),
             ("推进", MouseAction::Advance),
+            ("传球", MouseAction::SendMessage),
             ("规划", MouseAction::Plan),
             ("执行", MouseAction::Execute),
         ],
         View::Inbox => vec![
             ("接单", MouseAction::ApproveOrAccept),
             ("收到", MouseAction::AcknowledgeEscalation),
+            ("传球", MouseAction::SendMessage),
             ("推进", MouseAction::Advance),
             ("规划", MouseAction::Plan),
             ("执行", MouseAction::Execute),
@@ -2368,20 +2509,39 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
     let is_demand = matches!(&modal.purpose, InputPurpose::Demand);
     let area = centered(frame.area(), 72, if is_demand { 11 } else { 9 });
     frame.render_widget(Clear, area);
-    let (title, prompt, color) = match &modal.purpose {
+    let (title, prompt, color): (&str, String, Color) = match &modal.purpose {
         InputPurpose::Demand => (
             "NEW DEMAND / 管理需求",
-            "描述目标；Tab 或鼠标选择 PRD 规划器",
+            "描述目标；Tab 或鼠标选择 PRD 规划器".into(),
             GOLD,
         ),
-        InputPurpose::Evidence { .. } => ("EVIDENCE / 交付证据", "输入证据摘要", GREEN),
-        InputPurpose::Block { .. } => ("BLOCK / 请求协防", "输入阻塞原因", RED),
+        InputPurpose::Evidence { .. } => ("EVIDENCE / 交付证据", "输入证据摘要".into(), GREEN),
+        InputPurpose::Block { .. } => ("BLOCK / 请求协防", "输入阻塞原因".into(), RED),
+        InputPurpose::Message {
+            recipients,
+            requires_ack,
+            ..
+        } => (
+            "PASS / FLOW 指令",
+            format!(
+                "传给 {}{}",
+                recipients.join(", "),
+                if *requires_ack {
+                    "；等待明确回执"
+                } else {
+                    ""
+                }
+            ),
+            GOLD,
+        ),
         InputPurpose::Run { mode, .. } => (
             "FLIGHT CLEARANCE / 航班放行",
             match mode {
-                ExecutorMode::Plan => "只读规划会调用已分配终端并产生模型费用；输入 PASS 放行",
+                ExecutorMode::Plan => {
+                    "只读规划会调用已分配终端并产生模型费用；输入 PASS 放行".into()
+                }
                 ExecutorMode::Execute => {
-                    "执行模式允许终端修改注册工作区；确认仓库状态后输入 MAMBA 放行"
+                    "执行模式允许终端修改注册工作区；确认仓库状态后输入 MAMBA 放行".into()
                 }
             },
             match mode {
@@ -2499,7 +2659,8 @@ fn render_help_modal(frame: &mut Frame) {
         help_line("d", "从空塔台装载完整的交互式 Showcase"),
         help_line("n", "提出新需求，选择 Local / Claude Code / Codex 规划"),
         help_line("t", "立即巡航扫描 Todo 风险；后台每 30 秒自动扫描"),
-        help_line("g", "确认当前 Inbox 中首个未确认 Tower Call"),
+        help_line("g", "确认当前 Inbox 中首个 Flow 指令或 Tower Call"),
+        help_line("m", "围绕当前任务向 Owner、Copilot 或 Requester 传球"),
         help_line("a", "批准 Flow，或接受当前 Assignment"),
         help_line("s", "按状态接单、开工或提交验收"),
         help_line("e", "为当前任务补充 Evidence"),
@@ -2632,6 +2793,7 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::Advance | MouseAction::Plan => CYAN,
         MouseAction::Execute => ORANGE,
         MouseAction::Evidence | MouseAction::Complete => GREEN,
+        MouseAction::SendMessage => GOLD,
         MouseAction::Block | MouseAction::Quit => RED,
         MouseAction::ScanTracker => ORANGE,
         MouseAction::AcknowledgeEscalation => GOLD,
@@ -3208,6 +3370,52 @@ mod tests {
                 .any(|region| { region.target == HitTarget::Action(MouseAction::LoadShowcase) })
         );
 
+        state.cycle_actor(&app);
+        assert_eq!(state.actor_name(&app), Some("佐巴扬"));
+        state.switch_view(&app, View::Inbox);
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("TOWER COMMS"));
+        assert!(content.contains("Provider Secret"));
+        let compact_backend = TestBackend::new(80, 24);
+        let mut compact_terminal = Terminal::new(compact_backend).unwrap();
+        compact_terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let compact_content = compact_terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(compact_content.contains("TOWER COMMS"));
+        assert!(compact_content.contains("Provider Secret"));
+        state.acknowledge_next_inbox(&mut app);
+        assert!(state.message.contains("已收到指令"));
+        assert!(app.message_inbox("佐巴扬", false).unwrap().is_empty());
+        state.open_message_input(&app);
+        let Some(modal) = &mut state.modal else {
+            panic!("message modal should open for an assigned task");
+        };
+        assert!(matches!(&modal.purpose, InputPurpose::Message { .. }));
+        modal.value = "Secret 边界已确认，可以恢复执行".into();
+        state.submit_modal(&mut app).await;
+        assert!(
+            app.message_inbox("牢大", false)
+                .unwrap()
+                .iter()
+                .any(|item| item.message.body.contains("恢复执行"))
+        );
+
         state
             .handle_key(
                 &mut app,
@@ -3279,11 +3487,11 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains("TOWER CALLS"));
+        assert!(content.contains("TOWER COMMS"));
         assert!(content.contains("CRITICAL"));
         assert!(content.contains("waiting for access"));
 
-        state.acknowledge_next_escalation(&mut app);
+        state.acknowledge_next_inbox(&mut app);
         assert!(state.message.contains("已收到呼叫"));
         assert!(!state.actor_escalations(&app)[0].needs_acknowledgement());
         terminal

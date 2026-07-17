@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     ApiCredential, AttentionKind, Demand, Estimate, Evidence, ExecutionRecord, ExternalArtifact,
-    FlightLease, Flow, Organization, Principal, RemoteFlightReport, Team, TrackingAttention,
-    TrackingEscalation,
+    FlightLease, Flow, FlowMessage, MessageAcknowledgement, Organization, Principal,
+    RemoteFlightReport, Team, TrackingAttention, TrackingEscalation,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -42,6 +42,14 @@ pub enum DomainEvent {
         flow_id: String,
         task_id: String,
         target_id: String,
+    },
+    FlowMessagePosted {
+        message: FlowMessage,
+    },
+    FlowMessageAcknowledged {
+        flow_id: String,
+        message_id: String,
+        acknowledgements: Vec<MessageAcknowledgement>,
     },
     TaskAccepted {
         flow_id: String,
@@ -202,6 +210,8 @@ impl DomainEvent {
             Self::PlanGenerated { .. } => "plan.generated",
             Self::FlowApproved { .. } => "flow.approved",
             Self::WorkRequestSent { .. } => "work_request.sent",
+            Self::FlowMessagePosted { .. } => "flow_message.posted",
+            Self::FlowMessageAcknowledged { .. } => "flow_message.acknowledged",
             Self::TaskAccepted { .. } => "task.accepted",
             Self::TaskRejected { .. } => "task.rejected",
             Self::TaskEstimateNegotiated { .. } => "task.estimate_negotiated",
@@ -236,6 +246,7 @@ impl DomainEvent {
             Self::PlanGenerated { flow } => Some(&flow.id),
             Self::FlowApproved { flow_id, .. }
             | Self::WorkRequestSent { flow_id, .. }
+            | Self::FlowMessageAcknowledged { flow_id, .. }
             | Self::TaskAccepted { flow_id, .. }
             | Self::TaskRejected { flow_id, .. }
             | Self::TaskEstimateNegotiated { flow_id, .. }
@@ -257,6 +268,7 @@ impl DomainEvent {
             | Self::FlowCompleted { flow_id, .. } => Some(flow_id),
             Self::TrackingAttentionRaised { attention } => Some(&attention.flow_id),
             Self::TrackingEscalationRaised { escalation } => Some(&escalation.flow_id),
+            Self::FlowMessagePosted { message } => Some(&message.flow_id),
             Self::ExecutorFinished { record } => Some(&record.flow_id),
             Self::RemoteFlightAuthorized { lease } => Some(&lease.flow_id),
             Self::OrganizationInitialized { .. }

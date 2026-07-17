@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use manbaflow::dashboard::DashboardSnapshot;
 use manbaflow::domain::{
-    ExecutorConfig, ExecutorKind, ExecutorMode, Flow, PrincipalKind, Task, TrackingAttention,
-    TrackingEscalation,
+    ExecutorConfig, ExecutorKind, ExecutorMode, Flow, FlowMessage, FlowMessageKind, PrincipalKind,
+    Task, TrackingAttention, TrackingEscalation,
 };
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
@@ -81,6 +81,11 @@ enum Command {
     Task {
         #[command(subcommand)]
         command: TaskCommand,
+    },
+    /// 在 Flow 内向团队、Human 或 Agent 传球并跟踪回执
+    Message {
+        #[command(subcommand)]
+        command: MessageCommand,
     },
     /// 查看某个 Human 或 Agent 的工作收件箱
     Inbox {
@@ -414,6 +419,45 @@ enum TaskCommand {
 }
 
 #[derive(Subcommand)]
+enum MessageCommand {
+    /// 发送关联 Flow 或 Task 的结构化指令
+    Send {
+        flow: String,
+        body: String,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        by: String,
+        #[arg(long = "to", required = true)]
+        recipients: Vec<String>,
+        #[arg(long, value_enum, default_value = "command")]
+        kind: FlowMessageKindArg,
+        /// 消息无需接收方显式确认
+        #[arg(long)]
+        no_ack: bool,
+    },
+    /// 查看某个 Principal 收到的 Flow 消息
+    Inbox {
+        #[arg(long = "for")]
+        target: String,
+        #[arg(long)]
+        all: bool,
+    },
+    /// 查看当前 Principal 有权读取的 Flow 对话
+    Thread {
+        flow: String,
+        #[arg(long = "as")]
+        actor: String,
+    },
+    /// 确认已经收到一条要求回执的消息
+    Ack {
+        message: String,
+        #[arg(long)]
+        by: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ExecutorCommand {
     /// 检查 CLI 是否安装并输出版本
     Check {
@@ -480,6 +524,14 @@ enum PlannerKindArg {
 enum ExecutorModeArg {
     Plan,
     Execute,
+}
+
+#[derive(Clone, ValueEnum)]
+enum FlowMessageKindArg {
+    Command,
+    Question,
+    Update,
+    Decision,
 }
 
 #[tokio::main]
@@ -823,6 +875,77 @@ async fn run(cli: Cli) -> Result<()> {
                     &task,
                     cli.json,
                     format!("{} 已确认落地。Mamba Out.", task.id),
+                );
+            }
+        },
+        Command::Message { command } => match command {
+            MessageCommand::Send {
+                flow,
+                body,
+                task,
+                by,
+                recipients,
+                kind,
+                no_ack,
+            } => {
+                let message = app.post_flow_message(
+                    &flow,
+                    task.as_deref(),
+                    &by,
+                    kind.into(),
+                    &recipients,
+                    &body,
+                    !no_ack,
+                )?;
+                output(
+                    &message,
+                    cli.json,
+                    format!(
+                        "{} 已传球给 {}：{}",
+                        message.id,
+                        message
+                            .recipients
+                            .iter()
+                            .map(|recipient| recipient.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        message.body
+                    ),
+                );
+            }
+            MessageCommand::Inbox { target, all } => {
+                let messages = app.message_inbox(&target, all)?;
+                let text = messages
+                    .iter()
+                    .map(|item| {
+                        flow_message_line(
+                            &item.message,
+                            if item.needs_acknowledgement() {
+                                "WAITING_ACK"
+                            } else {
+                                "RECEIVED"
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                output(&messages, cli.json, text);
+            }
+            MessageCommand::Thread { flow, actor } => {
+                let messages = app.flow_messages(&flow, &actor)?;
+                let text = messages
+                    .iter()
+                    .map(|message| flow_message_line(message, "THREAD"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                output(&messages, cli.json, text);
+            }
+            MessageCommand::Ack { message, by } => {
+                let message = app.acknowledge_flow_message(&message, &by)?;
+                output(
+                    &message,
+                    cli.json,
+                    format!("{} 已收到指令 {}", by, message.id),
                 );
             }
         },
@@ -1366,6 +1489,23 @@ fn tracking_escalation_line(escalation: &TrackingEscalation) -> String {
     )
 }
 
+fn flow_message_line(message: &FlowMessage, status: &str) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        message.id,
+        status,
+        message.kind,
+        message.sender_name,
+        message
+            .recipients
+            .iter()
+            .map(|recipient| recipient.name.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        message.body
+    )
+}
+
 fn absolute_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(if path.as_ref().is_absolute() {
         path.as_ref().to_path_buf()
@@ -1407,6 +1547,17 @@ impl From<ExecutorModeArg> for ExecutorMode {
         match value {
             ExecutorModeArg::Plan => Self::Plan,
             ExecutorModeArg::Execute => Self::Execute,
+        }
+    }
+}
+
+impl From<FlowMessageKindArg> for FlowMessageKind {
+    fn from(value: FlowMessageKindArg) -> Self {
+        match value {
+            FlowMessageKindArg::Command => Self::Command,
+            FlowMessageKindArg::Question => Self::Question,
+            FlowMessageKindArg::Update => Self::Update,
+            FlowMessageKindArg::Decision => Self::Decision,
         }
     }
 }

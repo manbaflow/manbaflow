@@ -285,6 +285,69 @@ impl Flow {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowMessageKind {
+    Command,
+    Question,
+    Update,
+    Decision,
+}
+
+impl std::fmt::Display for FlowMessageKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Command => write!(f, "command"),
+            Self::Question => write!(f, "question"),
+            Self::Update => write!(f, "update"),
+            Self::Decision => write!(f, "decision"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageAcknowledgement {
+    pub recipient_id: String,
+    pub acknowledged_by_id: String,
+    pub acknowledged_by_name: String,
+    pub acknowledged_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FlowMessage {
+    pub id: String,
+    pub flow_id: String,
+    pub task_id: Option<String>,
+    pub kind: FlowMessageKind,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub recipients: Vec<AssignmentTarget>,
+    pub body: String,
+    pub requires_ack: bool,
+    pub acknowledgements: Vec<MessageAcknowledgement>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl FlowMessage {
+    pub fn recipient_is_acknowledged(&self, recipient_id: &str) -> bool {
+        self.acknowledgements
+            .iter()
+            .any(|acknowledgement| acknowledgement.recipient_id == recipient_id)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MessageInboxItem {
+    pub message: FlowMessage,
+    pub pending_recipient_ids: Vec<String>,
+}
+
+impl MessageInboxItem {
+    pub fn needs_acknowledgement(&self) -> bool {
+        self.message.requires_ack && !self.pending_recipient_ids.is_empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionKind {

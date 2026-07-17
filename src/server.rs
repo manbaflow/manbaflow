@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -17,8 +17,8 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
-    Evidence, ExecutorKind, FlightLease, Flow, Principal, PrincipalKind, RemoteFlightReport, Task,
-    TrackingEscalation,
+    Evidence, ExecutorKind, FlightLease, Flow, FlowMessage, FlowMessageKind, MessageInboxItem,
+    Principal, PrincipalKind, RemoteFlightReport, Task, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
@@ -112,6 +112,23 @@ struct EvidenceInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct MessageInboxQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PostMessageInput {
+    #[serde(default)]
+    task_id: Option<String>,
+    kind: FlowMessageKind,
+    recipients: Vec<String>,
+    body: String,
+    #[serde(default = "default_requires_ack")]
+    requires_ack: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct AuthorizeFlightInput {
     agent: String,
     executor: ExecutorKind,
@@ -167,9 +184,15 @@ fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAu
         .route("/api/v1/me", get(me))
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/inbox", get(inbox))
+        .route("/api/v1/messages", get(message_inbox))
+        .route("/api/v1/messages/{id}/ack", post(acknowledge_message))
         .route("/api/v1/escalations", get(escalations))
         .route("/api/v1/escalations/{id}/ack", post(ack_escalation))
         .route("/api/v1/flows/{id}/approve", post(approve_flow))
+        .route(
+            "/api/v1/flows/{id}/messages",
+            get(flow_messages).post(post_message),
+        )
         .route("/api/v1/tasks/{id}/accept", post(accept_task))
         .route("/api/v1/tasks/{id}/start", post(start_task))
         .route("/api/v1/tasks/{id}/heartbeat", post(heartbeat_task))
@@ -262,6 +285,57 @@ async fn inbox(
         })
         .collect();
     Ok(Json(items))
+}
+
+async fn message_inbox(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<MessageInboxQuery>,
+) -> ApiResult<Json<Vec<MessageInboxItem>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.message_inbox(&principal.id, query.all)?))
+}
+
+async fn flow_messages(
+    State(state): State<ApiState>,
+    Path(flow_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<FlowMessage>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.flow_messages(&flow_id, &principal.id)?))
+}
+
+async fn post_message(
+    State(state): State<ApiState>,
+    Path(flow_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<PostMessageInput>,
+) -> ApiResult<Json<FlowMessage>> {
+    mutate(&state, &headers, |app, actor| {
+        app.post_flow_message(
+            &flow_id,
+            input.task_id.as_deref(),
+            actor,
+            input.kind,
+            &input.recipients,
+            &input.body,
+            input.requires_ack,
+        )
+    })
+    .await
+}
+
+async fn acknowledge_message(
+    State(state): State<ApiState>,
+    Path(message_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<FlowMessage>> {
+    mutate(&state, &headers, |app, actor| {
+        app.acknowledge_flow_message(&message_id, actor)
+    })
+    .await
 }
 
 async fn escalations(
@@ -557,6 +631,10 @@ fn default_lease_ttl_seconds() -> u64 {
     3_600
 }
 
+fn default_requires_ack() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::{Body, to_bytes};
@@ -687,6 +765,64 @@ mod tests {
                 .status,
             crate::domain::TaskStatus::Accepted
         );
+
+        let sent = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                &format!("/api/v1/flows/{}/messages", flow.id),
+                &issued.token,
+                json!({
+                    "task_id": task_id,
+                    "kind": "command",
+                    "recipients": [observer.name],
+                    "body": "Confirm the release window",
+                    "requires_ack": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(sent.status(), StatusCode::OK);
+        let body = to_bytes(sent.into_body(), usize::MAX).await.unwrap();
+        let message: FlowMessage = serde_json::from_slice(&body).unwrap();
+
+        let messages = service
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/messages",
+                &observer_token.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(messages.status(), StatusCode::OK);
+        let body = to_bytes(messages.into_body(), usize::MAX).await.unwrap();
+        let messages: Vec<MessageInboxItem> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].needs_acknowledgement());
+
+        let acknowledged = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/messages/{}/ack", message.id),
+                &observer_token.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(acknowledged.status(), StatusCode::OK);
+        let messages = service
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/messages",
+                &observer_token.token,
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(messages.into_body(), usize::MAX).await.unwrap();
+        let messages: Vec<MessageInboxItem> = serde_json::from_slice(&body).unwrap();
+        assert!(messages.is_empty());
 
         app.lock()
             .await
