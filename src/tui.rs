@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 use crate::MambaApp;
 use crate::dashboard::{ActionPriority, FlowHealth, build_dashboard};
 use crate::domain::{
-    AttentionSeverity, ExecutorMode, FlightLeaseStatus, Flow, FlowMessageKind, FlowStatus,
-    MessageInboxItem, PrincipalKind, Task, TaskStatus, TrackingEscalation,
+    AssignmentTarget, AttentionSeverity, ExecutorMode, FlightLeaseStatus, Flow, FlowMessageKind,
+    FlowStatus, MessageInboxItem, PrincipalKind, Task, TaskStatus, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -154,6 +154,8 @@ enum MouseAction {
     Block,
     Complete,
     SendMessage,
+    NegotiateEstimate,
+    Reassign,
     ScanTracker,
     AcknowledgeEscalation,
     CycleActor,
@@ -162,6 +164,7 @@ enum MouseAction {
     ConfirmModal,
     CancelModal,
     SelectPlanner(PlannerKind),
+    SelectAssignee(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +199,15 @@ enum InputPurpose {
         recipients: Vec<String>,
         kind: FlowMessageKind,
         requires_ack: bool,
+    },
+    Negotiate {
+        task_id: String,
+        current_hours: f64,
+    },
+    Reassign {
+        task_id: String,
+        candidates: Vec<AssignmentTarget>,
+        selected: usize,
     },
     Run {
         task_id: String,
@@ -386,6 +398,8 @@ impl UiState {
             KeyCode::Char('e') => self.open_task_input(app, true),
             KeyCode::Char('b') => self.open_task_input(app, false),
             KeyCode::Char('m') => self.open_message_input(app),
+            KeyCode::Char('i') => self.open_estimate_input(app),
+            KeyCode::Char('v') => self.open_reassign_input(app),
             KeyCode::Char('p') => self.open_run_confirmation(app, ExecutorMode::Plan),
             KeyCode::Char('x') => self.open_run_confirmation(app, ExecutorMode::Execute),
             KeyCode::Char('t') => self.scan_tracker(app, true),
@@ -413,6 +427,15 @@ impl UiState {
                     Some(HitTarget::Action(MouseAction::CancelModal)) => self.modal = None,
                     Some(HitTarget::Action(MouseAction::SelectPlanner(planner))) => {
                         self.demand_planner = planner;
+                    }
+                    Some(HitTarget::Action(MouseAction::SelectAssignee(index))) => {
+                        if let Some(InputModal {
+                            purpose: InputPurpose::Reassign { selected, .. },
+                            ..
+                        }) = &mut self.modal
+                        {
+                            *selected = index;
+                        }
                     }
                     _ => {}
                 }
@@ -486,6 +509,8 @@ impl UiState {
             MouseAction::Block => self.open_task_input(app, false),
             MouseAction::Complete => self.complete_task(app),
             MouseAction::SendMessage => self.open_message_input(app),
+            MouseAction::NegotiateEstimate => self.open_estimate_input(app),
+            MouseAction::Reassign => self.open_reassign_input(app),
             MouseAction::ScanTracker => self.scan_tracker(app, true),
             MouseAction::AcknowledgeEscalation => self.acknowledge_next_inbox(app),
             MouseAction::CycleActor => self.cycle_actor(app),
@@ -494,6 +519,7 @@ impl UiState {
             MouseAction::ConfirmModal => self.submit_modal(app).await,
             MouseAction::CancelModal => self.modal = None,
             MouseAction::SelectPlanner(planner) => self.demand_planner = planner,
+            MouseAction::SelectAssignee(_) => {}
         }
         Ok(false)
     }
@@ -530,6 +556,21 @@ impl UiState {
                     .is_some_and(|modal| matches!(&modal.purpose, InputPurpose::Demand)) =>
             {
                 self.demand_planner = next_planner(self.demand_planner);
+            }
+            KeyCode::Tab => {
+                if let Some(InputModal {
+                    purpose:
+                        InputPurpose::Reassign {
+                            candidates,
+                            selected,
+                            ..
+                        },
+                    ..
+                }) = &mut self.modal
+                    && !candidates.is_empty()
+                {
+                    *selected = (*selected + 1) % candidates.len();
+                }
             }
             KeyCode::Backspace => {
                 if let Some(modal) = &mut self.modal {
@@ -620,6 +661,35 @@ impl UiState {
                             .map(|recipient| recipient.name.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
+                    )
+                }),
+            InputPurpose::Negotiate { task_id, .. } => value
+                .parse::<f64>()
+                .map_err(|_| MambaError::Validation("工时必须是数字".into()))
+                .and_then(|hours| app.negotiate_task(&task_id, &actor, hours))
+                .map(|task| {
+                    format!(
+                        "{} 调整为 {:.1}h；整条 Flow 已重新排期",
+                        task.id, task.estimate.effort_hours
+                    )
+                }),
+            InputPurpose::Reassign {
+                task_id,
+                candidates,
+                selected,
+            } => candidates
+                .get(selected)
+                .ok_or_else(|| MambaError::Validation("没有可用的换防候选人".into()))
+                .and_then(|target| app.reassign_task(&task_id, &actor, &target.id, &[], value))
+                .map(|flow| {
+                    let task = flow
+                        .task(&task_id)
+                        .expect("reassigned task remains in flow");
+                    format!(
+                        "{} 已换防给 {}；P80 {}",
+                        task.id,
+                        task.assignment.as_ref().unwrap().owner.name,
+                        flow.p80_finish.format("%m-%d %H:%M")
                     )
                 }),
             InputPurpose::Run { .. } => unreachable!(),
@@ -997,6 +1067,47 @@ impl UiState {
             },
             value: String::new(),
         });
+    }
+
+    fn open_estimate_input(&mut self, app: &MambaApp) {
+        let Some((_, task)) = self.selected_task_context(app) else {
+            self.failure(MambaError::Validation("请先选择一个任务再调整工时".into()));
+            return;
+        };
+        self.modal = Some(InputModal {
+            purpose: InputPurpose::Negotiate {
+                task_id: task.id.clone(),
+                current_hours: task.estimate.effort_hours,
+            },
+            value: String::new(),
+        });
+    }
+
+    fn open_reassign_input(&mut self, app: &MambaApp) {
+        let Some(actor) = self.actor_name(app) else {
+            self.failure(MambaError::Validation("没有可用的 Human 操作人".into()));
+            return;
+        };
+        let Some((_, task)) = self.selected_task_context(app) else {
+            self.failure(MambaError::Validation("请先选择一个任务再换防".into()));
+            return;
+        };
+        match app.reassignment_candidates(&task.id, actor) {
+            Ok(candidates) if !candidates.is_empty() => {
+                self.modal = Some(InputModal {
+                    purpose: InputPurpose::Reassign {
+                        task_id: task.id.clone(),
+                        candidates,
+                        selected: 0,
+                    },
+                    value: String::new(),
+                });
+            }
+            Ok(_) => self.failure(MambaError::Validation(
+                "当前没有满足能力约束的换防候选人".into(),
+            )),
+            Err(error) => self.failure(error),
+        }
     }
 
     fn open_task_input(&mut self, app: &MambaApp, evidence: bool) {
@@ -2065,7 +2176,6 @@ fn render_task_detail(frame: &mut Frame, task: Option<&Task>, area: Rect) {
     let mut lines = vec![
         Line::styled(task.title.clone(), Style::new().fg(TEXT).bold()),
         Line::styled(task.description.clone(), Style::new().fg(MUTED)),
-        Line::raw(""),
         Line::from(vec![
             Span::styled("副驾  ", Style::new().fg(MUTED)),
             Span::styled(copilots, Style::new().fg(CYAN)),
@@ -2074,6 +2184,18 @@ fn render_task_detail(frame: &mut Frame, task: Option<&Task>, area: Rect) {
             Span::styled("    Artifacts  ", Style::new().fg(MUTED)),
             Span::styled(
                 task.external_artifacts.len().to_string(),
+                Style::new().fg(CYAN),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("计划  ", Style::new().fg(MUTED)),
+            Span::styled(
+                format!(
+                    "基础 {:.1}h · 起始 {} · P80 {}",
+                    task.estimate.effort_hours,
+                    task.estimate.earliest_start.format("%m-%d %H:%M"),
+                    task.estimate.p80_finish.format("%m-%d %H:%M")
+                ),
                 Style::new().fg(CYAN),
             ),
         ]),
@@ -2452,6 +2574,8 @@ fn render_shortcuts(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area
             ("批准/接单", MouseAction::ApproveOrAccept),
             ("推进", MouseAction::Advance),
             ("传球", MouseAction::SendMessage),
+            ("调时", MouseAction::NegotiateEstimate),
+            ("换防", MouseAction::Reassign),
             ("规划", MouseAction::Plan),
             ("执行", MouseAction::Execute),
         ],
@@ -2459,6 +2583,8 @@ fn render_shortcuts(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area
             ("接单", MouseAction::ApproveOrAccept),
             ("收到", MouseAction::AcknowledgeEscalation),
             ("传球", MouseAction::SendMessage),
+            ("调时", MouseAction::NegotiateEstimate),
+            ("换防", MouseAction::Reassign),
             ("推进", MouseAction::Advance),
             ("规划", MouseAction::Plan),
             ("执行", MouseAction::Execute),
@@ -2507,7 +2633,9 @@ fn render_shortcuts(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area
 
 fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState) {
     let is_demand = matches!(&modal.purpose, InputPurpose::Demand);
-    let area = centered(frame.area(), 72, if is_demand { 11 } else { 9 });
+    let is_reassign = matches!(&modal.purpose, InputPurpose::Reassign { .. });
+    let has_selector = is_demand || is_reassign;
+    let area = centered(frame.area(), 72, if has_selector { 11 } else { 9 });
     frame.render_widget(Clear, area);
     let (title, prompt, color): (&str, String, Color) = match &modal.purpose {
         InputPurpose::Demand => (
@@ -2534,6 +2662,29 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
             ),
             GOLD,
         ),
+        InputPurpose::Negotiate { current_hours, .. } => (
+            "FLIGHT PLAN / 动态调时",
+            format!(
+                "当前基础工时 {:.1}h；输入新工时后同步重算下游窗口与关键路径",
+                current_hours
+            ),
+            CYAN,
+        ),
+        InputPurpose::Reassign {
+            candidates,
+            selected,
+            ..
+        } => (
+            "LINEUP / 任务换防",
+            format!(
+                "换防给 {}；输入原因，Tab 或点击切换候选人",
+                candidates
+                    .get(*selected)
+                    .map(|target| target.name.as_str())
+                    .unwrap_or("无候选人")
+            ),
+            ORANGE,
+        ),
         InputPurpose::Run { mode, .. } => (
             "FLIGHT CLEARANCE / 航班放行",
             match mode {
@@ -2550,8 +2701,8 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
             },
         ),
     };
-    let (hint, planner_area, input, footer) = if is_demand {
-        let [hint, planner, input, footer] = Layout::vertical([
+    let (hint, selector_area, input, footer) = if has_selector {
+        let [hint, selector, input, footer] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(3),
@@ -2559,7 +2710,7 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
         ])
         .margin(1)
         .areas(area);
-        (hint, Some(planner), input, footer)
+        (hint, Some(selector), input, footer)
     } else {
         let [hint, input, footer] = Layout::vertical([
             Constraint::Length(2),
@@ -2582,8 +2733,12 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
         area,
     );
     frame.render_widget(Paragraph::new(prompt).style(Style::new().fg(MUTED)), hint);
-    if let Some(planner_area) = planner_area {
-        render_planner_selector(frame, planner_area, state);
+    if let Some(selector_area) = selector_area {
+        if is_demand {
+            render_planner_selector(frame, selector_area, state);
+        } else {
+            render_assignee_selector(frame, selector_area, modal, state);
+        }
     }
     let visible = format!("{}█", modal.value);
     frame.render_widget(
@@ -2612,6 +2767,39 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
             .style(Style::new().fg(TEXT).bg(PANEL_ALT))
             .alignment(Alignment::Center),
         cancel,
+    );
+}
+
+fn render_assignee_selector(
+    frame: &mut Frame,
+    area: Rect,
+    modal: &InputModal,
+    state: &mut UiState,
+) {
+    let InputPurpose::Reassign {
+        candidates,
+        selected,
+        ..
+    } = &modal.purpose
+    else {
+        return;
+    };
+    let Some(target) = candidates.get(*selected) else {
+        return;
+    };
+    let next = (*selected + 1) % candidates.len();
+    state.register_hit(area, HitTarget::Action(MouseAction::SelectAssignee(next)));
+    frame.render_widget(
+        Paragraph::new(format!(
+            "[ {} · {} · {}/{} ]",
+            target.name,
+            target_kind_label(&target.kind),
+            selected + 1,
+            candidates.len()
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::new().fg(BG).bg(ORANGE).bold()),
+        area,
     );
 }
 
@@ -2644,7 +2832,7 @@ fn render_planner_selector(frame: &mut Frame, area: Rect, state: &mut UiState) {
 }
 
 fn render_help_modal(frame: &mut Frame) {
-    let area = centered(frame.area(), 78, 29);
+    let area = centered(frame.area(), 78, 32);
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::styled("塔台操作手册", Style::new().fg(GOLD).bold()),
@@ -2661,6 +2849,8 @@ fn render_help_modal(frame: &mut Frame) {
         help_line("t", "立即巡航扫描 Todo 风险；后台每 30 秒自动扫描"),
         help_line("g", "确认当前 Inbox 中首个 Flow 指令或 Tower Call"),
         help_line("m", "围绕当前任务向 Owner、Copilot 或 Requester 传球"),
+        help_line("i", "协商当前任务基础工时并动态重排整条 DAG"),
+        help_line("v", "Requester 为当前任务选择新 Owner 并重新排期"),
         help_line("a", "批准 Flow，或接受当前 Assignment"),
         help_line("s", "按状态接单、开工或提交验收"),
         help_line("e", "为当前任务补充 Evidence"),
@@ -2794,6 +2984,8 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::Execute => ORANGE,
         MouseAction::Evidence | MouseAction::Complete => GREEN,
         MouseAction::SendMessage => GOLD,
+        MouseAction::NegotiateEstimate => CYAN,
+        MouseAction::Reassign => ORANGE,
         MouseAction::Block | MouseAction::Quit => RED,
         MouseAction::ScanTracker => ORANGE,
         MouseAction::AcknowledgeEscalation => GOLD,
@@ -2801,6 +2993,7 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::ConfirmModal => GREEN,
         MouseAction::CancelModal => MUTED,
         MouseAction::SelectPlanner(planner) => planner_color(planner),
+        MouseAction::SelectAssignee(_) => ORANGE,
     }
 }
 
@@ -2982,6 +3175,14 @@ fn task_status_label(status: &TaskStatus) -> &'static str {
         TaskStatus::Completed => "LANDED",
         TaskStatus::Rejected => "REJECTED",
         TaskStatus::Cancelled => "ABORTED",
+    }
+}
+
+fn target_kind_label(kind: &crate::domain::TargetKind) -> &'static str {
+    match kind {
+        crate::domain::TargetKind::Human => "HUMAN",
+        crate::domain::TargetKind::Agent => "AGENT",
+        crate::domain::TargetKind::Team => "TEAM",
     }
 }
 
@@ -3505,6 +3706,173 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("RECEIVED"));
+    }
+
+    #[tokio::test]
+    async fn tui_reassigns_and_reschedules_a_task_from_mouse_controls() {
+        let directory = tempdir().unwrap();
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Mamba Labs", "admin").unwrap();
+        let team = app
+            .create_team(
+                "Platform",
+                "product,backend,llm-platform,security,quality,observability,operations",
+                "admin",
+            )
+            .unwrap();
+        let manager = app
+            .register_principal(
+                "Manager",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,llm-platform,operations",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        app.register_principal(
+            "Fast Engineer",
+            PrincipalKind::Human,
+            Some(&team.id),
+            None,
+            "backend,llm-platform,security,quality,observability",
+            100,
+            None,
+            "admin",
+        )
+        .unwrap();
+        let slow = app
+            .register_principal(
+                "Slow Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "backend,llm-platform",
+                25,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Build an LLM Gateway this week",
+                &manager.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        app.approve_flow(&flow.id, &manager.name).unwrap();
+        let gateway_index = flow
+            .tasks
+            .iter()
+            .position(|task| task.key == "gateway-core")
+            .unwrap();
+        let gateway_id = flow.tasks[gateway_index].id.clone();
+        let old_downstream_start = flow.task("observability").unwrap().estimate.earliest_start;
+        let mut state = UiState::new(
+            &app,
+            TuiOptions {
+                workspace: directory.path().to_path_buf(),
+                actor: Some(manager.name.clone()),
+            },
+        );
+        state.view = View::Flows;
+        state.focus_tasks = true;
+        state.flow_index = flow_ids(&app)
+            .iter()
+            .position(|flow_id| flow_id == &flow.id)
+            .unwrap();
+        state.task_index = gateway_index;
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let reassign = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::Reassign))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(reassign))
+            .await
+            .unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let next_candidate = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::SelectAssignee(1)))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(next_candidate))
+            .await
+            .unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let first_candidate = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::SelectAssignee(0)))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(first_candidate))
+            .await
+            .unwrap();
+        let Some(modal) = &mut state.modal else {
+            panic!("reassignment modal should open");
+        };
+        let InputPurpose::Reassign {
+            candidates,
+            selected,
+            ..
+        } = &modal.purpose
+        else {
+            panic!("expected reassignment modal");
+        };
+        assert_eq!(candidates[*selected].name, slow.name);
+        modal.value = "Fast Engineer is handling an incident".into();
+        state.submit_modal(&mut app).await;
+        assert_eq!(
+            app.state()
+                .find_task(&gateway_id)
+                .unwrap()
+                .1
+                .assignment
+                .as_ref()
+                .unwrap()
+                .owner
+                .id,
+            slow.id
+        );
+
+        state.actor_id = Some(slow.id.clone());
+        state.open_estimate_input(&app);
+        state.modal.as_mut().unwrap().value = "40".into();
+        state.submit_modal(&mut app).await;
+        let updated = app.state().flow(&flow.id).unwrap();
+        assert_eq!(
+            updated.task(&gateway_id).unwrap().estimate.effort_hours,
+            40.0
+        );
+        assert!(
+            updated
+                .task("observability")
+                .unwrap()
+                .estimate
+                .earliest_start
+                > old_downstream_start
+        );
+        assert!(state.message.contains("重新排期"));
     }
 
     #[cfg(unix)]

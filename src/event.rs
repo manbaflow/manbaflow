@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    ApiCredential, AttentionKind, Demand, Estimate, Evidence, ExecutionRecord, ExternalArtifact,
-    FlightLease, Flow, FlowMessage, MessageAcknowledgement, Organization, Principal,
-    RemoteFlightReport, Team, TrackingAttention, TrackingEscalation,
+    ApiCredential, Assignment, AttentionKind, Demand, Estimate, Evidence, ExecutionRecord,
+    ExternalArtifact, FlightLease, Flow, FlowMessage, FlowScheduleRevision, MessageAcknowledgement,
+    Organization, Principal, RemoteFlightReport, Team, TrackingAttention, TrackingEscalation,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -68,6 +68,19 @@ pub enum DomainEvent {
         task_id: String,
         negotiated_by: String,
         estimate: Estimate,
+    },
+    TaskReassigned {
+        flow_id: String,
+        task_id: String,
+        previous_assignment: Option<Assignment>,
+        assignment: Assignment,
+        reassigned_by: String,
+        reason: String,
+        at: DateTime<Utc>,
+    },
+    FlowRescheduled {
+        flow_id: String,
+        revision: FlowScheduleRevision,
     },
     TaskStarted {
         flow_id: String,
@@ -215,6 +228,8 @@ impl DomainEvent {
             Self::TaskAccepted { .. } => "task.accepted",
             Self::TaskRejected { .. } => "task.rejected",
             Self::TaskEstimateNegotiated { .. } => "task.estimate_negotiated",
+            Self::TaskReassigned { .. } => "task.reassigned",
+            Self::FlowRescheduled { .. } => "flow.rescheduled",
             Self::TaskStarted { .. } => "task.started",
             Self::TaskHeartbeat { .. } => "task.heartbeat",
             Self::TaskBlocked { .. } => "task.blocked",
@@ -250,6 +265,8 @@ impl DomainEvent {
             | Self::TaskAccepted { flow_id, .. }
             | Self::TaskRejected { flow_id, .. }
             | Self::TaskEstimateNegotiated { flow_id, .. }
+            | Self::TaskReassigned { flow_id, .. }
+            | Self::FlowRescheduled { flow_id, .. }
             | Self::TaskStarted { flow_id, .. }
             | Self::TaskHeartbeat { flow_id, .. }
             | Self::TaskBlocked { flow_id, .. }

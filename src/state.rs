@@ -193,6 +193,44 @@ impl OrganizationState {
                 self.task_mut(flow_id, task_id)?.estimate = estimate.clone();
                 self.refresh_flow_finish(flow_id)?;
             }
+            DomainEvent::TaskReassigned {
+                flow_id,
+                task_id,
+                previous_assignment,
+                assignment,
+                ..
+            } => {
+                let task = self.task_mut(flow_id, task_id)?;
+                if task.assignment.as_ref() != previous_assignment.as_ref() {
+                    return Err(MambaError::Validation(format!(
+                        "task {task_id} reassignment does not match its previous owner"
+                    )));
+                }
+                task.assignment = Some(assignment.clone());
+                task.status = TaskStatus::Assigned;
+                task.blocker = None;
+                task.last_heartbeat = None;
+            }
+            DomainEvent::FlowRescheduled { flow_id, revision } => {
+                let flow = self.flow_mut(flow_id)?;
+                for task in &mut flow.tasks {
+                    let estimate = revision.task_estimates.get(&task.id).ok_or_else(|| {
+                        MambaError::Validation(format!(
+                            "flow schedule revision has no estimate for task {}",
+                            task.id
+                        ))
+                    })?;
+                    task.estimate = estimate.clone();
+                }
+                if revision.task_estimates.len() != flow.tasks.len() {
+                    return Err(MambaError::Validation(format!(
+                        "flow schedule revision for {flow_id} has unexpected tasks"
+                    )));
+                }
+                flow.p50_finish = revision.p50_finish;
+                flow.p80_finish = revision.p80_finish;
+                flow.critical_path = revision.critical_path.clone();
+            }
             DomainEvent::TaskStarted {
                 flow_id,
                 task_id,

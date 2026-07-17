@@ -8,19 +8,20 @@ use uuid::Uuid;
 
 use crate::dashboard::{DashboardSnapshot, build_dashboard};
 use crate::domain::{
-    ApiCredential, AttentionSeverity, Demand, Evidence, ExecutionRecord, ExecutorConfig,
-    ExecutorKind, ExecutorMode, ExternalArtifact, FlightLease, FlightLeaseStatus, Flow,
-    FlowMessage, FlowMessageKind, FlowStatus, IssuedCredential, MessageAcknowledgement,
-    MessageInboxItem, Organization, Principal, PrincipalKind, RemoteFlightReport, TargetKind, Task,
-    TaskStatus, Team, TrackingAttention, TrackingEscalation, TrackingScan,
+    ApiCredential, Assignment, AssignmentTarget, AttentionSeverity, Demand, Evidence,
+    ExecutionRecord, ExecutorConfig, ExecutorKind, ExecutorMode, ExternalArtifact, FlightLease,
+    FlightLeaseStatus, Flow, FlowMessage, FlowMessageKind, FlowScheduleRevision, FlowStatus,
+    IssuedCredential, MessageAcknowledgement, MessageInboxItem, Organization, Principal,
+    PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskStatus, Team, TrackingAttention,
+    TrackingEscalation, TrackingScan,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
-use crate::ids::{new_id, parse_capabilities};
+use crate::ids::{new_id, normalize_capability, parse_capabilities};
 use crate::matcher::Matcher;
 use crate::planner::{PlannerKind, generate_plan};
-use crate::scheduler::schedule;
+use crate::scheduler::{reschedule, schedule};
 use crate::state::OrganizationState;
 use crate::store::EventStore;
 use crate::tracker;
@@ -1040,9 +1041,9 @@ impl MambaApp {
         actor: &str,
         effort_hours: f64,
     ) -> Result<Task> {
-        if !effort_hours.is_finite() || effort_hours <= 0.0 {
+        if !effort_hours.is_finite() || effort_hours <= 0.0 || effort_hours > 100_000.0 {
             return Err(MambaError::Validation(
-                "estimate must be greater than zero".into(),
+                "estimate must be greater than zero and at most 100000 hours".into(),
             ));
         }
         let (flow, task) = self.task_snapshot(task_id)?;
@@ -1051,32 +1052,236 @@ impl MambaApp {
             &[
                 TaskStatus::Assigned,
                 TaskStatus::Accepted,
+                TaskStatus::InProgress,
                 TaskStatus::Blocked,
             ],
         )?;
         self.ensure_task_actor(&task, actor)?;
-        let mut estimate = task.estimate.clone();
-        let ratio_p50 = estimate.p50_hours / estimate.effort_hours.max(0.1);
-        let ratio_p80 = estimate.p80_hours / estimate.effort_hours.max(0.1);
-        estimate.effort_hours = effort_hours;
-        estimate.p50_hours = round_hours(effort_hours * ratio_p50);
-        estimate.p80_hours = round_hours(effort_hours * ratio_p80);
-        estimate.p50_finish = estimate.earliest_start + hours(estimate.p50_hours);
-        estimate.p80_finish = estimate.earliest_start + hours(estimate.p80_hours);
-        estimate.confidence = "negotiated".into();
-        estimate.rationale.push(format!(
-            "{actor} negotiated base effort to {effort_hours:.1}h"
-        ));
+        let now = Utc::now();
+        let mut updated_flow = flow.clone();
+        updated_flow
+            .task_mut(&task.id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "task",
+                id: task.id.clone(),
+            })?
+            .estimate
+            .effort_hours = effort_hours;
+        let scheduled = reschedule(&updated_flow, &self.state, now)?;
+        let estimate = scheduled.task_estimates[&task.id].clone();
+        let revision = FlowScheduleRevision {
+            task_estimates: scheduled.task_estimates,
+            p50_finish: scheduled.p50_finish,
+            p80_finish: scheduled.p80_finish,
+            critical_path: scheduled.critical_path,
+            reason: format!("{actor} negotiated {} to {effort_hours:.1}h", task.id),
+            revised_by: actor.to_string(),
+            revised_at: now,
+        };
         self.commit(
             actor,
-            vec![DomainEvent::TaskEstimateNegotiated {
-                flow_id: flow.id,
-                task_id: task.id.clone(),
-                negotiated_by: actor.to_string(),
-                estimate,
-            }],
+            vec![
+                DomainEvent::TaskEstimateNegotiated {
+                    flow_id: flow.id.clone(),
+                    task_id: task.id.clone(),
+                    negotiated_by: actor.to_string(),
+                    estimate,
+                },
+                DomainEvent::FlowRescheduled {
+                    flow_id: flow.id,
+                    revision,
+                },
+            ],
         )?;
         Ok(self.state.find_task(&task.id)?.1.clone())
+    }
+
+    pub fn reassignment_candidates(
+        &self,
+        task_id: &str,
+        actor: &str,
+    ) -> Result<Vec<AssignmentTarget>> {
+        let principal = self.state.principal(actor)?;
+        if principal.kind != PrincipalKind::Human {
+            return Err(MambaError::PermissionDenied(
+                "task reassignment requires a human requester".into(),
+            ));
+        }
+        let (flow, task) = self.state.find_task(task_id)?;
+        if !matches!(flow.status, FlowStatus::Approved | FlowStatus::Active) {
+            return Err(MambaError::InvalidTransition(format!(
+                "flow {} is {:?}; only an approved or active flow can be reassigned",
+                flow.id, flow.status
+            )));
+        }
+        if flow.demand.requester != principal.id && flow.demand.requester != principal.name {
+            return Err(MambaError::PermissionDenied(format!(
+                "only demand requester {} can reassign task {}",
+                flow.demand.requester, task.id
+            )));
+        }
+        ensure_status(
+            task,
+            &[
+                TaskStatus::Assigned,
+                TaskStatus::Accepted,
+                TaskStatus::InProgress,
+                TaskStatus::Blocked,
+                TaskStatus::Rejected,
+            ],
+        )?;
+        let current_owner = task
+            .assignment
+            .as_ref()
+            .map(|assignment| &assignment.owner.id);
+        let mut candidates = self
+            .state
+            .principals
+            .values()
+            .filter(|candidate| candidate.active)
+            .filter(|candidate| !task.requires_human || candidate.kind == PrincipalKind::Human)
+            .filter(|candidate| {
+                capabilities_cover(&task.required_capabilities, &candidate.capabilities)
+            })
+            .map(target_for_principal)
+            .chain(
+                self.state
+                    .teams
+                    .values()
+                    .filter(|team| team.active)
+                    .filter(|team| {
+                        capabilities_cover(&task.required_capabilities, &team.capabilities)
+                    })
+                    .filter(|team| {
+                        !task.requires_human
+                            || self.state.principals.values().any(|candidate| {
+                                candidate.active
+                                    && candidate.kind == PrincipalKind::Human
+                                    && candidate.team_id.as_deref() == Some(team.id.as_str())
+                            })
+                    })
+                    .map(|team| AssignmentTarget {
+                        kind: TargetKind::Team,
+                        id: team.id.clone(),
+                        name: team.name.clone(),
+                    }),
+            )
+            .filter(|target| current_owner != Some(&target.id))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            target_kind_rank(&left.kind)
+                .cmp(&target_kind_rank(&right.kind))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(candidates)
+    }
+
+    pub fn reassign_task(
+        &mut self,
+        task_id: &str,
+        actor: &str,
+        new_owner: &str,
+        copilots: &[String],
+        reason: &str,
+    ) -> Result<Flow> {
+        let reason = reason.trim();
+        if reason.is_empty() || reason.chars().count() > 1_000 {
+            return Err(MambaError::Validation(
+                "reassignment reason must contain 1 to 1000 characters".into(),
+            ));
+        }
+        let candidates = self.reassignment_candidates(task_id, actor)?;
+        let owner = candidates
+            .into_iter()
+            .find(|candidate| {
+                candidate.id == new_owner || candidate.name.eq_ignore_ascii_case(new_owner)
+            })
+            .ok_or_else(|| {
+                MambaError::Validation(format!(
+                    "{new_owner} is not an eligible reassignment target for task {task_id}"
+                ))
+            })?;
+        let (flow, task) = self.task_snapshot(task_id)?;
+        let now = Utc::now();
+        if self.state.flight_leases.values().any(|lease| {
+            lease.task_id == task.id
+                && (lease.status == FlightLeaseStatus::Active || lease.is_claimable_at(now))
+        }) {
+            return Err(MambaError::InvalidTransition(format!(
+                "task {} has an open flight lease; revoke or finish it before reassignment",
+                task.id
+            )));
+        }
+        let mut resolved_copilots = Vec::new();
+        let mut seen = BTreeSet::new();
+        for value in copilots {
+            let target = self.resolve_active_target(value)?;
+            if target.id == owner.id {
+                return Err(MambaError::Validation(
+                    "task owner cannot also be a copilot".into(),
+                ));
+            }
+            if seen.insert(target.id.clone()) {
+                resolved_copilots.push(target);
+            }
+        }
+        if resolved_copilots.is_empty() {
+            resolved_copilots = self.default_copilots_for(&owner);
+        }
+        let assignment = Assignment {
+            owner: owner.clone(),
+            copilots: resolved_copilots,
+            score: 100.0,
+            rationale: vec![
+                format!("manual reassignment by {actor}"),
+                format!("reason: {reason}"),
+            ],
+        };
+        let mut updated_flow = flow.clone();
+        let updated_task = updated_flow
+            .task_mut(&task.id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "task",
+                id: task.id.clone(),
+            })?;
+        updated_task.assignment = Some(assignment.clone());
+        updated_task.status = TaskStatus::Assigned;
+        updated_task.blocker = None;
+        updated_task.last_heartbeat = None;
+        let scheduled = reschedule(&updated_flow, &self.state, now)?;
+        let revision = FlowScheduleRevision {
+            task_estimates: scheduled.task_estimates,
+            p50_finish: scheduled.p50_finish,
+            p80_finish: scheduled.p80_finish,
+            critical_path: scheduled.critical_path,
+            reason: format!("{} reassigned to {}: {reason}", task.id, owner.name),
+            revised_by: actor.to_string(),
+            revised_at: now,
+        };
+        self.commit(
+            actor,
+            vec![
+                DomainEvent::TaskReassigned {
+                    flow_id: flow.id.clone(),
+                    task_id: task.id.clone(),
+                    previous_assignment: task.assignment,
+                    assignment,
+                    reassigned_by: actor.to_string(),
+                    reason: reason.to_string(),
+                    at: now,
+                },
+                DomainEvent::WorkRequestSent {
+                    flow_id: flow.id.clone(),
+                    task_id: task.id,
+                    target_id: owner.id,
+                },
+                DomainEvent::FlowRescheduled {
+                    flow_id: flow.id.clone(),
+                    revision,
+                },
+            ],
+        )?;
+        Ok(self.state.flow(&flow.id)?.clone())
     }
 
     pub fn start_task(&mut self, task_id: &str, actor: &str) -> Result<Task> {
@@ -1889,6 +2094,60 @@ impl MambaApp {
             })
     }
 
+    fn resolve_active_target(&self, value: &str) -> Result<AssignmentTarget> {
+        if let Ok(principal) = self.state.principal(value) {
+            if !principal.active {
+                return Err(MambaError::Validation(format!(
+                    "principal {} is inactive",
+                    principal.name
+                )));
+            }
+            return Ok(target_for_principal(principal));
+        }
+        let team = self.state.team(value)?;
+        if !team.active {
+            return Err(MambaError::Validation(format!(
+                "team {} is inactive",
+                team.name
+            )));
+        }
+        Ok(AssignmentTarget {
+            kind: TargetKind::Team,
+            id: team.id.clone(),
+            name: team.name.clone(),
+        })
+    }
+
+    fn default_copilots_for(&self, owner: &AssignmentTarget) -> Vec<AssignmentTarget> {
+        let mut copilots = match owner.kind {
+            TargetKind::Human => self
+                .state
+                .principals
+                .values()
+                .filter(|principal| {
+                    principal.active
+                        && principal.kind == PrincipalKind::Agent
+                        && principal.owner_id.as_deref() == Some(owner.id.as_str())
+                })
+                .map(target_for_principal)
+                .collect::<Vec<_>>(),
+            TargetKind::Agent => self
+                .state
+                .principals
+                .get(&owner.id)
+                .and_then(|agent| agent.owner_id.as_deref())
+                .and_then(|owner_id| self.state.principals.get(owner_id))
+                .filter(|principal| principal.active)
+                .map(target_for_principal)
+                .into_iter()
+                .collect(),
+            TargetKind::Team => Vec::new(),
+        };
+        copilots.sort_by(|left, right| left.name.cmp(&right.name));
+        copilots.truncate(2);
+        copilots
+    }
+
     fn principal_has_flow_access(&self, flow: &Flow, principal: &Principal) -> bool {
         self.principal_is_flow_participant(flow, principal)
             || self.state.messages.values().any(|message| {
@@ -2047,6 +2306,36 @@ fn ensure_status(task: &Task, expected: &[TaskStatus]) -> Result<()> {
     }
 }
 
+fn target_for_principal(principal: &Principal) -> AssignmentTarget {
+    AssignmentTarget {
+        kind: match principal.kind {
+            PrincipalKind::Human => TargetKind::Human,
+            PrincipalKind::Agent => TargetKind::Agent,
+        },
+        id: principal.id.clone(),
+        name: principal.name.clone(),
+    }
+}
+
+fn capabilities_cover(required: &[String], actual: &[String]) -> bool {
+    let actual = actual
+        .iter()
+        .map(|capability| normalize_capability(capability))
+        .collect::<BTreeSet<_>>();
+    required
+        .iter()
+        .map(|capability| normalize_capability(capability))
+        .all(|capability| actual.contains(&capability))
+}
+
+fn target_kind_rank(kind: &TargetKind) -> u8 {
+    match kind {
+        TargetKind::Human => 0,
+        TargetKind::Agent => 1,
+        TargetKind::Team => 2,
+    }
+}
+
 fn validate_run_id(run_id: &str) -> Result<()> {
     if run_id.is_empty()
         || run_id.len() > 100
@@ -2143,14 +2432,6 @@ fn validate_external_artifact(artifact: &ExternalArtifact) -> Result<()> {
     } else {
         Ok(())
     }
-}
-
-fn hours(value: f64) -> Duration {
-    Duration::milliseconds((value.max(0.0) * 3_600_000.0).round() as i64)
-}
-
-fn round_hours(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
 }
 
 fn credential_hash(token: &str) -> Vec<u8> {
@@ -2295,6 +2576,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lease.status, FlightLeaseStatus::Authorized);
+        let backup = app
+            .register_principal(
+                "Backup Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let unsafe_reassignment = app.reassign_task(
+            &task_id,
+            &human.name,
+            &backup.name,
+            &[],
+            "move work while a lease is open",
+        );
+        assert!(matches!(
+            unsafe_reassignment,
+            Err(MambaError::InvalidTransition(_))
+        ));
         assert!(
             app.authorize_remote_flight(
                 &task_id,
@@ -2687,6 +2991,143 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(kinds.contains(&"flow_message.posted".to_string()));
         assert!(kinds.contains(&"flow_message.acknowledged".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reassignment_and_negotiation_reschedule_the_full_flow_and_replay() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team(
+                "Platform",
+                "product,backend,llm-platform,security,quality,observability,operations",
+                "admin",
+            )
+            .unwrap();
+        let manager = app
+            .register_principal(
+                "Manager",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,llm-platform,operations",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let fast = app
+            .register_principal(
+                "Fast Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "backend,llm-platform,security,quality,observability",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let slow = app
+            .register_principal(
+                "Slow Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "backend,llm-platform",
+                25,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Build an LLM Gateway this week",
+                &manager.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        app.approve_flow(&flow.id, &manager.name).unwrap();
+        let gateway = flow.task("gateway-core").unwrap().clone();
+        assert_eq!(gateway.assignment.as_ref().unwrap().owner.id, fast.id);
+        let old_gateway_p80 = gateway.estimate.p80_hours;
+        let old_observability_start = flow.task("observability").unwrap().estimate.earliest_start;
+
+        let denied = app
+            .reassign_task(
+                &gateway.id,
+                &fast.name,
+                &slow.name,
+                &[],
+                "capacity rebalance",
+            )
+            .unwrap_err();
+        assert!(matches!(denied, MambaError::PermissionDenied(_)));
+        let reassigned = app
+            .reassign_task(
+                &gateway.id,
+                &manager.name,
+                &slow.name,
+                &[],
+                "Fast Engineer is handling the incident response",
+            )
+            .unwrap();
+        let gateway = reassigned.task(&gateway.id).unwrap();
+        assert_eq!(gateway.assignment.as_ref().unwrap().owner.id, slow.id);
+        assert_eq!(gateway.status, TaskStatus::Assigned);
+        assert!(gateway.estimate.p80_hours > old_gateway_p80);
+        assert!(
+            reassigned
+                .task("observability")
+                .unwrap()
+                .estimate
+                .earliest_start
+                > old_observability_start
+        );
+
+        app.accept_task(&gateway.id, &slow.name).unwrap();
+        let negotiated = app.negotiate_task(&gateway.id, &slow.name, 40.0).unwrap();
+        assert_eq!(negotiated.estimate.effort_hours, 40.0);
+        let updated = app.state().flow(&flow.id).unwrap();
+        assert!(
+            updated
+                .task("observability")
+                .unwrap()
+                .estimate
+                .earliest_start
+                >= negotiated.estimate.p80_finish
+        );
+        assert!(updated.critical_path.contains(&"gateway-core".to_string()));
+        let expected_p80 = updated.p80_finish;
+
+        drop(app);
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed_flow = replayed.state().flow(&flow.id).unwrap();
+        assert_eq!(replayed_flow.p80_finish, expected_p80);
+        assert_eq!(
+            replayed_flow
+                .task(&gateway.id)
+                .unwrap()
+                .assignment
+                .as_ref()
+                .unwrap()
+                .owner
+                .id,
+            slow.id
+        );
+        let kinds = replayed
+            .timeline(&flow.id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"task.reassigned".to_string()));
+        assert!(kinds.contains(&"flow.rescheduled".to_string()));
     }
 
     #[tokio::test]

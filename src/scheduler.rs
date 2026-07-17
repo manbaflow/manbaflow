@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 
-use crate::domain::{Assignment, Estimate, TargetKind, Task, TaskDraft, TaskStatus};
+use crate::domain::{Assignment, Estimate, Flow, TargetKind, Task, TaskDraft, TaskStatus};
 use crate::error::{MambaError, Result};
 use crate::ids::new_id;
 use crate::state::OrganizationState;
@@ -11,6 +11,13 @@ pub struct Schedule {
     pub tasks: Vec<Task>,
     pub p50_finish: chrono::DateTime<Utc>,
     pub p80_finish: chrono::DateTime<Utc>,
+    pub critical_path: Vec<String>,
+}
+
+pub struct Reschedule {
+    pub task_estimates: BTreeMap<String, Estimate>,
+    pub p50_finish: DateTime<Utc>,
+    pub p80_finish: DateTime<Utc>,
     pub critical_path: Vec<String>,
 }
 
@@ -178,6 +185,156 @@ pub fn schedule(
 
     Ok(Schedule {
         tasks,
+        p50_finish,
+        p80_finish,
+        critical_path,
+    })
+}
+
+pub fn reschedule(
+    flow: &Flow,
+    state: &OrganizationState,
+    now: DateTime<Utc>,
+) -> Result<Reschedule> {
+    if flow.tasks.is_empty() {
+        return Err(MambaError::Validation(
+            "a flow must contain at least one task".into(),
+        ));
+    }
+    let by_id = flow
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| (task.id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut indegree = vec![0usize; flow.tasks.len()];
+    let mut dependents = vec![Vec::new(); flow.tasks.len()];
+    for (index, task) in flow.tasks.iter().enumerate() {
+        for dependency in &task.depends_on {
+            let dependency_index = *by_id.get(dependency).ok_or_else(|| {
+                MambaError::Validation(format!(
+                    "task `{}` depends on unknown task `{dependency}`",
+                    task.key
+                ))
+            })?;
+            if dependency_index == index {
+                return Err(MambaError::Validation(format!(
+                    "task `{}` cannot depend on itself",
+                    task.key
+                )));
+            }
+            indegree[index] += 1;
+            dependents[dependency_index].push(index);
+        }
+    }
+    let mut queue = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut order = Vec::with_capacity(flow.tasks.len());
+    while let Some(index) = queue.pop_front() {
+        order.push(index);
+        for dependent in &dependents[index] {
+            indegree[*dependent] -= 1;
+            if indegree[*dependent] == 0 {
+                queue.push_back(*dependent);
+            }
+        }
+    }
+    if order.len() != flow.tasks.len() {
+        return Err(MambaError::Validation(
+            "task dependency graph contains a cycle".into(),
+        ));
+    }
+
+    let mut estimates = BTreeMap::<String, Estimate>::new();
+    let mut longest = BTreeMap::<String, (f64, Vec<String>)>::new();
+    for index in order {
+        let task = &flow.tasks[index];
+        let terminal = task.status.is_terminal();
+        let earliest_start = task
+            .depends_on
+            .iter()
+            .filter_map(|dependency| estimates.get(dependency))
+            .map(|estimate| estimate.p80_finish)
+            .max()
+            .unwrap_or(now)
+            .max(now);
+        let mut estimate = task.estimate.clone();
+        let path_hours;
+        if terminal {
+            let finished_at = task.last_heartbeat.unwrap_or(now).min(now);
+            estimate.earliest_start = finished_at;
+            estimate.p50_finish = finished_at;
+            estimate.p80_finish = finished_at;
+            estimate.confidence = "actual".into();
+            if !estimate
+                .rationale
+                .iter()
+                .any(|reason| reason == "terminal task preserved as an actual waypoint")
+            {
+                estimate
+                    .rationale
+                    .push("terminal task preserved as an actual waypoint".into());
+            }
+            path_hours = 0.0;
+        } else {
+            let assignment = task
+                .assignment
+                .as_ref()
+                .ok_or_else(|| MambaError::NoEligibleAssignee(task.title.clone()))?;
+            let capacity = assignment_capacity(assignment, state).max(0.1);
+            let coordination_factor = 1.0
+                + if task.depends_on.len() > 1 { 0.1 } else { 0.0 }
+                + if task.requires_human { 0.08 } else { 0.0 };
+            estimate.p50_hours =
+                round_hours(estimate.effort_hours / capacity * coordination_factor);
+            estimate.p80_hours = round_hours(estimate.p50_hours * 1.4);
+            estimate.earliest_start = earliest_start;
+            estimate.p50_finish = earliest_start + hours(estimate.p50_hours);
+            estimate.p80_finish = earliest_start + hours(estimate.p80_hours);
+            estimate.confidence = "rescheduled".into();
+            estimate.rationale = vec![
+                format!("base effort: {:.1}h", estimate.effort_hours),
+                format!("owner capacity factor: {:.2}", capacity),
+                format!("coordination factor: {:.2}", coordination_factor),
+                format!("dynamic schedule anchor: {}", now.to_rfc3339()),
+            ];
+            path_hours = estimate.p80_hours;
+        }
+
+        let (previous_hours, mut path) = task
+            .depends_on
+            .iter()
+            .filter_map(|dependency| longest.get(dependency))
+            .max_by(|left, right| left.0.total_cmp(&right.0))
+            .cloned()
+            .unwrap_or((0.0, Vec::new()));
+        path.push(task.key.clone());
+        longest.insert(task.id.clone(), (previous_hours + path_hours, path));
+        estimates.insert(task.id.clone(), estimate);
+    }
+
+    let non_terminal = flow.tasks.iter().filter(|task| !task.status.is_terminal());
+    let p50_finish = non_terminal
+        .clone()
+        .filter_map(|task| estimates.get(&task.id))
+        .map(|estimate| estimate.p50_finish)
+        .max()
+        .unwrap_or(now);
+    let p80_finish = non_terminal
+        .filter_map(|task| estimates.get(&task.id))
+        .map(|estimate| estimate.p80_finish)
+        .max()
+        .unwrap_or(now);
+    let critical_path = longest
+        .into_values()
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, path)| path)
+        .unwrap_or_default();
+    Ok(Reschedule {
+        task_estimates: estimates,
         p50_finish,
         p80_finish,
         critical_path,

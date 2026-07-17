@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -269,6 +270,17 @@ pub struct Flow {
     pub created_at: DateTime<Utc>,
     pub approved_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FlowScheduleRevision {
+    pub task_estimates: BTreeMap<String, Estimate>,
+    pub p50_finish: DateTime<Utc>,
+    pub p80_finish: DateTime<Utc>,
+    pub critical_path: Vec<String>,
+    pub reason: String,
+    pub revised_by: String,
+    pub revised_at: DateTime<Utc>,
 }
 
 impl Flow {

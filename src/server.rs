@@ -17,8 +17,8 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
-    Evidence, ExecutorKind, FlightLease, Flow, FlowMessage, FlowMessageKind, MessageInboxItem,
-    Principal, PrincipalKind, RemoteFlightReport, Task, TrackingEscalation,
+    AssignmentTarget, Evidence, ExecutorKind, FlightLease, Flow, FlowMessage, FlowMessageKind,
+    MessageInboxItem, Principal, PrincipalKind, RemoteFlightReport, Task, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
@@ -112,6 +112,19 @@ struct EvidenceInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct NegotiateInput {
+    effort_hours: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReassignInput {
+    owner: String,
+    #[serde(default)]
+    copilots: Vec<String>,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct MessageInboxQuery {
     #[serde(default)]
     all: bool,
@@ -196,6 +209,12 @@ fn router(app: Arc<Mutex<MambaApp>>, gitlab_webhook_auth: Option<GitLabWebhookAu
         .route("/api/v1/tasks/{id}/accept", post(accept_task))
         .route("/api/v1/tasks/{id}/start", post(start_task))
         .route("/api/v1/tasks/{id}/heartbeat", post(heartbeat_task))
+        .route("/api/v1/tasks/{id}/negotiate", post(negotiate_task))
+        .route("/api/v1/tasks/{id}/reassign", post(reassign_task))
+        .route(
+            "/api/v1/tasks/{id}/reassignment-candidates",
+            get(reassignment_candidates),
+        )
         .route("/api/v1/tasks/{id}/block", post(block_task))
         .route("/api/v1/tasks/{id}/evidence", post(add_evidence))
         .route("/api/v1/tasks/{id}/flight-leases", post(authorize_flight))
@@ -393,6 +412,46 @@ async fn heartbeat_task(
 ) -> ApiResult<Json<Task>> {
     mutate(&state, &headers, |app, actor| {
         app.heartbeat_task(&task_id, actor, input.note)
+    })
+    .await
+}
+
+async fn negotiate_task(
+    State(state): State<ApiState>,
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<NegotiateInput>,
+) -> ApiResult<Json<Task>> {
+    mutate(&state, &headers, |app, actor| {
+        app.negotiate_task(&task_id, actor, input.effort_hours)
+    })
+    .await
+}
+
+async fn reassignment_candidates(
+    State(state): State<ApiState>,
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<AssignmentTarget>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.reassignment_candidates(&task_id, &principal.id)?))
+}
+
+async fn reassign_task(
+    State(state): State<ApiState>,
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<ReassignInput>,
+) -> ApiResult<Json<Flow>> {
+    mutate(&state, &headers, |app, actor| {
+        app.reassign_task(
+            &task_id,
+            actor,
+            &input.owner,
+            &input.copilots,
+            &input.reason,
+        )
     })
     .await
 }
@@ -690,7 +749,7 @@ mod tests {
                 PrincipalKind::Human,
                 Some(&team.id),
                 None,
-                "operations",
+                "product,delivery,operations",
                 100,
                 None,
                 "admin",
@@ -823,6 +882,71 @@ mod tests {
         let body = to_bytes(messages.into_body(), usize::MAX).await.unwrap();
         let messages: Vec<MessageInboxItem> = serde_json::from_slice(&body).unwrap();
         assert!(messages.is_empty());
+
+        let candidates = service
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                &format!("/api/v1/tasks/{task_id}/reassignment-candidates"),
+                &issued.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(candidates.status(), StatusCode::OK);
+        let body = to_bytes(candidates.into_body(), usize::MAX).await.unwrap();
+        let candidates: Vec<AssignmentTarget> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.id == observer.id)
+        );
+
+        let reassigned = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                &format!("/api/v1/tasks/{task_id}/reassign"),
+                &issued.token,
+                json!({
+                    "owner": observer.id,
+                    "reason": "Manager moved the delivery window",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reassigned.status(), StatusCode::OK);
+        let accepted = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/tasks/{task_id}/accept"),
+                &observer_token.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let negotiated = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                &format!("/api/v1/tasks/{task_id}/negotiate"),
+                &observer_token.token,
+                json!({"effort_hours": 12.0}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(negotiated.status(), StatusCode::OK);
+        assert_eq!(
+            app.lock()
+                .await
+                .state()
+                .find_task(&task_id)
+                .unwrap()
+                .1
+                .estimate
+                .effort_hours,
+            12.0
+        );
 
         app.lock()
             .await

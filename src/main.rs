@@ -340,6 +340,24 @@ enum TaskCommand {
         #[arg(long)]
         hours: f64,
     },
+    /// 查看当前任务可改派的 Human、Agent 和团队
+    ReassignmentCandidates {
+        task: String,
+        #[arg(long)]
+        by: String,
+    },
+    /// Demand Requester 改派任务并动态重算整条 Flow
+    Reassign {
+        task: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long = "to")]
+        owner: String,
+        #[arg(long = "copilot")]
+        copilots: Vec<String>,
+        #[arg(long)]
+        reason: String,
+    },
     /// 在依赖完成后开始任务
     Start {
         task: String,
@@ -787,6 +805,37 @@ async fn run(cli: Cli) -> Result<()> {
                     &task,
                     cli.json,
                     format!("{} 工期已协商为 {:.1}h", task.id, hours),
+                );
+            }
+            TaskCommand::ReassignmentCandidates { task, by } => {
+                let candidates = app.reassignment_candidates(&task, &by)?;
+                let text = candidates
+                    .iter()
+                    .map(|candidate| {
+                        format!("{:?}\t{}\t{}", candidate.kind, candidate.id, candidate.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                output(&candidates, cli.json, text);
+            }
+            TaskCommand::Reassign {
+                task,
+                by,
+                owner,
+                copilots,
+                reason,
+            } => {
+                let flow = app.reassign_task(&task, &by, &owner, &copilots, &reason)?;
+                let task = flow.task(&task).expect("reassigned task remains in flow");
+                output(
+                    &flow,
+                    cli.json,
+                    format!(
+                        "{} 已换防给 {}；Flow P80 更新为 {}",
+                        task.id,
+                        task.assignment.as_ref().unwrap().owner.name,
+                        flow.p80_finish.format("%Y-%m-%d %H:%M UTC")
+                    ),
                 );
             }
             TaskCommand::Start { task, by } => {
