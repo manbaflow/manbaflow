@@ -29,6 +29,7 @@ use crate::domain::{
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 use crate::planner::PlannerKind;
+use crate::showcase::bootstrap_showcase;
 
 const BG: Color = Color::Rgb(13, 14, 16);
 const PANEL: Color = Color::Rgb(23, 25, 29);
@@ -143,6 +144,7 @@ impl View {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MouseAction {
+    LoadShowcase,
     NewDemand,
     ApproveOrAccept,
     Advance,
@@ -361,6 +363,7 @@ impl UiState {
                 }
                 Err(error) => self.failure(error),
             },
+            KeyCode::Char('d') => self.load_showcase(app).await,
             KeyCode::Char('n') => self.open_demand_modal(),
             KeyCode::Char('a') => self.approve_or_accept(app),
             KeyCode::Char('s') => self.advance_task(app),
@@ -457,6 +460,7 @@ impl UiState {
         action: MouseAction,
     ) -> Result<bool> {
         match action {
+            MouseAction::LoadShowcase => self.load_showcase(app).await,
             MouseAction::NewDemand => self.open_demand_modal(),
             MouseAction::ApproveOrAccept => self.approve_or_accept(app),
             MouseAction::Advance => self.advance_task(app),
@@ -594,6 +598,29 @@ impl UiState {
     fn switch_view(&mut self, app: &MambaApp, view: View) {
         self.view = view;
         self.refresh_timeline(app);
+    }
+
+    async fn load_showcase(&mut self, app: &mut MambaApp) {
+        match bootstrap_showcase(app, &self.workspace).await {
+            Ok(showcase) => {
+                self.actor_id = app
+                    .state()
+                    .principal("牢大")
+                    .ok()
+                    .map(|principal| principal.id.clone());
+                self.flow_index = flow_ids(app)
+                    .iter()
+                    .position(|flow_id| flow_id == &showcase.highlighted_flow_id)
+                    .unwrap_or_else(|| initial_flow_index(app));
+                self.task_index = 0;
+                self.inbox_index = 0;
+                self.focus_tasks = false;
+                self.view = View::Overview;
+                self.refresh_timeline(app);
+                self.success("Showcase 机队已进场：3 条 Flow 就位，塔台已聚焦 LLM Gateway 风险");
+            }
+            Err(error) => self.failure(error),
+        }
     }
 
     fn move_selection(&mut self, app: &MambaApp, delta: isize) {
@@ -1144,7 +1171,7 @@ fn render(frame: &mut Frame, app: &MambaApp, state: &mut UiState) {
         View::Timeline => render_timeline(frame, app, state, content),
     }
     render_status(frame, state, status);
-    render_shortcuts(frame, state, help);
+    render_shortcuts(frame, app, state, help);
 
     if state.show_help {
         render_help_modal(frame);
@@ -1458,7 +1485,7 @@ fn render_flow_table(
 fn render_tower_brief(frame: &mut Frame, app: &MambaApp, flow: Option<&Flow>, area: Rect) {
     let Some(flow) = flow else {
         frame.render_widget(
-            Paragraph::new("按 n 提出第一个需求。")
+            Paragraph::new("点击 SHOWCASE 装载演示机队，或按 n 提出第一个需求。")
                 .style(Style::new().fg(MUTED))
                 .alignment(Alignment::Center)
                 .block(panel_block("TOWER BRIEF", false)),
@@ -1636,7 +1663,7 @@ fn render_flows(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Re
 
 fn render_prd(frame: &mut Frame, flow: Option<&Flow>, area: Rect) {
     let text = flow.map_or_else(
-        || Text::from("还没有 Flow。按 n 提出需求。"),
+        || Text::from("还没有 Flow。点击 SHOWCASE 装载演示，或按 n 提出需求。"),
         |flow| {
             let mut lines = vec![
                 Line::styled(flow.prd.title.clone(), Style::new().fg(GOLD).bold()),
@@ -2275,20 +2302,20 @@ fn render_status(frame: &mut Frame, state: &UiState, area: Rect) {
     );
 }
 
-fn render_shortcuts(frame: &mut Frame, state: &mut UiState, area: Rect) {
-    let actions: &[(&str, MouseAction)] = match state.view {
-        View::Overview => &[
+fn render_shortcuts(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+    let mut actions = match state.view {
+        View::Overview => vec![
             ("新需求", MouseAction::NewDemand),
             ("批准", MouseAction::ApproveOrAccept),
             ("巡航", MouseAction::ScanTracker),
         ],
-        View::Flows => &[
+        View::Flows => vec![
             ("批准/接单", MouseAction::ApproveOrAccept),
             ("推进", MouseAction::Advance),
             ("规划", MouseAction::Plan),
             ("执行", MouseAction::Execute),
         ],
-        View::Inbox => &[
+        View::Inbox => vec![
             ("接单", MouseAction::ApproveOrAccept),
             ("收到", MouseAction::AcknowledgeEscalation),
             ("推进", MouseAction::Advance),
@@ -2298,14 +2325,16 @@ fn render_shortcuts(frame: &mut Frame, state: &mut UiState, area: Rect) {
             ("阻塞", MouseAction::Block),
             ("验收", MouseAction::Complete),
         ],
-        View::Roster => &[("切换球权", MouseAction::CycleActor)],
-        View::Timeline => &[],
+        View::Roster => vec![("切换球权", MouseAction::CycleActor)],
+        View::Timeline => vec![],
     };
+    if state.view == View::Overview && app.state().organization.is_none() {
+        actions.insert(0, ("SHOWCASE", MouseAction::LoadShowcase));
+    }
     let mut spans = Vec::new();
     let mut x = area.x;
     for (label, action) in actions
-        .iter()
-        .copied()
+        .into_iter()
         .chain([("帮助", MouseAction::Help), ("退出", MouseAction::Quit)])
     {
         let text = format!(" {label} ");
@@ -2467,6 +2496,7 @@ fn render_help_modal(frame: &mut Frame) {
         help_line("h / l", "在 Flow 列表与任务列表之间切换球权"),
         help_line("h / l (时间线)", "切换正在审计的 Flow"),
         help_line("u", "切换当前 Human 操作人"),
+        help_line("d", "从空塔台装载完整的交互式 Showcase"),
         help_line("n", "提出新需求，选择 Local / Claude Code / Codex 规划"),
         help_line("t", "立即巡航扫描 Todo 风险；后台每 30 秒自动扫描"),
         help_line("g", "确认当前 Inbox 中首个未确认 Tower Call"),
@@ -2598,7 +2628,7 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 
 fn action_color(action: MouseAction) -> Color {
     match action {
-        MouseAction::NewDemand | MouseAction::ApproveOrAccept => GOLD,
+        MouseAction::LoadShowcase | MouseAction::NewDemand | MouseAction::ApproveOrAccept => GOLD,
         MouseAction::Advance | MouseAction::Plan => CYAN,
         MouseAction::Execute => ORANGE,
         MouseAction::Evidence | MouseAction::Complete => GREEN,
@@ -3109,6 +3139,85 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("FLIGHT DECK"));
         assert!(content.contains("CLEARED"));
+    }
+
+    #[tokio::test]
+    async fn empty_tower_loads_showcase_from_mouse_and_focuses_risk() {
+        let directory = tempdir().unwrap();
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        let mut state = UiState::new(
+            &app,
+            TuiOptions {
+                workspace: directory.path().to_path_buf(),
+                actor: None,
+            },
+        );
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("SHOWCASE"));
+        let showcase_button = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::LoadShowcase))
+            .unwrap()
+            .area;
+
+        state
+            .handle_mouse(&mut app, mouse_down(showcase_button))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state().organization().unwrap().name, "Mamba Labs");
+        assert_eq!(app.state().flows.len(), 3);
+        assert_eq!(state.actor_name(&app), Some("牢大"));
+        assert!(
+            state
+                .selected_flow(&app)
+                .is_some_and(|flow| flow.prd.title.contains("LLM Gateway v0"))
+        );
+        assert!(!state.message_is_error);
+
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("TASK PROGRESS"));
+        assert!(content.contains("ACTION QUEUE"));
+        assert!(content.contains("LLM Gateway v0"));
+        assert!(
+            !state
+                .hit_regions
+                .iter()
+                .any(|region| { region.target == HitTarget::Action(MouseAction::LoadShowcase) })
+        );
+
+        state
+            .handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            )
+            .await
+            .unwrap();
+        assert_eq!(app.state().flows.len(), 3);
+        assert!(state.message_is_error);
+        assert!(state.message.contains("空塔台"));
     }
 
     #[tokio::test]

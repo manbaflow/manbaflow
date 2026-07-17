@@ -3,7 +3,9 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::MambaApp;
-use crate::domain::{ExecutorKind, Flow, PrincipalKind, TargetKind, Task, TaskStatus};
+use crate::domain::{
+    ExecutorConfig, ExecutorKind, Flow, PrincipalKind, TargetKind, Task, TaskStatus,
+};
 use crate::error::{MambaError, Result};
 use crate::planner::PlannerKind;
 
@@ -15,6 +17,73 @@ pub struct ShowcaseSummary {
     pub waiting_review_task_id: String,
     pub completed_flow_id: String,
     pub flows: Vec<Flow>,
+}
+
+pub async fn bootstrap_showcase(app: &mut MambaApp, workspace: &Path) -> Result<ShowcaseSummary> {
+    if app.state().organization.is_some() {
+        return Err(MambaError::Validation(
+            "Showcase 只能装载到空塔台，请换一个独立的 --data-dir".to_string(),
+        ));
+    }
+
+    app.init_organization("Mamba Labs", "admin")?;
+    let team = app.create_team(
+        "洛杉矶研发队",
+        "product,delivery,backend,rust,llm-platform,security,quality,observability,operations",
+        "admin",
+    )?;
+    let leader = app.register_principal(
+        "牢大",
+        PrincipalKind::Human,
+        Some(&team.id),
+        None,
+        "product,delivery,llm-platform,operations",
+        80,
+        None,
+        "admin",
+    )?;
+    let engineer = app.register_principal(
+        "佐巴扬",
+        PrincipalKind::Human,
+        Some(&team.id),
+        None,
+        "backend,rust,llm-platform,security,quality,observability",
+        100,
+        None,
+        "admin",
+    )?;
+    app.register_principal(
+        "Codex 副驾",
+        PrincipalKind::Agent,
+        Some(&team.id),
+        Some(&engineer.id),
+        "backend,rust,llm-platform,security,quality,observability",
+        100,
+        Some(ExecutorConfig {
+            kind: ExecutorKind::Codex,
+            workspace: workspace.to_path_buf(),
+            model: None,
+            command: None,
+        }),
+        "admin",
+    )?;
+    app.register_principal(
+        "Claude Code 副驾",
+        PrincipalKind::Agent,
+        Some(&team.id),
+        Some(&leader.id),
+        "product,delivery,llm-platform,operations,backend",
+        100,
+        Some(ExecutorConfig {
+            kind: ExecutorKind::ClaudeCode,
+            workspace: workspace.to_path_buf(),
+            model: None,
+            command: None,
+        }),
+        "admin",
+    )?;
+
+    seed_showcase(app, workspace, &leader.name).await
 }
 
 pub async fn seed_showcase(

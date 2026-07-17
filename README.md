@@ -478,22 +478,19 @@ cargo build --release
 ./target/release/mamba --help
 ```
 
-最快的体验方式是在当前仓库创建一套本地演示阵容。`demo` 会注册牢大、佐巴扬，以及分别归属他们的
-Claude Code / Codex 副驾；加上 `--showcase` 还会通过真实领域 API 生成三条可回放的 Flow，不会启动
-模型：
+最快的体验方式是直接打开一座空塔台：
 
 ```bash
+rm -rf .mambaflow-showcase
 ./target/release/mamba --data-dir .mambaflow-showcase \
-  demo --showcase --workspace .
-./target/release/mamba --data-dir .mambaflow-showcase \
-  dashboard --as 牢大
-./target/release/mamba --data-dir .mambaflow-showcase \
-  tui --as 牢大 --workspace .
+  tui --workspace .
 ```
 
-Showcase 包含一条阻塞中的 LLM Gateway 主流程、一条等待 Human 验收的发布文档流程和一条已经完成的
-值班手册流程，并预先签发一个远程写入 Flight Lease。完整的五分钟演示顺序和现场解除风险的命令见
-[Showcase 演示脚本](docs/SHOWCASE.md)。
+进入 Ratatui 后点击底栏的 `SHOWCASE`，或按 `d`。塔台会在界面内注册牢大、佐巴扬及各自的
+Claude Code / Codex 副驾，创建三条可回放的真实 Flow，并自动聚焦风险最高的 LLM Gateway。Showcase
+包含正在执行、阻塞、等待 Human 验收、已完成和远程 Flight Lease 等状态；每一步都会进入同一份
+append-only Flow Ledger，不是一张静态看板。完整的五分钟展示顺序见
+[TUI Showcase 演示脚本](docs/SHOWCASE.md)。
 
 不带子命令时，`mamba` 默认进入全屏 Ratatui 塔台。也可以显式指定当前 Human 和工作区：
 
@@ -511,6 +508,7 @@ Showcase 包含一条阻塞中的 LLM Gateway 主流程、一条等待 Human 验
 | `j` / `k` | 移动当前列表选择 |
 | `h` / `l` | 在 Flow Selector 和任务列表之间切换 |
 | `u` | 在已注册 Human 之间切换球权 |
+| `d` | 从空塔台装载完整的交互式 Showcase |
 | `n` | 输入管理需求，选择 Local / Claude Code / Codex 生成 PRD、任务 DAG、匹配和工期 |
 | `a` | 批准 Flow 或接受 Assignment |
 | `s` | 根据当前状态接单、开工或提交验收 |
