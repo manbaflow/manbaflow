@@ -19,9 +19,9 @@ use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
     AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, Flow,
-    FlowChangeRequest, FlowMessage, FlowMessageKind, MessageInboxItem, NotificationDelivery,
-    NotificationEndpoint, Principal, PrincipalKind, RemoteFlightReport, Task, TrackingEscalation,
-    WorkCalendar, Workday,
+    FlowChangeRequest, FlowMessage, FlowMessageKind, MessageInboxItem, NotificationConnector,
+    NotificationDelivery, NotificationEndpoint, Principal, PrincipalKind, RemoteFlightReport, Task,
+    TrackingEscalation, WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
@@ -173,6 +173,42 @@ struct MessageInboxQuery {
 struct NotificationListQuery {
     #[serde(default)]
     all: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NotificationEndpointView {
+    id: String,
+    name: String,
+    connector: NotificationConnector,
+    destination_env: Option<String>,
+    uses_legacy_url: bool,
+    signing_secret_env: Option<String>,
+    event_kinds: Vec<String>,
+    active: bool,
+    created_by: String,
+    created_at: DateTime<Utc>,
+    disabled_by: Option<String>,
+    disabled_at: Option<DateTime<Utc>>,
+}
+
+impl From<&NotificationEndpoint> for NotificationEndpointView {
+    fn from(endpoint: &NotificationEndpoint) -> Self {
+        Self {
+            id: endpoint.id.clone(),
+            name: endpoint.name.clone(),
+            connector: endpoint.connector,
+            destination_env: endpoint.url_env.clone(),
+            uses_legacy_url: endpoint.url_env.is_none(),
+            signing_secret_env: (!endpoint.secret_env.is_empty())
+                .then(|| endpoint.secret_env.clone()),
+            event_kinds: endpoint.event_kinds.clone(),
+            active: endpoint.active,
+            created_by: endpoint.created_by.clone(),
+            created_at: endpoint.created_at,
+            disabled_by: endpoint.disabled_by.clone(),
+            disabled_at: endpoint.disabled_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -462,7 +498,7 @@ async fn notification_endpoints(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<NotificationListQuery>,
-) -> ApiResult<Json<Vec<NotificationEndpoint>>> {
+) -> ApiResult<Json<Vec<NotificationEndpointView>>> {
     let app = state.app.lock().await;
     let principal = authenticate(&app, &headers)?;
     ensure_notification_admin(&principal)?;
@@ -471,7 +507,7 @@ async fn notification_endpoints(
         .notification_endpoints
         .values()
         .filter(|endpoint| query.all || endpoint.active)
-        .cloned()
+        .map(NotificationEndpointView::from)
         .collect::<Vec<_>>();
     endpoints.sort_by_key(|endpoint| endpoint.created_at);
     Ok(Json(endpoints))
@@ -1434,7 +1470,8 @@ mod tests {
             .unwrap();
         assert_eq!(endpoints.status(), StatusCode::OK);
         let body = to_bytes(endpoints.into_body(), usize::MAX).await.unwrap();
-        let endpoints: Vec<NotificationEndpoint> = serde_json::from_slice(&body).unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("example.invalid"));
+        let endpoints: Vec<NotificationEndpointView> = serde_json::from_slice(&body).unwrap();
         assert_eq!(endpoints[0].id, notification_endpoint.id);
         let agent_endpoints = service
             .clone()

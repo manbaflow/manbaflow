@@ -113,14 +113,43 @@ pub struct WorkCalendar {
 pub struct NotificationEndpoint {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub connector: NotificationConnector,
+    #[serde(default)]
+    pub url_env: Option<String>,
+    // Kept for replaying generic endpoints created before connector credentials
+    // were moved out of the Ledger.
+    #[serde(default)]
     pub url: String,
     pub event_kinds: Vec<String>,
+    #[serde(default)]
     pub secret_env: String,
     pub active: bool,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     pub disabled_by: Option<String>,
     pub disabled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationConnector {
+    #[default]
+    Generic,
+    Feishu,
+    Slack,
+    Teams,
+}
+
+impl NotificationConnector {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::Feishu => "feishu",
+            Self::Slack => "slack",
+            Self::Teams => "teams",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -12,10 +12,10 @@ use crate::domain::{
     Estimate, Evidence, ExecutionRecord, ExecutorConfig, ExecutorKind, ExecutorMode,
     ExternalArtifact, FlightLease, FlightLeaseStatus, Flow, FlowChangeImpact, FlowChangeRequest,
     FlowChangeStatus, FlowMessage, FlowMessageKind, FlowScheduleRevision, FlowStatus,
-    IssuedCredential, MessageAcknowledgement, MessageInboxItem, NotificationDelivery,
-    NotificationEndpoint, NotificationStatus, Organization, Principal, PrincipalKind,
-    RemoteFlightReport, TargetKind, Task, TaskDraft, TaskStatus, Team, TrackingAttention,
-    TrackingEscalation, TrackingScan, WorkCalendar, Workday,
+    IssuedCredential, MessageAcknowledgement, MessageInboxItem, NotificationConnector,
+    NotificationDelivery, NotificationEndpoint, NotificationStatus, Organization, Principal,
+    PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskDraft, TaskStatus, Team,
+    TrackingAttention, TrackingEscalation, TrackingScan, WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -398,9 +398,67 @@ impl MambaApp {
         let endpoint = NotificationEndpoint {
             id: new_id("NEND"),
             name: name.trim().to_string(),
+            connector: NotificationConnector::Generic,
+            url_env: None,
             url: url.trim().to_string(),
             event_kinds,
             secret_env: secret_env.trim().to_string(),
+            active: true,
+            created_by: actor.to_string(),
+            created_at: Utc::now(),
+            disabled_by: None,
+            disabled_at: None,
+        };
+        crate::notification::validate_endpoint(&endpoint)?;
+        self.commit(
+            actor,
+            vec![DomainEvent::NotificationEndpointRegistered {
+                endpoint: endpoint.clone(),
+            }],
+        )?;
+        Ok(endpoint)
+    }
+
+    pub fn register_notification_connector(
+        &mut self,
+        name: &str,
+        connector: NotificationConnector,
+        url_env: &str,
+        event_kinds: &[String],
+        secret_env: Option<&str>,
+        actor: &str,
+    ) -> Result<NotificationEndpoint> {
+        if connector == NotificationConnector::Generic {
+            return Err(MambaError::Validation(
+                "use register_notification_endpoint for a generic signed webhook".into(),
+            ));
+        }
+        let mut event_kinds = event_kinds
+            .iter()
+            .map(|kind| kind.trim().to_ascii_lowercase())
+            .filter(|kind| !kind.is_empty())
+            .collect::<Vec<_>>();
+        event_kinds.sort();
+        event_kinds.dedup();
+        if self
+            .state
+            .notification_endpoints
+            .values()
+            .any(|endpoint| endpoint.name.eq_ignore_ascii_case(name.trim()) && endpoint.active)
+        {
+            return Err(MambaError::Validation(format!(
+                "active notification endpoint already exists: {}",
+                name.trim()
+            )));
+        }
+        let endpoint = NotificationEndpoint {
+            id: new_id("NEND"),
+            name: name.trim().to_string(),
+            connector,
+            url_env: Some(url_env.trim().to_string()),
+            url: String::new(),
+            event_kinds,
+            secret_env: secret_env.unwrap_or_default().trim().to_string(),
             active: true,
             created_by: actor.to_string(),
             created_at: Utc::now(),
@@ -559,6 +617,50 @@ impl MambaApp {
             self.record_notification_attempt(&delivery.id, attempt, actor)?;
         }
         Ok(summary)
+    }
+
+    pub async fn test_notification_endpoint(
+        &mut self,
+        endpoint_id: &str,
+        actor: &str,
+    ) -> Result<NotificationDelivery> {
+        let endpoint = self
+            .state
+            .notification_endpoints
+            .get(endpoint_id)
+            .filter(|endpoint| endpoint.active)
+            .cloned()
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "active notification endpoint",
+                id: endpoint_id.to_string(),
+            })?;
+        let delivery = NotificationDelivery {
+            id: new_id("NTF"),
+            organization_id: self.state.organization()?.id.clone(),
+            endpoint_id: endpoint.id.clone(),
+            source_event_kind: "connector.test".into(),
+            flow_id: None,
+            actor: actor.to_string(),
+            payload: serde_json::json!({
+                "type": "connector_test",
+                "data": {"endpoint_id": endpoint.id, "connector": endpoint.connector.as_str()}
+            }),
+            status: NotificationStatus::Pending,
+            attempts: 0,
+            queued_at: Utc::now(),
+            last_attempt_at: None,
+            delivered_at: None,
+            response_status: None,
+            last_error: None,
+        };
+        self.commit(
+            actor,
+            vec![DomainEvent::NotificationQueued {
+                delivery: Box::new(delivery.clone()),
+            }],
+        )?;
+        let attempt = crate::notification::deliver(&endpoint, &delivery).await;
+        self.record_notification_attempt(&delivery.id, attempt, actor)
     }
 
     pub fn issue_api_credential(
@@ -3453,6 +3555,19 @@ mod tests {
         .unwrap();
         assert_eq!(app.state().notification_deliveries.len(), 2);
 
+        let teams = app
+            .register_notification_connector(
+                "leadership teams",
+                NotificationConnector::Teams,
+                "MAMBA_TEAMS_WEBHOOK_URL",
+                &["tracking.escalation_raised".into()],
+                None,
+                "admin",
+            )
+            .unwrap();
+        assert_eq!(teams.url_env.as_deref(), Some("MAMBA_TEAMS_WEBHOOK_URL"));
+        assert!(teams.url.is_empty());
+
         drop(app);
         let replayed = MambaApp::open(&data_dir).unwrap();
         let replayed_delivery = &replayed.state().notification_deliveries[&delivery.id];
@@ -3463,6 +3578,10 @@ mod tests {
             NotificationStatus::Cancelled
         );
         assert!(!replayed.state().notification_endpoints[&endpoint.id].active);
+        assert_eq!(
+            replayed.state().notification_endpoints[&teams.id].connector,
+            NotificationConnector::Teams
+        );
     }
 
     #[tokio::test]

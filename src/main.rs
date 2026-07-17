@@ -7,8 +7,8 @@ use manbaflow::calendar::{parse_workdays, summary as calendar_summary};
 use manbaflow::dashboard::DashboardSnapshot;
 use manbaflow::domain::{
     ExecutorConfig, ExecutorKind, ExecutorMode, Flow, FlowChangeRequest, FlowMessage,
-    FlowMessageKind, NotificationDelivery, NotificationEndpoint, NotificationStatus, PrincipalKind,
-    Task, TrackingAttention, TrackingEscalation, WorkCalendar,
+    FlowMessageKind, NotificationConnector, NotificationDelivery, NotificationEndpoint,
+    NotificationStatus, PrincipalKind, Task, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
@@ -301,6 +301,26 @@ enum NotificationCommand {
         #[arg(long, default_value = "admin")]
         by: String,
     },
+    /// 注册飞书、Slack 或 Teams 原生 Connector；Webhook URL 只从环境读取
+    ConnectorAdd {
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_enum)]
+        provider: NotificationConnectorArg,
+        #[arg(long)]
+        url_env: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "work_request.sent,flow_message.posted,task.blocked,task.submitted,tracking.escalation_raised,flow_change.proposed,flow_change.applied,flow_change.rejected,remote_flight.crashed,flow.completed"
+        )]
+        events: Vec<String>,
+        /// 飞书机器人开启签名校验时使用；Slack/Teams 不需要
+        #[arg(long)]
+        secret_env: Option<String>,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
     /// 查看 Webhook Endpoint
     EndpointList {
         #[arg(long)]
@@ -324,6 +344,12 @@ enum NotificationCommand {
         #[arg(long)]
         force: bool,
         #[arg(long, default_value = "tower://cli-notification-dispatcher")]
+        by: String,
+    },
+    /// 发送一条经过 Outbox 审计的测试卡片
+    Test {
+        endpoint: String,
+        #[arg(long, default_value = "admin")]
         by: String,
     },
 }
@@ -689,6 +715,23 @@ enum FlowMessageKindArg {
     Question,
     Update,
     Decision,
+}
+
+#[derive(Clone, ValueEnum)]
+enum NotificationConnectorArg {
+    Feishu,
+    Slack,
+    Teams,
+}
+
+impl From<NotificationConnectorArg> for NotificationConnector {
+    fn from(value: NotificationConnectorArg) -> Self {
+        match value {
+            NotificationConnectorArg::Feishu => Self::Feishu,
+            NotificationConnectorArg::Slack => Self::Slack,
+            NotificationConnectorArg::Teams => Self::Teams,
+        }
+    }
 }
 
 #[tokio::main]
@@ -1393,6 +1436,24 @@ async fn run(cli: Cli) -> Result<()> {
                     app.register_notification_endpoint(&name, &url, &events, &secret_env, &by)?;
                 output(&endpoint, cli.json, notification_endpoint_text(&endpoint));
             }
+            NotificationCommand::ConnectorAdd {
+                name,
+                provider,
+                url_env,
+                events,
+                secret_env,
+                by,
+            } => {
+                let endpoint = app.register_notification_connector(
+                    &name,
+                    provider.into(),
+                    &url_env,
+                    &events,
+                    secret_env.as_deref(),
+                    &by,
+                )?;
+                output(&endpoint, cli.json, notification_endpoint_text(&endpoint));
+            }
             NotificationCommand::EndpointList { all } => {
                 let mut endpoints = app
                     .state()
@@ -1445,6 +1506,21 @@ async fn run(cli: Cli) -> Result<()> {
                         "Outbox 投递 {} · LANDED {} · CRASHED {}",
                         summary.attempted, summary.delivered, summary.failed
                     ),
+                );
+            }
+            NotificationCommand::Test { endpoint, by } => {
+                let delivery = app.test_notification_endpoint(&endpoint, &by).await?;
+                if delivery.status != NotificationStatus::Delivered {
+                    return Err(MambaError::ExternalConnector(format!(
+                        "{} test delivery crashed: {}",
+                        delivery.id,
+                        delivery.last_error.as_deref().unwrap_or("unknown error")
+                    )));
+                }
+                output(
+                    &delivery,
+                    cli.json,
+                    format!("{} 测试传球已安全落地", delivery.id),
                 );
             }
         },
@@ -1695,8 +1771,18 @@ fn calendar_text(calendar: &WorkCalendar) -> String {
 }
 
 fn notification_endpoint_text(endpoint: &NotificationEndpoint) -> String {
+    let destination = endpoint
+        .url_env
+        .as_ref()
+        .map(|name| format!("url=${name}"))
+        .unwrap_or_else(|| endpoint.url.clone());
+    let secret = if endpoint.secret_env.is_empty() {
+        String::new()
+    } else {
+        format!("\tsecret=${}", endpoint.secret_env)
+    };
     format!(
-        "{}\t{}\t{}\t{}\tsecret=${}\t{}",
+        "{}\t{}\t{}\t{}\t{}{}\t{}",
         endpoint.id,
         if endpoint.active {
             "ACTIVE"
@@ -1704,8 +1790,9 @@ fn notification_endpoint_text(endpoint: &NotificationEndpoint) -> String {
             "DISABLED"
         },
         endpoint.name,
-        endpoint.url,
-        endpoint.secret_env,
+        endpoint.connector.as_str(),
+        destination,
+        secret,
         endpoint.event_kinds.join(",")
     )
 }
