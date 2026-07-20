@@ -8,7 +8,8 @@ use manbaflow::dashboard::DashboardSnapshot;
 use manbaflow::domain::{
     ExecutorConfig, ExecutorKind, ExecutorMode, Flow, FlowChangeRequest, FlowMessage,
     FlowMessageKind, NotificationConnector, NotificationDelivery, NotificationEndpoint,
-    NotificationStatus, PrincipalKind, Task, TrackingAttention, TrackingEscalation, WorkCalendar,
+    NotificationStatus, OrganizationRole, PrincipalKind, Task, TrackingAttention,
+    TrackingEscalation, WorkCalendar,
 };
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
@@ -185,6 +186,11 @@ enum PrincipalCommand {
         #[command(subcommand)]
         command: CredentialCommand,
     },
+    /// 管理 Principal 的组织角色与权限
+    Role {
+        #[command(subcommand)]
+        command: RoleCommand,
+    },
     /// 管理 Slack、飞书或 Teams 用户与 Human Principal 的身份绑定
     Identity {
         #[command(subcommand)]
@@ -289,6 +295,34 @@ enum CredentialCommand {
     Revoke {
         credential: String,
         #[arg(long, default_value = "admin")]
+        by: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RoleCommand {
+    /// 查看 Principal 的角色绑定
+    List {
+        #[arg(long = "for")]
+        target: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+        #[arg(long)]
+        all: bool,
+    },
+    /// 授予组织角色
+    Grant {
+        #[arg(long = "for")]
+        target: String,
+        #[arg(long)]
+        role: OrganizationRoleArg,
+        #[arg(long)]
+        by: String,
+    },
+    /// 撤销一个角色绑定
+    Revoke {
+        binding: String,
+        #[arg(long)]
         by: String,
     },
 }
@@ -759,12 +793,33 @@ enum NotificationConnectorArg {
     Teams,
 }
 
+#[derive(Clone, ValueEnum)]
+enum OrganizationRoleArg {
+    TenantAdmin,
+    OrganizationAdmin,
+    Manager,
+    Member,
+    Auditor,
+}
+
 impl From<NotificationConnectorArg> for NotificationConnector {
     fn from(value: NotificationConnectorArg) -> Self {
         match value {
             NotificationConnectorArg::Feishu => Self::Feishu,
             NotificationConnectorArg::Slack => Self::Slack,
             NotificationConnectorArg::Teams => Self::Teams,
+        }
+    }
+}
+
+impl From<OrganizationRoleArg> for OrganizationRole {
+    fn from(value: OrganizationRoleArg) -> Self {
+        match value {
+            OrganizationRoleArg::TenantAdmin => Self::TenantAdmin,
+            OrganizationRoleArg::OrganizationAdmin => Self::OrganizationAdmin,
+            OrganizationRoleArg::Manager => Self::Manager,
+            OrganizationRoleArg::Member => Self::Member,
+            OrganizationRoleArg::Auditor => Self::Auditor,
         }
     }
 }
@@ -1096,6 +1151,41 @@ async fn run(cli: Cli) -> Result<()> {
                         cli.json,
                         format!("{} 已解绑，历史交互回执保留", binding.id),
                     );
+                }
+            },
+            PrincipalCommand::Role { command } => match command {
+                RoleCommand::List { target, by, all } => {
+                    let bindings = app.role_bindings(&target, &by, all)?;
+                    let text = bindings
+                        .iter()
+                        .map(|binding| {
+                            format!(
+                                "{}\t{}\t{}\t{}",
+                                binding.id,
+                                if binding.is_active() {
+                                    "ACTIVE"
+                                } else {
+                                    "REVOKED"
+                                },
+                                binding.role,
+                                binding.principal_id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    output(&bindings, cli.json, text);
+                }
+                RoleCommand::Grant { target, role, by } => {
+                    let binding = app.grant_role(&target, role.into(), &by)?;
+                    output(
+                        &binding,
+                        cli.json,
+                        format!("{} 已获得 {}", binding.principal_id, binding.role),
+                    );
+                }
+                RoleCommand::Revoke { binding, by } => {
+                    let binding = app.revoke_role(&binding, &by)?;
+                    output(&binding, cli.json, format!("{} 已撤销", binding.id));
                 }
             },
         },

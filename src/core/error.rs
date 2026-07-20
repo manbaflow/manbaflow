@@ -19,6 +19,12 @@ pub enum MambaError {
     #[error("organization is already initialized")]
     OrganizationAlreadyInitialized,
 
+    #[error("tenant has not been initialized")]
+    TenantNotInitialized,
+
+    #[error("tenant is already initialized")]
+    TenantAlreadyInitialized,
+
     #[error("{entity} not found: {id}")]
     NotFound { entity: &'static str, id: String },
 

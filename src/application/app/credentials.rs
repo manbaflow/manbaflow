@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::MambaApp;
+use super::authority::Permission;
 use crate::domain::{ApiCredential, IssuedCredential, Principal};
 use crate::error::{MambaError, Result};
 use crate::event::DomainEvent;
@@ -16,6 +17,7 @@ impl MambaApp {
         actor: &str,
     ) -> Result<IssuedCredential> {
         self.state.organization()?;
+        self.ensure_permission(actor, Permission::CredentialManage)?;
         let principal = self.state.principal(target)?.clone();
         let label = label.trim();
         if label.is_empty() || label.chars().count() > 80 {
@@ -55,6 +57,7 @@ impl MambaApp {
         credential_id: &str,
         actor: &str,
     ) -> Result<ApiCredential> {
+        self.ensure_permission(actor, Permission::CredentialManage)?;
         let credential = self
             .state
             .credentials

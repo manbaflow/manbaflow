@@ -9,8 +9,8 @@ use crate::domain::{
     Assignment, AssignmentTarget, Demand, Estimate, Evidence, ExecutionRecord, ExecutorConfig,
     ExecutorKind, ExecutorMode, ExternalArtifact, FlightLease, FlightLeaseStatus, Flow,
     FlowChangeImpact, FlowChangeRequest, FlowChangeStatus, FlowScheduleRevision, FlowStatus,
-    Organization, Principal, PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskDraft,
-    TaskStatus, Team,
+    Organization, OrganizationRole, Principal, PrincipalKind, RemoteFlightReport, RoleBinding,
+    TargetKind, Task, TaskDraft, TaskStatus, Team, Tenant,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -23,6 +23,7 @@ use crate::state::OrganizationState;
 use crate::store::EventStore;
 
 mod actions;
+mod authority;
 mod calendars;
 mod commit;
 mod credentials;
@@ -32,6 +33,7 @@ mod notifications;
 mod policy;
 mod tracking;
 
+use self::authority::Permission;
 use self::policy::ensure_status;
 
 pub struct MambaApp {
@@ -53,11 +55,15 @@ impl MambaApp {
         fs::create_dir_all(&data_dir)?;
         let store = EventStore::open(data_dir.join("flow.db"))?;
         let state = OrganizationState::replay(&store.load_all()?)?;
-        Ok(Self {
+        let mut app = Self {
             data_dir,
             store,
             state,
-        })
+        };
+        if let Err(MambaError::ConcurrentModification { .. }) = app.migrate_legacy_authority() {
+            app.migrate_legacy_authority()?;
+        }
+        Ok(app)
     }
 
     pub fn state(&self) -> &OrganizationState {
@@ -82,23 +88,36 @@ impl MambaApp {
                 "organization name cannot be empty".into(),
             ));
         }
+        if self.state.tenant.is_some() {
+            return Err(MambaError::TenantAlreadyInitialized);
+        }
+        let now = Utc::now();
+        let tenant = Tenant {
+            id: new_id("TEN"),
+            name: name.trim().to_string(),
+            created_at: now,
+        };
         let organization = Organization {
             id: new_id("ORG"),
             name: name.trim().to_string(),
-            created_at: Utc::now(),
+            created_at: now,
         };
         self.commit_as(
             &organization.id,
             actor,
-            vec![DomainEvent::OrganizationInitialized {
-                organization: organization.clone(),
-            }],
+            vec![
+                DomainEvent::TenantInitialized { tenant },
+                DomainEvent::OrganizationInitialized {
+                    organization: organization.clone(),
+                },
+            ],
         )?;
         Ok(organization)
     }
 
     pub fn create_team(&mut self, name: &str, capabilities: &str, actor: &str) -> Result<Team> {
         self.state.organization()?;
+        self.ensure_permission(actor, Permission::OrganizationManage)?;
         if name.trim().is_empty() {
             return Err(MambaError::Validation("team name cannot be empty".into()));
         }
@@ -137,6 +156,7 @@ impl MambaApp {
         actor: &str,
     ) -> Result<Principal> {
         self.state.organization()?;
+        self.ensure_permission(actor, Permission::PrincipalManage)?;
         if name.trim().is_empty() {
             return Err(MambaError::Validation(
                 "principal name cannot be empty".into(),
@@ -182,6 +202,19 @@ impl MambaApp {
         {
             return Err(MambaError::InvalidWorkspace(config.workspace.clone()));
         }
+        let default_role = match &kind {
+            PrincipalKind::Human
+                if !self
+                    .state
+                    .principals
+                    .values()
+                    .any(|principal| principal.kind == PrincipalKind::Human) =>
+            {
+                OrganizationRole::TenantAdmin
+            }
+            PrincipalKind::Human => OrganizationRole::Member,
+            PrincipalKind::Agent => OrganizationRole::Agent,
+        };
         let principal = Principal {
             id: new_id(match kind {
                 PrincipalKind::Human => "HUM",
@@ -197,11 +230,25 @@ impl MambaApp {
             active: true,
             created_at: Utc::now(),
         };
+        let binding = RoleBinding {
+            id: new_id("ROLE"),
+            tenant_id: self.state.tenant()?.id.clone(),
+            organization_id: self.state.organization()?.id.clone(),
+            principal_id: principal.id.clone(),
+            role: default_role,
+            granted_by: actor.to_string(),
+            granted_at: principal.created_at,
+            revoked_by: None,
+            revoked_at: None,
+        };
         self.commit(
             actor,
-            vec![DomainEvent::PrincipalRegistered {
-                principal: principal.clone(),
-            }],
+            vec![
+                DomainEvent::PrincipalRegistered {
+                    principal: principal.clone(),
+                },
+                DomainEvent::RoleGranted { binding },
+            ],
         )?;
         Ok(principal)
     }
@@ -229,6 +276,7 @@ impl MambaApp {
                 "a demand requester must be a registered human".into(),
             ));
         }
+        self.ensure_permission(&requester.id, Permission::DemandCreate)?;
         let requester = requester.name.clone();
         if !workspace.is_dir() {
             return Err(MambaError::InvalidWorkspace(workspace.to_path_buf()));
@@ -1231,6 +1279,7 @@ impl MambaApp {
                 "organization dashboard requires a human identity".into(),
             ));
         }
+        self.ensure_permission(&principal.id, Permission::DashboardRead)?;
         Ok(build_dashboard(&self.state))
     }
 

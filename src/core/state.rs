@@ -6,14 +6,15 @@ use crate::domain::{
     ApiCredential, ExecutionRecord, ExternalIdentityBinding, ExternalInteractionReceipt,
     FlightLease, FlightLeaseStatus, Flow, FlowChangeRequest, FlowChangeStatus, FlowMessage,
     FlowScheduleRevision, FlowStatus, NotificationDelivery, NotificationEndpoint,
-    NotificationStatus, Organization, Principal, PrincipalKind, TargetKind, TaskStatus, Team,
-    TrackingAttention, TrackingEscalation, WorkCalendar,
+    NotificationStatus, Organization, OrganizationRole, Principal, PrincipalKind, RoleBinding,
+    TargetKind, TaskStatus, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 
 #[derive(Clone, Debug, Default)]
 pub struct OrganizationState {
+    pub tenant: Option<Tenant>,
     pub organization: Option<Organization>,
     pub teams: BTreeMap<String, Team>,
     pub principals: BTreeMap<String, Principal>,
@@ -23,6 +24,7 @@ pub struct OrganizationState {
     pub notification_endpoints: BTreeMap<String, NotificationEndpoint>,
     pub notification_deliveries: BTreeMap<String, NotificationDelivery>,
     pub credentials: BTreeMap<String, ApiCredential>,
+    pub role_bindings: BTreeMap<String, RoleBinding>,
     pub external_deliveries: BTreeMap<String, DateTime<Utc>>,
     pub external_binding_clocks: BTreeMap<String, DateTime<Utc>>,
     pub flows: BTreeMap<String, Flow>,
@@ -56,6 +58,12 @@ impl OrganizationState {
         }
 
         match &envelope.event {
+            DomainEvent::TenantInitialized { tenant } => {
+                if self.tenant.is_some() {
+                    return Err(MambaError::TenantAlreadyInitialized);
+                }
+                self.tenant = Some(tenant.clone());
+            }
             DomainEvent::OrganizationInitialized { organization } => {
                 if self.organization.is_some() {
                     return Err(MambaError::OrganizationAlreadyInitialized);
@@ -73,6 +81,49 @@ impl OrganizationState {
                     .or_insert_with(|| {
                         WorkCalendar::always_available(principal.id.clone(), principal.created_at)
                     });
+            }
+            DomainEvent::RoleGranted { binding } => {
+                let tenant = self.tenant()?;
+                let organization = self.organization()?;
+                if binding.tenant_id != tenant.id || binding.organization_id != organization.id {
+                    return Err(MambaError::Validation(
+                        "role binding scope does not match the active tenant and organization"
+                            .into(),
+                    ));
+                }
+                self.principal(&binding.principal_id)?;
+                if self.role_bindings.values().any(|existing| {
+                    existing.is_active()
+                        && existing.principal_id == binding.principal_id
+                        && existing.role == binding.role
+                }) {
+                    return Err(MambaError::Validation(format!(
+                        "principal {} already has role {}",
+                        binding.principal_id, binding.role
+                    )));
+                }
+                self.role_bindings
+                    .insert(binding.id.clone(), binding.clone());
+            }
+            DomainEvent::RoleRevoked {
+                binding_id,
+                revoked_by,
+                revoked_at,
+            } => {
+                let binding =
+                    self.role_bindings
+                        .get_mut(binding_id)
+                        .ok_or_else(|| MambaError::NotFound {
+                            entity: "role binding",
+                            id: binding_id.clone(),
+                        })?;
+                if !binding.is_active() {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "role binding {binding_id} is already revoked"
+                    )));
+                }
+                binding.revoked_by = Some(revoked_by.clone());
+                binding.revoked_at = Some(*revoked_at);
             }
             DomainEvent::ExternalIdentityBound { binding } => {
                 if self.external_identities.contains_key(&binding.id) {
@@ -760,6 +811,28 @@ impl OrganizationState {
         self.organization
             .as_ref()
             .ok_or(MambaError::OrganizationNotInitialized)
+    }
+
+    pub fn tenant(&self) -> Result<&Tenant> {
+        self.tenant.as_ref().ok_or(MambaError::TenantNotInitialized)
+    }
+
+    pub fn roles_for(&self, principal_id: &str) -> Vec<OrganizationRole> {
+        let mut roles = self
+            .role_bindings
+            .values()
+            .filter(|binding| binding.is_active() && binding.principal_id == principal_id)
+            .map(|binding| binding.role)
+            .collect::<Vec<_>>();
+        roles.sort();
+        roles.dedup();
+        roles
+    }
+
+    pub fn has_role(&self, principal_id: &str, role: OrganizationRole) -> bool {
+        self.role_bindings.values().any(|binding| {
+            binding.is_active() && binding.principal_id == principal_id && binding.role == role
+        })
     }
 
     pub fn flow(&self, id: &str) -> Result<&Flow> {

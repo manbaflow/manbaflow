@@ -82,6 +82,7 @@ mod tests {
         let mut first = MambaApp::open(data_dir).unwrap();
         first.init_organization("Mamba", "admin").unwrap();
         let mut stale = MambaApp::open(data_dir).unwrap();
+        let stale_sequence = stale.state.last_sequence;
 
         first
             .create_team("Platform", "rust,infra", "admin")
@@ -92,13 +93,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            MambaError::ConcurrentModification {
-                expected: 1,
-                actual: 2
-            }
+            MambaError::ConcurrentModification { expected, actual }
+                if expected == stale_sequence && actual == stale_sequence + 1
         ));
-        assert_eq!(stale.state.last_sequence, 2);
-        assert_eq!(stale.store.current_sequence().unwrap(), 2);
+        assert_eq!(stale.state.last_sequence, stale_sequence + 1);
+        assert_eq!(stale.store.current_sequence().unwrap(), stale_sequence + 1);
         assert!(stale.state.team("Platform").is_ok());
         assert!(stale.state.team("People").is_err());
     }

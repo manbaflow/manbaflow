@@ -19,9 +19,10 @@ use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
     AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, Flow,
-    FlowChangeRequest, FlowMessage, FlowMessageKind, MessageInboxItem, NotificationConnector,
-    NotificationDelivery, NotificationEndpoint, Principal, PrincipalKind, RemoteFlightReport, Task,
-    TrackingEscalation, WorkCalendar, Workday,
+    FlowChangeRequest, FlowMessage, FlowMessageKind, IssuedCredential, MessageInboxItem,
+    NotificationConnector, NotificationDelivery, NotificationEndpoint, Organization,
+    OrganizationRole, Principal, PrincipalKind, RemoteFlightReport, RoleBinding, Task, Team,
+    Tenant, TrackingEscalation, WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
@@ -71,7 +72,9 @@ impl From<MambaError> for ApiError {
             }
             MambaError::PermissionDenied(_) => StatusCode::FORBIDDEN,
             MambaError::Validation(_) | MambaError::InvalidWorkspace(_) => StatusCode::BAD_REQUEST,
-            MambaError::OrganizationNotInitialized => StatusCode::PRECONDITION_REQUIRED,
+            MambaError::OrganizationNotInitialized | MambaError::TenantNotInitialized => {
+                StatusCode::PRECONDITION_REQUIRED
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
@@ -103,6 +106,52 @@ struct InboxItem {
     flow_title: String,
     task: Task,
     blocked_by: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct OrganizationView {
+    tenant: Tenant,
+    organization: Organization,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CreateTeamInput {
+    name: String,
+    #[serde(default)]
+    capabilities: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CreatePrincipalInput {
+    name: String,
+    kind: PrincipalKind,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    capabilities: String,
+    #[serde(default = "default_capacity_percent")]
+    capacity_percent: u8,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GrantRoleInput {
+    role: OrganizationRole,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct IssueCredentialInput {
+    label: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CreateDemandInput {
+    summary: String,
+    #[serde(default = "default_planner_kind")]
+    planner: PlannerKind,
+    #[serde(default = "default_planner_timeout_seconds")]
+    timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -299,6 +348,23 @@ fn router(
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/me", get(me))
+        .route("/api/v1/organization", get(organization))
+        .route("/api/v1/teams", get(teams).post(create_team))
+        .route("/api/v1/principals", get(principals).post(create_principal))
+        .route(
+            "/api/v1/principals/{id}/roles",
+            get(principal_roles).post(grant_principal_role),
+        )
+        .route("/api/v1/roles/{id}/revoke", post(revoke_principal_role))
+        .route(
+            "/api/v1/principals/{id}/credentials",
+            post(issue_principal_credential),
+        )
+        .route(
+            "/api/v1/credentials/{id}/revoke",
+            post(revoke_principal_credential),
+        )
+        .route("/api/v1/demands", post(create_demand))
         .route("/api/v1/me/calendar", get(my_calendar).put(set_my_calendar))
         .route("/api/v1/me/time-off", post(add_my_time_off))
         .route("/api/v1/me/time-off/{id}/cancel", post(cancel_my_time_off))
@@ -418,6 +484,162 @@ async fn me(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Json
     Ok(Json(authenticate(&app, &headers)?))
 }
 
+async fn organization(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<OrganizationView>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    app.authorize_organization_read(&principal.id)?;
+    Ok(Json(OrganizationView {
+        tenant: app.state().tenant()?.clone(),
+        organization: app.state().organization()?.clone(),
+    }))
+}
+
+async fn teams(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Json<Vec<Team>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    app.authorize_organization_read(&principal.id)?;
+    let mut teams = app.state().teams.values().cloned().collect::<Vec<_>>();
+    teams.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(Json(teams))
+}
+
+async fn create_team(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateTeamInput>,
+) -> ApiResult<Json<Team>> {
+    mutate(&state, &headers, |app, actor| {
+        app.create_team(&input.name, &input.capabilities, actor)
+    })
+    .await
+}
+
+async fn principals(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<Principal>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    app.authorize_organization_read(&principal.id)?;
+    let mut principals = app.state().principals.values().cloned().collect::<Vec<_>>();
+    principals.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(Json(principals))
+}
+
+async fn create_principal(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<CreatePrincipalInput>,
+) -> ApiResult<Json<Principal>> {
+    mutate(&state, &headers, |app, actor| {
+        app.register_principal(
+            &input.name,
+            input.kind,
+            input.team.as_deref(),
+            input.owner.as_deref(),
+            &input.capabilities,
+            input.capacity_percent,
+            None,
+            actor,
+        )
+    })
+    .await
+}
+
+async fn principal_roles(
+    State(state): State<ApiState>,
+    Path(principal_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<RoleBinding>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.role_bindings(
+        &principal_id,
+        &principal.id,
+        false,
+    )?))
+}
+
+async fn grant_principal_role(
+    State(state): State<ApiState>,
+    Path(principal_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<GrantRoleInput>,
+) -> ApiResult<Json<RoleBinding>> {
+    mutate(&state, &headers, |app, actor| {
+        app.grant_role(&principal_id, input.role, actor)
+    })
+    .await
+}
+
+async fn revoke_principal_role(
+    State(state): State<ApiState>,
+    Path(binding_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<RoleBinding>> {
+    mutate(&state, &headers, |app, actor| {
+        app.revoke_role(&binding_id, actor)
+    })
+    .await
+}
+
+async fn issue_principal_credential(
+    State(state): State<ApiState>,
+    Path(principal_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<IssueCredentialInput>,
+) -> ApiResult<Json<IssuedCredential>> {
+    mutate(&state, &headers, |app, actor| {
+        app.issue_api_credential(&principal_id, &input.label, actor)
+    })
+    .await
+}
+
+async fn revoke_principal_credential(
+    State(state): State<ApiState>,
+    Path(credential_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<crate::domain::ApiCredential>> {
+    mutate(&state, &headers, |app, actor| {
+        app.revoke_api_credential(&credential_id, actor)
+    })
+    .await
+}
+
+async fn create_demand(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateDemandInput>,
+) -> ApiResult<Json<Flow>> {
+    if input.timeout_seconds == 0 || input.timeout_seconds > 3_600 {
+        return Err(MambaError::Validation(
+            "planner timeout must be between 1 and 3600 seconds".into(),
+        )
+        .into());
+    }
+    let workspace = std::env::current_dir().map_err(MambaError::from)?;
+    let (data_dir, principal_id) = {
+        let app = state.app.lock().await;
+        let principal = authenticate(&app, &headers)?;
+        (app.data_dir().to_path_buf(), principal.id)
+    };
+    let mut planning_app = MambaApp::open(data_dir)?;
+    let flow = planning_app
+        .create_demand(
+            &input.summary,
+            &principal_id,
+            input.planner,
+            &workspace,
+            input.timeout_seconds,
+        )
+        .await?;
+    state.app.lock().await.reload()?;
+    Ok(Json(flow))
+}
+
 async fn my_calendar(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -521,7 +743,7 @@ async fn notification_endpoints(
 ) -> ApiResult<Json<Vec<NotificationEndpointView>>> {
     let app = state.app.lock().await;
     let principal = authenticate(&app, &headers)?;
-    ensure_notification_admin(&principal)?;
+    app.authorize_notification_admin(&principal.id)?;
     let mut endpoints = app
         .state()
         .notification_endpoints
@@ -540,7 +762,7 @@ async fn notification_deliveries(
 ) -> ApiResult<Json<Vec<NotificationDelivery>>> {
     let app = state.app.lock().await;
     let principal = authenticate(&app, &headers)?;
-    ensure_notification_admin(&principal)?;
+    app.authorize_notification_admin(&principal.id)?;
     let mut deliveries = app
         .state()
         .notification_deliveries
@@ -567,7 +789,7 @@ async fn dispatch_notifications(
     let actor = {
         let app = state.app.lock().await;
         let principal = authenticate(&app, &headers)?;
-        ensure_notification_admin(&principal)?;
+        app.authorize_notification_admin(&principal.id)?;
         principal.name
     };
     Ok(Json(
@@ -1069,16 +1291,6 @@ async fn deliver_notification_batch(
     Ok(summary)
 }
 
-fn ensure_notification_admin(principal: &Principal) -> Result<()> {
-    if principal.kind == PrincipalKind::Human {
-        Ok(())
-    } else {
-        Err(MambaError::PermissionDenied(
-            "notification administration requires a Human principal".into(),
-        ))
-    }
-}
-
 fn authenticate(app: &MambaApp, headers: &HeaderMap) -> ApiResult<Principal> {
     let value = headers
         .get(header::AUTHORIZATION)
@@ -1107,6 +1319,18 @@ fn default_lease_ttl_seconds() -> u64 {
     3_600
 }
 
+fn default_capacity_percent() -> u8 {
+    100
+}
+
+fn default_planner_kind() -> PlannerKind {
+    PlannerKind::Local
+}
+
+fn default_planner_timeout_seconds() -> u64 {
+    300
+}
+
 fn default_requires_ack() -> bool {
     true
 }
@@ -1133,6 +1357,115 @@ mod tests {
     use crate::planner::PlannerKind;
 
     type TestHmacSha256 = Hmac<Sha256>;
+
+    #[tokio::test]
+    async fn tenant_admin_can_manage_roles_and_manager_can_create_remote_demand() {
+        let directory = tempdir().unwrap();
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Platform", "product,rust", "admin")
+            .unwrap();
+        let admin = app
+            .register_principal(
+                "Admin",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let member = app
+            .register_principal(
+                "Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "rust",
+                100,
+                None,
+                &admin.id,
+            )
+            .unwrap();
+        let admin_token = app
+            .issue_api_credential(&admin.id, "admin api", &admin.id)
+            .unwrap();
+        let member_token = app
+            .issue_api_credential(&member.id, "member api", &admin.id)
+            .unwrap();
+        let app = Arc::new(Mutex::new(app));
+        let service = router(
+            app.clone(),
+            None,
+            InteractionWebhookAuth::for_test(None, None),
+        );
+
+        let organization = service
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/organization",
+                &member_token.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(organization.status(), StatusCode::OK);
+        let denied = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/api/v1/demands",
+                &member_token.token,
+                json!({"summary": "Build an internal gateway"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let granted = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                &format!("/api/v1/principals/{}/roles", member.id),
+                &admin_token.token,
+                json!({"role": "manager"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(granted.status(), StatusCode::OK);
+        let body = to_bytes(granted.into_body(), usize::MAX).await.unwrap();
+        let binding: RoleBinding = serde_json::from_slice(&body).unwrap();
+        assert_eq!(binding.role, OrganizationRole::Manager);
+
+        let created = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/api/v1/demands",
+                &member_token.token,
+                json!({"summary": "Build an internal gateway"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let flow: Flow = serde_json::from_slice(&body).unwrap();
+        assert_eq!(flow.demand.requester, member.name);
+        assert!(app.lock().await.state().flows.contains_key(&flow.id));
+
+        let dashboard = service
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/dashboard",
+                &member_token.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dashboard.status(), StatusCode::OK);
+    }
 
     #[tokio::test]
     async fn signed_bridge_and_slack_actions_use_bound_human_identity() {

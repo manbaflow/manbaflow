@@ -1,6 +1,7 @@
 use chrono::Utc;
 
 use super::MambaApp;
+use super::authority::Permission;
 use crate::domain::{
     ExternalIdentityBinding, ExternalInteractionAction, ExternalInteractionReceipt,
     ExternalInteractionResult, PrincipalKind,
@@ -20,6 +21,13 @@ impl MambaApp {
         let provider = normalize_external_provider(provider)?;
         let external_user_id = validate_external_value(external_user_id, "external user ID", 200)?;
         let principal = self.state.principal(principal)?.clone();
+        let actor_is_principal = self
+            .state
+            .principal(actor)
+            .is_ok_and(|candidate| candidate.id == principal.id);
+        if !actor_is_principal {
+            self.ensure_permission(actor, Permission::PrincipalManage)?;
+        }
         if principal.kind != PrincipalKind::Human || !principal.active {
             return Err(MambaError::PermissionDenied(
                 "external identities can only bind to an active Human principal".into(),
@@ -67,7 +75,15 @@ impl MambaApp {
             .ok_or_else(|| MambaError::NotFound {
                 entity: "active external identity binding",
                 id: binding_id.to_string(),
-            })?;
+            })?
+            .clone();
+        let actor_is_principal = self
+            .state
+            .principal(actor)
+            .is_ok_and(|candidate| candidate.id == binding.principal_id);
+        if !actor_is_principal {
+            self.ensure_permission(actor, Permission::PrincipalManage)?;
+        }
         self.commit(
             actor,
             vec![DomainEvent::ExternalIdentityUnbound {

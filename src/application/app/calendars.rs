@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use super::MambaApp;
+use super::authority::Permission;
 use crate::domain::{AvailabilityBlock, FlowScheduleRevision, FlowStatus, WorkCalendar, Workday};
 use crate::error::{MambaError, Result};
 use crate::event::DomainEvent;
@@ -20,6 +21,13 @@ impl MambaApp {
         actor: &str,
     ) -> Result<WorkCalendar> {
         let principal = self.state.principal(target)?.clone();
+        if !self
+            .state
+            .principal(actor)
+            .is_ok_and(|actor| actor.id == principal.id)
+        {
+            self.ensure_permission(actor, Permission::PrincipalManage)?;
+        }
         let now = Utc::now();
         let mut working_days = working_days;
         working_days.sort();
@@ -62,6 +70,13 @@ impl MambaApp {
         actor: &str,
     ) -> Result<AvailabilityBlock> {
         let principal = self.state.principal(target)?.clone();
+        if !self
+            .state
+            .principal(actor)
+            .is_ok_and(|actor| actor.id == principal.id)
+        {
+            self.ensure_permission(actor, Permission::PrincipalManage)?;
+        }
         let reason = reason.trim();
         if reason.is_empty() || reason.chars().count() > 500 {
             return Err(MambaError::Validation(
@@ -121,6 +136,13 @@ impl MambaApp {
         actor: &str,
     ) -> Result<AvailabilityBlock> {
         let principal = self.state.principal(target)?.clone();
+        if !self
+            .state
+            .principal(actor)
+            .is_ok_and(|actor| actor.id == principal.id)
+        {
+            self.ensure_permission(actor, Permission::PrincipalManage)?;
+        }
         let calendar = self.state.work_calendar(&principal.id)?;
         let block = calendar
             .time_off

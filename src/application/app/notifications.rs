@@ -1,6 +1,7 @@
 use chrono::{Duration, Utc};
 
 use super::MambaApp;
+use super::authority::Permission;
 use crate::domain::{
     NotificationConnector, NotificationDelivery, NotificationEndpoint, NotificationStatus,
 };
@@ -18,6 +19,7 @@ impl MambaApp {
         secret_env: &str,
         actor: &str,
     ) -> Result<NotificationEndpoint> {
+        self.ensure_permission(actor, Permission::NotificationManage)?;
         let mut event_kinds = event_kinds
             .iter()
             .map(|kind| kind.trim().to_ascii_lowercase())
@@ -69,6 +71,7 @@ impl MambaApp {
         secret_env: Option<&str>,
         actor: &str,
     ) -> Result<NotificationEndpoint> {
+        self.ensure_permission(actor, Permission::NotificationManage)?;
         if connector == NotificationConnector::Generic {
             return Err(MambaError::Validation(
                 "use register_notification_endpoint for a generic signed webhook".into(),
@@ -121,6 +124,7 @@ impl MambaApp {
         endpoint_id: &str,
         actor: &str,
     ) -> Result<NotificationEndpoint> {
+        self.ensure_permission(actor, Permission::NotificationManage)?;
         let endpoint = self
             .state
             .notification_endpoints
@@ -240,6 +244,7 @@ impl MambaApp {
         force_failed: bool,
         actor: &str,
     ) -> Result<NotificationDispatchSummary> {
+        self.ensure_permission(actor, Permission::NotificationManage)?;
         if limit == 0 || limit > 1_000 {
             return Err(MambaError::Validation(
                 "notification dispatch limit must be between 1 and 1000".into(),
@@ -265,6 +270,7 @@ impl MambaApp {
         endpoint_id: &str,
         actor: &str,
     ) -> Result<NotificationDelivery> {
+        self.ensure_permission(actor, Permission::NotificationManage)?;
         let endpoint = self
             .state
             .notification_endpoints

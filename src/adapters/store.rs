@@ -324,7 +324,7 @@ fn decode_event_payload(payload: &str) -> Result<(u16, DomainEvent)> {
             .cloned()
             .ok_or_else(|| MambaError::Validation("stored event version is missing".into()))?;
         let version = serde_json::from_value::<u16>(version_value)?;
-        if version != CURRENT_EVENT_VERSION {
+        if !matches!(version, 1 | CURRENT_EVENT_VERSION) {
             return Err(MambaError::Validation(format!(
                 "unsupported event payload version {version}"
             )));
@@ -408,6 +408,37 @@ mod tests {
         let loaded = store.load_all().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].event_version, 0);
+        assert_eq!(loaded[0].event, event);
+    }
+
+    #[test]
+    fn version_one_events_still_replay_after_authority_upgrade() {
+        let directory = tempdir().unwrap();
+        let store = EventStore::open(directory.path().join("mamba.db")).unwrap();
+        let event = DomainEvent::OrganizationInitialized {
+            organization: Organization {
+                id: "ORG-V1".to_string(),
+                name: "Version One".to_string(),
+                created_at: Utc::now(),
+            },
+        };
+        let payload = serde_json::json!({"version": 1, "event": event});
+        store
+            .connection
+            .execute(
+                "INSERT INTO events(
+                    sequence, id, organization_id, actor, kind, payload, occurred_at
+                 ) VALUES (1, 'EVT-V1', 'ORG-V1', 'test', ?1, ?2, ?3)",
+                params![
+                    event.kind(),
+                    serde_json::to_string(&payload).unwrap(),
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded[0].event_version, 1);
         assert_eq!(loaded[0].event, event);
     }
 

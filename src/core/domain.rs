@@ -6,6 +6,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Tenant {
+    pub id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Organization {
     pub id: String,
     pub name: String,
@@ -26,6 +33,49 @@ pub struct Team {
 pub enum PrincipalKind {
     Human,
     Agent,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationRole {
+    TenantAdmin,
+    OrganizationAdmin,
+    Manager,
+    Member,
+    Auditor,
+    Agent,
+}
+
+impl std::fmt::Display for OrganizationRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TenantAdmin => write!(f, "tenant_admin"),
+            Self::OrganizationAdmin => write!(f, "organization_admin"),
+            Self::Manager => write!(f, "manager"),
+            Self::Member => write!(f, "member"),
+            Self::Auditor => write!(f, "auditor"),
+            Self::Agent => write!(f, "agent"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RoleBinding {
+    pub id: String,
+    pub tenant_id: String,
+    pub organization_id: String,
+    pub principal_id: String,
+    pub role: OrganizationRole,
+    pub granted_by: String,
+    pub granted_at: DateTime<Utc>,
+    pub revoked_by: Option<String>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl RoleBinding {
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

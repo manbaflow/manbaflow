@@ -6,10 +6,11 @@ use crate::domain::{
     ExecutionRecord, ExternalArtifact, ExternalIdentityBinding, ExternalInteractionReceipt,
     FlightLease, Flow, FlowChangeRequest, FlowMessage, FlowScheduleRevision,
     MessageAcknowledgement, NotificationDelivery, NotificationEndpoint, Organization, PrdDraft,
-    Principal, RemoteFlightReport, Task, Team, TrackingAttention, TrackingEscalation, WorkCalendar,
+    Principal, RemoteFlightReport, RoleBinding, Task, Team, Tenant, TrackingAttention,
+    TrackingEscalation, WorkCalendar,
 };
 
-pub const CURRENT_EVENT_VERSION: u16 = 1;
+pub const CURRENT_EVENT_VERSION: u16 = 2;
 
 fn default_event_version() -> u16 {
     CURRENT_EVENT_VERSION
@@ -18,6 +19,9 @@ fn default_event_version() -> u16 {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum DomainEvent {
+    TenantInitialized {
+        tenant: Tenant,
+    },
     OrganizationInitialized {
         organization: Organization,
     },
@@ -26,6 +30,14 @@ pub enum DomainEvent {
     },
     PrincipalRegistered {
         principal: Principal,
+    },
+    RoleGranted {
+        binding: RoleBinding,
+    },
+    RoleRevoked {
+        binding_id: String,
+        revoked_by: String,
+        revoked_at: DateTime<Utc>,
     },
     ExternalIdentityBound {
         binding: ExternalIdentityBinding,
@@ -288,9 +300,12 @@ pub enum DomainEvent {
 impl DomainEvent {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::TenantInitialized { .. } => "tenant.initialized",
             Self::OrganizationInitialized { .. } => "organization.initialized",
             Self::TeamCreated { .. } => "team.created",
             Self::PrincipalRegistered { .. } => "principal.registered",
+            Self::RoleGranted { .. } => "authority.role_granted",
+            Self::RoleRevoked { .. } => "authority.role_revoked",
             Self::ExternalIdentityBound { .. } => "external_identity.bound",
             Self::ExternalIdentityUnbound { .. } => "external_identity.unbound",
             Self::WorkCalendarConfigured { .. } => "calendar.configured",
@@ -383,9 +398,12 @@ impl DomainEvent {
             Self::ExecutorFinished { record } => Some(&record.flow_id),
             Self::RemoteFlightAuthorized { lease } => Some(&lease.flow_id),
             Self::ExternalInteractionProcessed { receipt } => receipt.flow_id.as_deref(),
-            Self::OrganizationInitialized { .. }
+            Self::TenantInitialized { .. }
+            | Self::OrganizationInitialized { .. }
             | Self::TeamCreated { .. }
             | Self::PrincipalRegistered { .. }
+            | Self::RoleGranted { .. }
+            | Self::RoleRevoked { .. }
             | Self::ExternalIdentityBound { .. }
             | Self::ExternalIdentityUnbound { .. }
             | Self::WorkCalendarConfigured { .. }
