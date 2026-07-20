@@ -2,6 +2,7 @@
 name = "manbaflow"
 version = "0.1.0"
 edition = "2024"
+autobins = false
 description = "Enterprise Human-Agent Flow control plane"
 license = "MIT"
 repository = "https://github.com/manbaflow/manbaflow"
@@ -9,7 +10,7 @@ readme = "README.md"
 
 [[bin]]
 name = "mamba"
-path = "src/main.rs"
+path = "src/bin/mamba/main.rs"
 
 [dependencies]
 axum = "0.8"

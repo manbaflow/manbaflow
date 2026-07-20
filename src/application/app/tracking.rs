@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 
 use super::MambaApp;
+use crate::application::tracker;
 use crate::domain::{
     AttentionSeverity, FlowStatus, Principal, PrincipalKind, TrackingAttention, TrackingEscalation,
     TrackingScan,
@@ -10,7 +11,6 @@ use crate::domain::{
 use crate::error::{MambaError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
-use crate::tracker;
 
 impl MambaApp {
     pub fn scan_tracking(&mut self, stale_after_hours: u64, actor: &str) -> Result<TrackingScan> {

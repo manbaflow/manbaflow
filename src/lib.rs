@@ -1,25 +1,12 @@
-pub mod app;
-pub mod calendar;
-pub mod dashboard;
-pub mod domain;
-pub mod error;
-pub mod event;
-pub mod executor;
-pub mod gitlab;
-pub mod ids;
-pub mod interaction;
-pub mod matcher;
-pub mod notification;
-pub mod planner;
-pub mod scheduler;
-pub mod server;
-pub mod showcase;
-pub mod state;
-pub mod store;
-mod tracker;
-pub mod tui;
-pub mod worker;
-pub mod worktree;
+pub mod adapters;
+pub mod application;
+pub mod core;
+pub mod interfaces;
+
+pub use adapters::{executor, gitlab, interaction, notification, store, worktree};
+pub use application::{app, dashboard, matcher, planner, scheduler};
+pub use core::{calendar, domain, error, event, ids, state};
+pub use interfaces::{server, showcase, tui, worker};
 
 pub use app::MambaApp;
 pub use error::{MambaError, Result};

@@ -213,6 +213,22 @@ T-07  PR Review 与发布说明               owner=A        estimate=4h
 Control Plane 管组织和工作，Execution Plane 管一次具体执行。Tower 不亲自调用模型完成业务任务，
 而是监督 Flow、路由 WorkRequest、管理权限、资源、预算和恢复策略。
 
+### 代码模块
+
+```text
+src/
+├── core/          # 领域对象、事件、组织状态、工作日历、错误与 ID
+├── application/   # MambaApp、规划、匹配、排期、Tracker 与管理看板
+│   └── app/       # 按日历、凭证、消息、通知、交互等用例拆分的应用服务
+├── adapters/      # SQLite、终端执行器、GitLab、Webhook、通知与 worktree
+├── interfaces/    # HTTP Server、Ratatui、Remote Worker 与 Showcase
+├── bin/mamba/     # mamba CLI 入口
+└── lib.rs         # 分层模块入口与向后兼容的公开导出
+```
+
+依赖方向从 Interface 进入 Application，由 Application 使用 Core 并通过 Adapter 访问外部系统。
+`lib.rs` 继续导出 `manbaflow::domain`、`manbaflow::server` 等稳定路径，物理目录不会泄漏给调用方。
+
 ## 核心模型
 
 | 实体 | 说明 |
