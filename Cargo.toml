@@ -19,6 +19,9 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
 hmac = "0.13"
+native-tls = "0.2"
+postgres = "0.19.14"
+postgres-native-tls = "0.5.3"
 ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

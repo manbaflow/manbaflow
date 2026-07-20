@@ -10,6 +10,12 @@ pub enum MambaError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 
+    #[error("PostgreSQL error: {0}")]
+    Postgres(#[from] postgres::Error),
+
+    #[error("database TLS error: {0}")]
+    DatabaseTls(#[from] native_tls::Error),
+
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 

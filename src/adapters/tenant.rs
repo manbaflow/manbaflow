@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
+use super::postgres_store::PostgresDatabase;
 use crate::domain::Tenant;
 use crate::error::{MambaError, Result};
 
@@ -22,12 +23,102 @@ pub struct TenantRecord {
 }
 
 pub struct TenantCatalog {
-    root: PathBuf,
-    connection: Connection,
+    backend: CatalogBackend,
+}
+
+enum CatalogBackend {
+    Sqlite(SqliteTenantCatalog),
+    Postgres(PostgresTenantCatalog),
 }
 
 impl TenantCatalog {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            backend: CatalogBackend::Sqlite(SqliteTenantCatalog::open(root)?),
+        })
+    }
+
+    pub fn configured(root: impl AsRef<Path>) -> Result<Self> {
+        if let Some(database_url) = database_url_from_env()? {
+            Self::postgres(root, &database_url)
+        } else {
+            Self::open(root)
+        }
+    }
+
+    pub fn postgres(root: impl AsRef<Path>, database_url: &str) -> Result<Self> {
+        Ok(Self {
+            backend: CatalogBackend::Postgres(PostgresTenantCatalog::connect(root, database_url)?),
+        })
+    }
+
+    pub fn adopt_default(&mut self, tenant: &Tenant) -> Result<TenantRecord> {
+        match &mut self.backend {
+            CatalogBackend::Sqlite(catalog) => catalog.adopt_default(tenant),
+            CatalogBackend::Postgres(catalog) => catalog.adopt_default(tenant),
+        }
+    }
+
+    pub fn register(
+        &mut self,
+        tenant: &Tenant,
+        slug: &str,
+        storage_path: impl AsRef<Path>,
+    ) -> Result<TenantRecord> {
+        match &mut self.backend {
+            CatalogBackend::Sqlite(catalog) => catalog.register(tenant, slug, storage_path),
+            CatalogBackend::Postgres(catalog) => catalog.register(tenant, slug, storage_path),
+        }
+    }
+
+    pub fn list(&self) -> Result<Vec<TenantRecord>> {
+        match &self.backend {
+            CatalogBackend::Sqlite(catalog) => catalog.list(),
+            CatalogBackend::Postgres(catalog) => catalog.list(),
+        }
+    }
+
+    pub fn active(&self) -> Result<Vec<TenantRecord>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|record| record.active)
+            .collect())
+    }
+
+    pub fn find(&self, id_or_slug: &str) -> Result<Option<TenantRecord>> {
+        match &self.backend {
+            CatalogBackend::Sqlite(catalog) => catalog.find(id_or_slug),
+            CatalogBackend::Postgres(catalog) => catalog.find(id_or_slug),
+        }
+    }
+
+    pub fn default_tenant(&self) -> Result<Option<TenantRecord>> {
+        match &self.backend {
+            CatalogBackend::Sqlite(catalog) => catalog.default_tenant(),
+            CatalogBackend::Postgres(catalog) => catalog.default_tenant(),
+        }
+    }
+
+    pub fn data_dir(&self, record: &TenantRecord) -> Result<PathBuf> {
+        match &self.backend {
+            CatalogBackend::Sqlite(catalog) => catalog.data_dir(record),
+            CatalogBackend::Postgres(catalog) => catalog.data_dir(record),
+        }
+    }
+
+    pub fn uses_shared_storage(&self) -> bool {
+        matches!(self.backend, CatalogBackend::Postgres(_))
+    }
+}
+
+struct SqliteTenantCatalog {
+    root: PathBuf,
+    connection: Connection,
+}
+
+impl SqliteTenantCatalog {
+    fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let path = root.join("control.db");
@@ -72,7 +163,7 @@ impl TenantCatalog {
         Ok(Self { root, connection })
     }
 
-    pub fn adopt_default(&mut self, tenant: &Tenant) -> Result<TenantRecord> {
+    fn adopt_default(&mut self, tenant: &Tenant) -> Result<TenantRecord> {
         if let Some(record) = self.default_tenant()? {
             if record.id != tenant.id {
                 return Err(MambaError::Validation(format!(
@@ -85,7 +176,7 @@ impl TenantCatalog {
         self.insert(tenant, "default", Path::new("."), true)
     }
 
-    pub fn register(
+    fn register(
         &mut self,
         tenant: &Tenant,
         slug: &str,
@@ -94,7 +185,7 @@ impl TenantCatalog {
         self.insert(tenant, slug, storage_path.as_ref(), false)
     }
 
-    pub fn list(&self) -> Result<Vec<TenantRecord>> {
+    fn list(&self) -> Result<Vec<TenantRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT id, slug, name, storage_path, is_default, active, created_at
              FROM tenants ORDER BY is_default DESC, slug",
@@ -107,15 +198,7 @@ impl TenantCatalog {
         Ok(records)
     }
 
-    pub fn active(&self) -> Result<Vec<TenantRecord>> {
-        Ok(self
-            .list()?
-            .into_iter()
-            .filter(|record| record.active)
-            .collect())
-    }
-
-    pub fn find(&self, id_or_slug: &str) -> Result<Option<TenantRecord>> {
+    fn find(&self, id_or_slug: &str) -> Result<Option<TenantRecord>> {
         self.connection
             .query_row(
                 "SELECT id, slug, name, storage_path, is_default, active, created_at
@@ -127,7 +210,7 @@ impl TenantCatalog {
             .map_err(Into::into)
     }
 
-    pub fn default_tenant(&self) -> Result<Option<TenantRecord>> {
+    fn default_tenant(&self) -> Result<Option<TenantRecord>> {
         self.connection
             .query_row(
                 "SELECT id, slug, name, storage_path, is_default, active, created_at
@@ -139,7 +222,7 @@ impl TenantCatalog {
             .map_err(Into::into)
     }
 
-    pub fn data_dir(&self, record: &TenantRecord) -> Result<PathBuf> {
+    fn data_dir(&self, record: &TenantRecord) -> Result<PathBuf> {
         validate_relative_storage_path(&record.storage_path)?;
         Ok(self.root.join(&record.storage_path))
     }
@@ -179,6 +262,181 @@ impl TenantCatalog {
             created_at: tenant.created_at,
         })
     }
+}
+
+struct PostgresTenantCatalog {
+    root: PathBuf,
+    database: PostgresDatabase,
+}
+
+impl PostgresTenantCatalog {
+    fn connect(root: impl AsRef<Path>, database_url: &str) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(&root)?;
+        let database = PostgresDatabase::connect(database_url, "mamba-pg-tenant-catalog")?;
+        database.call(|client| {
+            client.batch_execute(
+                "CREATE TABLE IF NOT EXISTS mamba_tenants (
+                     id           TEXT PRIMARY KEY,
+                     slug         TEXT NOT NULL UNIQUE,
+                     name         TEXT NOT NULL,
+                     storage_path TEXT NOT NULL UNIQUE,
+                     is_default   BOOLEAN NOT NULL DEFAULT FALSE,
+                     active       BOOLEAN NOT NULL DEFAULT TRUE,
+                     created_at   TEXT NOT NULL
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_mamba_tenants_single_default
+                     ON mamba_tenants(is_default) WHERE is_default = TRUE;",
+            )?;
+            Ok(())
+        })?;
+        Ok(Self { root, database })
+    }
+
+    fn adopt_default(&mut self, tenant: &Tenant) -> Result<TenantRecord> {
+        if let Some(record) = self.default_tenant()? {
+            if record.id != tenant.id {
+                return Err(MambaError::Validation(format!(
+                    "default PostgreSQL tenant is {} but bootstrap opened {}",
+                    record.id, tenant.id
+                )));
+            }
+            return Ok(record);
+        }
+        self.insert(tenant, "default", Path::new("."), true)
+    }
+
+    fn register(
+        &mut self,
+        tenant: &Tenant,
+        slug: &str,
+        storage_path: impl AsRef<Path>,
+    ) -> Result<TenantRecord> {
+        self.insert(tenant, slug, storage_path.as_ref(), false)
+    }
+
+    fn list(&self) -> Result<Vec<TenantRecord>> {
+        self.database.call(|client| {
+            client
+                .query(
+                    "SELECT id, slug, name, storage_path, is_default, active, created_at
+                 FROM mamba_tenants ORDER BY is_default DESC, slug",
+                    &[],
+                )?
+                .into_iter()
+                .map(decode_postgres_record)
+                .collect()
+        })
+    }
+
+    fn find(&self, id_or_slug: &str) -> Result<Option<TenantRecord>> {
+        let id_or_slug = id_or_slug.to_string();
+        self.database.call(move |client| {
+            client
+                .query_opt(
+                    "SELECT id, slug, name, storage_path, is_default, active, created_at
+                 FROM mamba_tenants WHERE id = $1 OR slug = $1",
+                    &[&id_or_slug],
+                )?
+                .map(decode_postgres_record)
+                .transpose()
+        })
+    }
+
+    fn default_tenant(&self) -> Result<Option<TenantRecord>> {
+        self.database.call(|client| {
+            client
+                .query_opt(
+                    "SELECT id, slug, name, storage_path, is_default, active, created_at
+                 FROM mamba_tenants WHERE is_default = TRUE",
+                    &[],
+                )?
+                .map(decode_postgres_record)
+                .transpose()
+        })
+    }
+
+    fn data_dir(&self, record: &TenantRecord) -> Result<PathBuf> {
+        validate_relative_storage_path(&record.storage_path)?;
+        Ok(self.root.join(&record.storage_path))
+    }
+
+    fn insert(
+        &mut self,
+        tenant: &Tenant,
+        slug: &str,
+        storage_path: &Path,
+        is_default: bool,
+    ) -> Result<TenantRecord> {
+        let slug = validate_slug(slug)?;
+        validate_relative_storage_path(storage_path)?;
+        let storage_path = storage_path.to_path_buf();
+        let storage_text = storage_path
+            .to_str()
+            .ok_or_else(|| {
+                MambaError::Validation("tenant storage path must be valid UTF-8".into())
+            })?
+            .to_string();
+        let tenant_id = tenant.id.clone();
+        let tenant_name = tenant.name.clone();
+        let created_at = tenant.created_at.to_rfc3339();
+        let stored_slug = slug.clone();
+        self.database.call(move |client| {
+            client.execute(
+                "INSERT INTO mamba_tenants(
+                    id, slug, name, storage_path, is_default, active, created_at
+                 ) VALUES ($1, $2, $3, $4, $5, TRUE, $6)",
+                &[
+                    &tenant_id,
+                    &stored_slug,
+                    &tenant_name,
+                    &storage_text,
+                    &is_default,
+                    &created_at,
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(TenantRecord {
+            id: tenant.id.clone(),
+            slug,
+            name: tenant.name.clone(),
+            storage_path,
+            is_default,
+            active: true,
+            created_at: tenant.created_at,
+        })
+    }
+}
+
+fn decode_postgres_record(row: postgres::Row) -> Result<TenantRecord> {
+    let created_at = DateTime::parse_from_rfc3339(row.get::<_, String>(6).as_str())
+        .map_err(|error| MambaError::Validation(error.to_string()))?
+        .with_timezone(&Utc);
+    Ok(TenantRecord {
+        id: row.get(0),
+        slug: row.get(1),
+        name: row.get(2),
+        storage_path: PathBuf::from(row.get::<_, String>(3)),
+        is_default: row.get(4),
+        active: row.get(5),
+        created_at,
+    })
+}
+
+pub fn database_url_from_env() -> Result<Option<String>> {
+    let Some(value) = std::env::var_os("MAMBA_DATABASE_URL") else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| MambaError::Validation("MAMBA_DATABASE_URL must be valid UTF-8".into()))?;
+    if value.trim().is_empty() {
+        return Err(MambaError::Validation(
+            "MAMBA_DATABASE_URL cannot be empty".into(),
+        ));
+    }
+    Ok(Some(value))
 }
 
 fn decode_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TenantRecord> {

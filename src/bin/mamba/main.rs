@@ -12,9 +12,10 @@ use manbaflow::domain::{
     Task, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use manbaflow::gitlab::GitLabClient;
+use manbaflow::ids::new_id;
 use manbaflow::planner::PlannerKind;
 use manbaflow::showcase::seed_showcase;
-use manbaflow::tenant::{TenantCatalog, TenantRecord, validate_slug};
+use manbaflow::tenant::{TenantCatalog, TenantRecord, database_url_from_env, validate_slug};
 use manbaflow::worker::{RemoteWorker, WorkerOptions, WorkerOutcome, WorkerOutcomeStatus};
 use manbaflow::{MambaApp, MambaError, Result};
 use serde::Serialize;
@@ -791,6 +792,12 @@ enum OpsCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// 把本地 SQLite Tenant Fleet 原样迁移到共享 PostgreSQL 数据面
+    MigratePostgres {
+        /// 保存目标 PostgreSQL URL 的环境变量名
+        #[arg(long, default_value = "MAMBA_TARGET_DATABASE_URL")]
+        target_env: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -933,8 +940,17 @@ async fn run(cli: Cli) -> Result<()> {
                 .into(),
         ));
     }
-    let selected_data_dir = selected_tenant_data_dir(&cli.data_dir, cli.tenant.as_deref())?;
-    let mut app = MambaApp::open(&selected_data_dir)?;
+    let allow_postgres_bootstrap = matches!(
+        &command,
+        Command::Org {
+            command: OrgCommand::Init { .. }
+        }
+    );
+    let mut app = open_selected_app(
+        &cli.data_dir,
+        cli.tenant.as_deref(),
+        allow_postgres_bootstrap,
+    )?;
     match command {
         Command::Tui { actor, workspace } => {
             manbaflow::tui::run(
@@ -969,7 +985,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Tenant { command } => {
             let tenant = app.state().tenant()?.clone();
-            let mut catalog = TenantCatalog::open(&cli.data_dir)?;
+            let mut catalog = TenantCatalog::configured(&cli.data_dir)?;
             catalog.adopt_default(&tenant)?;
             match command {
                 TenantCommand::Create { name, slug, by } => {
@@ -987,7 +1003,11 @@ async fn run(cli: Cli) -> Result<()> {
                             tenant_data_dir.display()
                         )));
                     }
-                    let mut tenant_app = MambaApp::open(&tenant_data_dir)?;
+                    let mut tenant_app = if let Some(database_url) = database_url_from_env()? {
+                        MambaApp::open_postgres(&tenant_data_dir, &database_url, &new_id("TEN"))?
+                    } else {
+                        MambaApp::open(&tenant_data_dir)?
+                    };
                     tenant_app.init_organization(&name, &by)?;
                     let tenant = tenant_app.state().tenant()?.clone();
                     let record = catalog.register(&tenant, &slug, &relative_path)?;
@@ -1009,6 +1029,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Org { command } => match command {
             OrgCommand::Init { name, by } => {
                 let org = app.init_organization(&name, &by)?;
+                let mut catalog = TenantCatalog::configured(&cli.data_dir)?;
+                catalog.adopt_default(app.state().tenant()?)?;
                 output(
                     &org,
                     cli.json,
@@ -2017,6 +2039,32 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("Ledger 快照已落地：{}", path.display()),
                 );
             }
+            OpsCommand::MigratePostgres { target_env } => {
+                if app.uses_shared_storage() {
+                    return Err(MambaError::Validation(
+                        "PostgreSQL migration source must be a local SQLite data directory".into(),
+                    ));
+                }
+                let database_url = std::env::var(&target_env).map_err(|_| {
+                    MambaError::Validation(format!(
+                        "target database URL environment variable is missing: {target_env}"
+                    ))
+                })?;
+                let report =
+                    manbaflow::migration::sqlite_fleet_to_postgres(&cli.data_dir, &database_url)?;
+                output(
+                    &report,
+                    cli.json,
+                    format!(
+                        "PostgreSQL 数据面就位：{} Tenant，迁移 {}，幂等复核 {}，{} events，{} credentials",
+                        report.tenants,
+                        report.migrated_tenants,
+                        report.replayed_tenants,
+                        report.events,
+                        report.credentials
+                    ),
+                );
+            }
         },
         Command::Demo {
             workspace,
@@ -2044,6 +2092,38 @@ fn selected_tenant_data_dir(root: &Path, selector: Option<&str>) -> Result<PathB
         )));
     }
     catalog.data_dir(&record)
+}
+
+fn open_selected_app(
+    root: &Path,
+    selector: Option<&str>,
+    allow_postgres_bootstrap: bool,
+) -> Result<MambaApp> {
+    let Some(database_url) = database_url_from_env()? else {
+        return MambaApp::open(selected_tenant_data_dir(root, selector)?);
+    };
+    let catalog = TenantCatalog::postgres(root, &database_url)?;
+    let record = if let Some(selector) = selector {
+        catalog
+            .find(selector)?
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "tenant",
+                id: selector.to_string(),
+            })?
+    } else if let Some(record) = catalog.default_tenant()? {
+        record
+    } else if allow_postgres_bootstrap {
+        return MambaApp::open_postgres(root, &database_url, &new_id("TEN"));
+    } else {
+        return Err(MambaError::TenantNotInitialized);
+    };
+    if !record.active {
+        return Err(MambaError::PermissionDenied(format!(
+            "tenant {} is inactive",
+            record.id
+        )));
+    }
+    MambaApp::open_postgres(catalog.data_dir(&record)?, &database_url, &record.id)
 }
 
 fn format_tenant_records(records: &[TenantRecord]) -> String {

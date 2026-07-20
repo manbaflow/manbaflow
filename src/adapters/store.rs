@@ -6,6 +6,7 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::postgres_store::PostgresEventStore;
 use crate::error::{MambaError, Result};
 use crate::event::{CURRENT_EVENT_VERSION, DomainEvent, EventEnvelope};
 use crate::ids::new_id;
@@ -15,6 +16,7 @@ const SCHEMA_VERSION: i64 = 3;
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct StorageHealth {
     pub path: PathBuf,
+    pub backend: String,
     pub schema_version: i64,
     pub journal_mode: String,
     pub integrity: String,
@@ -22,10 +24,144 @@ pub struct StorageHealth {
     pub active_credentials: i64,
 }
 
+pub(crate) enum FlowStore {
+    Sqlite(EventStore),
+    Postgres(PostgresEventStore),
+}
+
+impl FlowStore {
+    pub fn sqlite(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::Sqlite(EventStore::open(path)?))
+    }
+
+    pub fn postgres(database_url: &str, tenant_id: &str) -> Result<Self> {
+        Ok(Self::Postgres(PostgresEventStore::connect(
+            database_url,
+            tenant_id,
+        )?))
+    }
+
+    pub fn health(&self) -> Result<StorageHealth> {
+        match self {
+            Self::Sqlite(store) => store.health(),
+            Self::Postgres(store) => store.health(),
+        }
+    }
+
+    pub fn backup(&mut self, destination: impl AsRef<Path>) -> Result<PathBuf> {
+        match self {
+            Self::Sqlite(store) => store.backup(destination),
+            Self::Postgres(_) => Err(MambaError::Validation(
+                "PostgreSQL storage must be backed up with database snapshots or PITR".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn append_prepared(
+        &mut self,
+        expected_sequence: i64,
+        envelopes: &[EventEnvelope],
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => store.append_prepared(expected_sequence, envelopes),
+            Self::Postgres(store) => store.append_prepared(expected_sequence, envelopes),
+        }
+    }
+
+    pub fn load_all(&self) -> Result<Vec<EventEnvelope>> {
+        match self {
+            Self::Sqlite(store) => store.load_all(),
+            Self::Postgres(store) => store.load_all(),
+        }
+    }
+
+    pub fn load_flow(&self, flow_id: &str) -> Result<Vec<EventEnvelope>> {
+        match self {
+            Self::Sqlite(store) => store.load_flow(flow_id),
+            Self::Postgres(store) => store.load_flow(flow_id),
+        }
+    }
+
+    pub fn load_after(&self, sequence: i64) -> Result<Vec<EventEnvelope>> {
+        match self {
+            Self::Sqlite(store) => store.load_after(sequence),
+            Self::Postgres(store) => store.load_after(sequence),
+        }
+    }
+
+    pub fn insert_credential(
+        &mut self,
+        id: &str,
+        principal_id: &str,
+        token_hash: &[u8],
+        created_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => {
+                store.insert_credential(id, principal_id, token_hash, created_at, expires_at)
+            }
+            Self::Postgres(store) => {
+                store.insert_credential(id, principal_id, token_hash, created_at, expires_at)
+            }
+        }
+    }
+
+    pub fn delete_credential(&mut self, id: &str) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => store.delete_credential(id),
+            Self::Postgres(store) => store.delete_credential(id),
+        }
+    }
+
+    pub fn revoke_credential(&mut self, id: &str, revoked_at: DateTime<Utc>) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => store.revoke_credential(id, revoked_at),
+            Self::Postgres(store) => store.revoke_credential(id, revoked_at),
+        }
+    }
+
+    pub fn authenticate_credential(&self, token_hash: &[u8]) -> Result<Option<(String, String)>> {
+        match self {
+            Self::Sqlite(store) => store.authenticate_credential(token_hash),
+            Self::Postgres(store) => store.authenticate_credential(token_hash),
+        }
+    }
+
+    pub fn tenant_id(&self) -> Option<&str> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(store) => Some(store.tenant_id()),
+        }
+    }
+
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Postgres(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_sequence(&self) -> Result<i64> {
+        match self {
+            Self::Sqlite(store) => store.current_sequence(),
+            Self::Postgres(store) => store.current_sequence(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct StoredEvent<'a> {
     version: u16,
     event: &'a DomainEvent,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CredentialSnapshot {
+    pub id: String,
+    pub principal_id: String,
+    pub token_hash: Vec<u8>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub revoked_at: Option<String>,
 }
 
 pub struct EventStore {
@@ -149,6 +285,7 @@ impl EventStore {
         )?;
         Ok(StorageHealth {
             path: self.path.clone(),
+            backend: "sqlite".into(),
             schema_version,
             journal_mode,
             integrity,
@@ -332,6 +469,14 @@ impl EventStore {
         )
     }
 
+    pub fn load_after(&self, sequence: i64) -> Result<Vec<EventEnvelope>> {
+        self.load_where(
+            "SELECT sequence, id, organization_id, flow_id, actor, kind, payload, occurred_at
+             FROM events WHERE sequence > ?1 ORDER BY sequence",
+            [&sequence.to_string()],
+        )
+    }
+
     pub fn insert_credential(
         &mut self,
         id: &str,
@@ -387,6 +532,28 @@ impl EventStore {
         } else {
             Ok(None)
         }
+    }
+
+    pub(crate) fn export_credentials(&self) -> Result<Vec<CredentialSnapshot>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, principal_id, token_hash, created_at, expires_at, revoked_at
+             FROM api_credentials ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(CredentialSnapshot {
+                id: row.get(0)?,
+                principal_id: row.get(1)?,
+                token_hash: row.get(2)?,
+                created_at: row.get(3)?,
+                expires_at: row.get(4)?,
+                revoked_at: row.get(5)?,
+            })
+        })?;
+        let mut credentials = Vec::new();
+        for row in rows {
+            credentials.push(row?);
+        }
+        Ok(credentials)
     }
 
     fn load_where<const N: usize>(
@@ -458,7 +625,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn decode_event_payload(payload: &str) -> Result<(u16, DomainEvent)> {
+pub(crate) fn decode_event_payload(payload: &str) -> Result<(u16, DomainEvent)> {
     let value = serde_json::from_str::<Value>(payload)?;
     let Some(object) = value.as_object() else {
         return Err(MambaError::Validation(

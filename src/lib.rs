@@ -4,7 +4,7 @@ pub mod core;
 pub mod interfaces;
 
 pub use adapters::{
-    capability, executor, gitlab, interaction, notification, store, tenant, worktree,
+    capability, executor, gitlab, interaction, migration, notification, store, tenant, worktree,
 };
 pub use application::{app, dashboard, matcher, planner, scheduler};
 pub use core::{calendar, domain, error, event, ids, state};

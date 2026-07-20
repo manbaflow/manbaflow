@@ -1,8 +1,8 @@
-# MambaFlow 单节点生产部署
+# MambaFlow 生产部署
 
-这份手册覆盖当前 v0 能支持的边界：一个 `mamba serve` 进程、一个 Tenant Catalog、每个 Tenant 一个
-SQLite Ledger，远程 Worker 分布在员工工作站。它不是多地域高可用方案，也不替代 OIDC/SCIM、容器
-沙箱或集中 Secret Manager。
+这份手册覆盖两种数据面：单节点使用一个 `mamba serve` 进程、一个 Tenant Catalog、每个 Tenant 一个
+SQLite Ledger；多副本使用共享 PostgreSQL。远程 Worker 分布在员工工作站。它不是多地域数据库方案，
+也不替代 OIDC/SCIM、容器沙箱或集中 Secret Manager。
 
 ## 1. 数据目录
 
@@ -14,7 +14,7 @@ install -d -m 0700 -o manbaflow -g manbaflow /var/lib/manbaflow
 sudo -u manbaflow mamba --data-dir /var/lib/manbaflow ops doctor
 ```
 
-启动时数据库使用 WAL、`synchronous=FULL`、外键检查、5 秒 busy timeout 和严格 schema 版本。Unix
+SQLite 启动时使用 WAL、`synchronous=FULL`、外键检查、5 秒 busy timeout 和严格 schema 版本。Unix
 数据目录和 SQLite 文件会收紧为 `0700` 与 `0600`。二进制遇到未来版本 schema 会拒绝启动，不会把
 版本号静默改回去。
 
@@ -30,6 +30,17 @@ mamba --data-dir /var/lib/manbaflow --tenant mamba-apac ops doctor
 
 禁止手工交换 Tenant 目录或修改 Catalog 指向。服务启动时会核对 Catalog Tenant ID 与 Ledger 内事件状态，
 不一致时拒绝启动。
+
+多副本使用独立 PostgreSQL 数据库和最小权限账号。数据库 URL 只通过 Secret 注入：
+
+```bash
+export MAMBA_DATABASE_URL='postgresql://mamba@db.internal/manbaflow?sslmode=require'
+mamba --data-dir /var/lib/manbaflow serve --bind 127.0.0.1:7777
+```
+
+所有副本共享 `mamba_tenants`、`mamba_events`、`mamba_streams` 和 `mamba_api_credentials`。每次提交在事务
+内对 Tenant 的 `mamba_streams` 行执行 `FOR UPDATE`，校验预期 sequence 后才追加事件；每个 API 请求先
+刷新事件投影。`--data-dir` 仍需可写空间存放本副本运行产物，但不能在多个副本之间当作状态源。
 
 ## 2. TLS 入口
 
@@ -74,7 +85,7 @@ mamba --data-dir /var/lib/manbaflow principal token issue \
 
 ```text
 GET /health/live   -> 进程是否存活
-GET /health/ready  -> 组织已初始化，SQLite quick_check=ok
+GET /health/ready  -> 组织已初始化，存储连接和 schema 正常
 ```
 
 `/metrics` 输出 Prometheus 文本，但必须使用拥有 `dashboard_read` 权限的 Bearer Token。当前指标包括
@@ -97,6 +108,19 @@ mamba --data-dir /var/lib/manbaflow ops backup \
 快照运行 `quick_check`。把备份复制到不同故障域，并使用基础设施自己的加密与保留策略。只复制正在
 运行的 `flow.db` 而忽略 WAL 不是受支持的备份方式。
 
+PostgreSQL 模式下 `mamba ops backup` 会拒绝执行。使用托管数据库快照、连续 WAL 归档或 PITR，并同时
+验证 `mamba_tenants`、每个 Tenant 的 `mamba_streams.current_sequence` 与 `mamba_events` 最大 sequence。
+
+SQLite 切换 PostgreSQL 前先停止写入，然后执行可重复迁移：
+
+```bash
+export MAMBA_TARGET_DATABASE_URL='postgresql://mamba@db.internal/manbaflow?sslmode=require'
+mamba --data-dir /var/lib/manbaflow ops migrate-postgres
+```
+
+迁移保留事件 ID、sequence、发生时间、Credential 摘要、到期和撤销状态。第二次运行必须报告全部 Tenant
+为“幂等复核”；如果目标已有不同计数或 Catalog 定义，命令会拒绝覆盖。
+
 ## 6. 恢复演练
 
 1. 停止 `mamba serve`，确认没有 Worker 或 CLI 仍写入旧 Control Plane，并记录 `tenant list` 输出。
@@ -115,8 +139,7 @@ Secret 不在数据库内，灾备环境必须从 Secret Manager 单独恢复。
 
 ## 7. 当前限制
 
-- 一个进程可以承载多个隔离 Tenant，但所有 Catalog 和 Ledger 仍位于同一节点；
-- 只支持单个 Control Plane 写进程，不支持水平扩展；
+- SQLite 模式仍只支持单个写进程；PostgreSQL 模式支持多个 Control Plane 副本；
 - 没有 OIDC、SCIM、集中策略引擎和分布式限流；
 - Remote Worker 使用 Git worktree 隔离，不是容器或虚拟机安全边界；
 - Office Pack 只生成待 Human 发布的本地草稿，不直接写 Microsoft 365 或 Google Workspace；

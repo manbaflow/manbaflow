@@ -21,7 +21,7 @@ use crate::matcher::Matcher;
 use crate::planner::{PlannerKind, generate_plan, generate_revision_plan};
 use crate::scheduler::{reschedule, schedule};
 use crate::state::OrganizationState;
-use crate::store::{EventStore, StorageHealth};
+use crate::store::{FlowStore, StorageHealth};
 
 mod actions;
 mod authority;
@@ -42,7 +42,7 @@ pub use self::credentials::tenant_token_hint;
 
 pub struct MambaApp {
     data_dir: PathBuf,
-    store: EventStore,
+    store: FlowStore,
     state: OrganizationState,
 }
 
@@ -71,8 +71,32 @@ impl MambaApp {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
         restrict_data_dir_permissions(&data_dir)?;
-        let store = EventStore::open(data_dir.join("flow.db"))?;
+        let store = FlowStore::sqlite(data_dir.join("flow.db"))?;
+        Self::open_with_store(data_dir, store)
+    }
+
+    pub fn open_postgres(
+        data_dir: impl AsRef<Path>,
+        database_url: &str,
+        tenant_id: &str,
+    ) -> Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        fs::create_dir_all(&data_dir)?;
+        restrict_data_dir_permissions(&data_dir)?;
+        let store = FlowStore::postgres(database_url, tenant_id)?;
+        Self::open_with_store(data_dir, store)
+    }
+
+    fn open_with_store(data_dir: PathBuf, store: FlowStore) -> Result<Self> {
         let state = OrganizationState::replay(&store.load_all()?)?;
+        if let (Some(expected), Some(actual)) = (store.tenant_id(), state.tenant.as_ref())
+            && expected != actual.id
+        {
+            return Err(MambaError::Validation(format!(
+                "PostgreSQL stream {expected} contains events for tenant {}",
+                actual.id
+            )));
+        }
         let mut app = Self {
             data_dir,
             store,
@@ -96,12 +120,30 @@ impl MambaApp {
         self.store.health()
     }
 
+    pub fn uses_shared_storage(&self) -> bool {
+        self.store.is_shared()
+    }
+
     pub fn backup_storage(&mut self, destination: impl AsRef<Path>) -> Result<PathBuf> {
         self.store.backup(destination)
     }
 
     pub fn reload(&mut self) -> Result<()> {
         self.state = OrganizationState::replay(&self.store.load_all()?)?;
+        Ok(())
+    }
+
+    pub fn refresh_shared_state(&mut self) -> Result<()> {
+        if self.store.is_shared() {
+            let events = self.store.load_after(self.state.last_sequence)?;
+            if !events.is_empty() {
+                let mut projected = self.state.clone();
+                for event in &events {
+                    projected.apply(event)?;
+                }
+                self.state = projected;
+            }
+        }
         Ok(())
     }
 
@@ -119,7 +161,11 @@ impl MambaApp {
         }
         let now = Utc::now();
         let tenant = Tenant {
-            id: new_id("TEN"),
+            id: self
+                .store
+                .tenant_id()
+                .map(str::to_string)
+                .unwrap_or_else(|| new_id("TEN")),
             name: name.trim().to_string(),
             created_at: now,
         };

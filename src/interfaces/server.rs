@@ -34,7 +34,7 @@ use crate::interaction::{
 };
 use crate::notification::NotificationDispatchSummary;
 use crate::planner::PlannerKind;
-use crate::tenant::TenantCatalog;
+use crate::tenant::{TenantCatalog, database_url_from_env};
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -403,17 +403,28 @@ pub async fn run_fleet(
 ) -> Result<()> {
     validate_server_options(&options)?;
     let data_dir = data_dir.as_ref();
-    let default_app = MambaApp::open(data_dir)?;
-    let default_tenant = default_app.state().tenant()?.clone();
-    let mut catalog = TenantCatalog::open(data_dir)?;
-    let default_record = catalog.adopt_default(&default_tenant)?;
+    let database_url = database_url_from_env()?;
+    let mut catalog = TenantCatalog::configured(data_dir)?;
+    let (default_record, mut default_app) = if database_url.is_some() {
+        let record = catalog.default_tenant()?.ok_or_else(|| {
+            MambaError::Validation(
+                "PostgreSQL tenant catalog is empty; run `mamba org init` before serve".into(),
+            )
+        })?;
+        (record, None)
+    } else {
+        let app = MambaApp::open(data_dir)?;
+        let record = catalog.adopt_default(app.state().tenant()?)?;
+        (record, Some(app))
+    };
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
     let interaction_auth = InteractionWebhookAuth::from_env()?;
     let mut routers = BTreeMap::new();
-    let mut default_app = Some(default_app);
 
     for record in catalog.active()? {
-        let app = if record.id == default_record.id {
+        let app = if let Some(database_url) = database_url.as_deref() {
+            MambaApp::open_postgres(catalog.data_dir(&record)?, database_url, &record.id)?
+        } else if record.id == default_record.id {
             if default_record.storage_path != record.storage_path {
                 return Err(MambaError::Validation(
                     "default tenant storage path changed while loading the fleet".into(),
@@ -533,6 +544,11 @@ fn router(
     interaction_auth: InteractionWebhookAuth,
 ) -> Router {
     let rate_limit = RateLimitState::default();
+    let state = ApiState {
+        app,
+        gitlab_webhook_auth,
+        interaction_auth,
+    };
     Router::new()
         .route("/console", get(crate::console::index))
         .route(
@@ -625,11 +641,32 @@ fn router(
         .route("/api/v1/connectors/slack/actions", post(slack_interaction))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(rate_limit, request_guard))
-        .with_state(ApiState {
-            app,
-            gitlab_webhook_auth,
-            interaction_auth,
-        })
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            refresh_shared_ledger,
+        ))
+        .with_state(state)
+}
+
+async fn refresh_shared_ledger(
+    State(state): State<ApiState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let needs_state = request.uri().path().starts_with("/api/")
+        || matches!(request.uri().path(), "/metrics" | "/health/ready");
+    if needs_state {
+        let mut app = state.app.lock().await;
+        if let Err(error) = app.refresh_shared_state() {
+            eprintln!("shared Flow Ledger refresh failed: {error}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "shared Flow Ledger is unavailable"})),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 async fn request_guard(
