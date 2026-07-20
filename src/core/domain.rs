@@ -915,8 +915,105 @@ pub enum FailureClass {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityPack {
+    #[default]
+    General,
+    Coding,
+    Office,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliverableKind {
+    Code,
+    Document,
+    Spreadsheet,
+    Presentation,
+    EmailDraft,
+    CalendarProposal,
+    Other,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputContract {
+    pub allowed_extensions: Vec<String>,
+    pub min_deliverables: u32,
+    pub requires_human_release: bool,
+}
+
+impl OutputContract {
+    pub fn for_pack(pack: CapabilityPack) -> Self {
+        match pack {
+            CapabilityPack::General => Self::default(),
+            CapabilityPack::Coding => Self {
+                allowed_extensions: Vec::new(),
+                min_deliverables: 0,
+                requires_human_release: true,
+            },
+            CapabilityPack::Office => Self {
+                allowed_extensions: [
+                    "md", "txt", "html", "pdf", "docx", "csv", "xlsx", "pptx", "eml", "ics",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                min_deliverables: 1,
+                requires_human_release: true,
+            },
+        }
+    }
+}
+
+impl Default for OutputContract {
+    fn default() -> Self {
+        Self {
+            allowed_extensions: Vec::new(),
+            min_deliverables: 0,
+            requires_human_release: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlightDeliverable {
+    pub path: String,
+    pub kind: DeliverableKind,
+    pub requires_human_release: bool,
+}
+
+impl FlightDeliverable {
+    pub fn from_path(path: String, requires_human_release: bool) -> Self {
+        let extension = std::path::Path::new(&path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase);
+        let kind = match extension.as_deref() {
+            Some(
+                "rs" | "go" | "py" | "js" | "ts" | "tsx" | "jsx" | "java" | "kt" | "c" | "h"
+                | "cpp" | "hpp" | "cs" | "rb" | "php" | "swift" | "scala" | "sh" | "toml" | "yaml"
+                | "yml",
+            ) => DeliverableKind::Code,
+            Some("md" | "txt" | "html" | "pdf" | "docx") => DeliverableKind::Document,
+            Some("csv" | "xlsx") => DeliverableKind::Spreadsheet,
+            Some("pptx") => DeliverableKind::Presentation,
+            Some("eml") => DeliverableKind::EmailDraft,
+            Some("ics") => DeliverableKind::CalendarProposal,
+            _ => DeliverableKind::Other,
+        };
+        Self {
+            path,
+            kind,
+            requires_human_release,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct FlightManifestDraft {
+    #[serde(default)]
+    pub capability_pack: Option<CapabilityPack>,
     #[serde(default)]
     pub objective: Option<String>,
     #[serde(default)]
@@ -931,6 +1028,8 @@ pub struct FlightManifestDraft {
     pub recovery: Option<RecoveryPolicy>,
     #[serde(default)]
     pub resources: Vec<ResourceClaim>,
+    #[serde(default)]
+    pub output_contract: Option<OutputContract>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -943,6 +1042,10 @@ pub struct FlightManifest {
     pub fuel: FuelBudget,
     pub recovery: RecoveryPolicy,
     pub resources: Vec<ResourceClaim>,
+    #[serde(default)]
+    pub capability_pack: CapabilityPack,
+    #[serde(default)]
+    pub output_contract: OutputContract,
     pub declared_by: String,
     pub declared_at: DateTime<Utc>,
 }
@@ -981,6 +1084,10 @@ pub struct RemoteFlightReport {
     pub failure_class: Option<FailureClass>,
     #[serde(default)]
     pub budget_exhaustions: Vec<String>,
+    #[serde(default)]
+    pub deliverables: Vec<FlightDeliverable>,
+    #[serde(default)]
+    pub contract_violations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

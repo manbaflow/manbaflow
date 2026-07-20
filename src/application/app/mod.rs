@@ -6,11 +6,12 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::dashboard::{DashboardSnapshot, build_dashboard};
 use crate::domain::{
-    Assignment, AssignmentTarget, Demand, Estimate, Evidence, ExecutionRecord, ExecutorConfig,
-    ExecutorKind, ExecutorMode, ExternalArtifact, FailureClass, FlightLease, FlightLeaseStatus,
-    FlightManifestDraft, Flow, FlowChangeImpact, FlowChangeRequest, FlowChangeStatus,
-    FlowScheduleRevision, FlowStatus, Organization, OrganizationRole, Principal, PrincipalKind,
-    RemoteFlightReport, RoleBinding, TargetKind, Task, TaskDraft, TaskStatus, Team, Tenant,
+    Assignment, AssignmentTarget, DeliverableKind, Demand, Estimate, Evidence, ExecutionRecord,
+    ExecutorConfig, ExecutorKind, ExecutorMode, ExternalArtifact, FailureClass, FlightLease,
+    FlightLeaseStatus, FlightManifestDraft, Flow, FlowChangeImpact, FlowChangeRequest,
+    FlowChangeStatus, FlowScheduleRevision, FlowStatus, Organization, OrganizationRole, Principal,
+    PrincipalKind, RemoteFlightReport, RoleBinding, TargetKind, Task, TaskDraft, TaskStatus, Team,
+    Tenant,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -1558,13 +1559,18 @@ impl MambaApp {
             )));
         }
         validate_remote_flight_report(&lease, &report)?;
+        report.deliverables = self.normalize_deliverables(&lease, &report.changed_files);
+        report.contract_violations = self.output_contract_violations(&lease, &report);
         report.budget_exhaustions = self.fuel_exhaustions(&lease, &report);
-        let effective_landed = landed && report.budget_exhaustions.is_empty();
+        let effective_landed =
+            landed && report.budget_exhaustions.is_empty() && report.contract_violations.is_empty();
         if !effective_landed && report.failure_class.is_none() {
-            report.failure_class = Some(if report.budget_exhaustions.is_empty() {
-                FailureClass::Unknown
-            } else {
+            report.failure_class = Some(if !report.budget_exhaustions.is_empty() {
                 FailureClass::Budget
+            } else if !report.contract_violations.is_empty() {
+                FailureClass::Validation
+            } else {
+                FailureClass::Unknown
             });
         }
         if matches!(
@@ -1613,6 +1619,34 @@ impl MambaApp {
             },
         ];
         if effective_landed {
+            events.extend(report.deliverables.iter().map(|deliverable| {
+                DomainEvent::EvidenceAdded {
+                    flow_id: lease.flow_id.clone(),
+                    task_id: lease.task_id.clone(),
+                    evidence: Evidence {
+                        id: new_id("EVD"),
+                        kind: match deliverable.kind {
+                            DeliverableKind::Code => "code",
+                            DeliverableKind::Document => "document",
+                            DeliverableKind::Spreadsheet => "spreadsheet",
+                            DeliverableKind::Presentation => "presentation",
+                            DeliverableKind::EmailDraft => "email_draft",
+                            DeliverableKind::CalendarProposal => "calendar_proposal",
+                            DeliverableKind::Other => "artifact",
+                        }
+                        .into(),
+                        uri: format!("flight://{}/artifact/{}", lease.id, deliverable.path),
+                        summary: format!(
+                            "Flight deliverable awaiting Human release: {}",
+                            deliverable.path
+                        ),
+                        created_by: principal.name.clone(),
+                        created_at: finished_at,
+                    },
+                }
+            }));
+        }
+        if effective_landed {
             events.push(DomainEvent::TaskHeartbeat {
                 flow_id: lease.flow_id.clone(),
                 task_id: lease.task_id.clone(),
@@ -1626,14 +1660,21 @@ impl MambaApp {
         } else {
             let budget_reason = (!report.budget_exhaustions.is_empty())
                 .then(|| format!("; fuel exhausted: {}", report.budget_exhaustions.join(", ")));
+            let contract_reason = (!report.contract_violations.is_empty()).then(|| {
+                format!(
+                    "; landing contract: {}",
+                    report.contract_violations.join(", ")
+                )
+            });
             events.push(DomainEvent::TaskBlocked {
                 flow_id: lease.flow_id.clone(),
                 task_id: lease.task_id.clone(),
                 actor: principal.name.clone(),
                 reason: format!(
-                    "remote execution flight crashed: {}{}",
+                    "remote execution flight crashed: {}{}{}",
                     report.summary,
-                    budget_reason.as_deref().unwrap_or_default()
+                    budget_reason.as_deref().unwrap_or_default(),
+                    contract_reason.as_deref().unwrap_or_default()
                 ),
                 at: finished_at,
             });
@@ -2214,9 +2255,9 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        AttentionSeverity, ExternalInteractionAction, FlowMessageKind, FuelBudget, FuelUsage,
-        NotificationConnector, NotificationStatus, RecoveryAction, ResourceClaim, ResourceKind,
-        ResourceLeaseStatus,
+        AttentionSeverity, CapabilityPack, ExternalInteractionAction, FlowMessageKind, FuelBudget,
+        FuelUsage, NotificationConnector, NotificationStatus, RecoveryAction, ResourceClaim,
+        ResourceKind, ResourceLeaseStatus,
     };
     use crate::notification::NotificationAttempt;
 
@@ -2775,12 +2816,17 @@ mod tests {
             fuel: Default::default(),
             failure_class: None,
             budget_exhaustions: Vec::new(),
+            deliverables: Vec::new(),
+            contract_violations: Vec::new(),
         };
         let landed = app
             .finish_remote_flight(&lease.id, &agent.name, true, report.clone())
             .unwrap();
         assert_eq!(landed.status, FlightLeaseStatus::Landed);
-        assert_eq!(landed.report, Some(report));
+        assert_eq!(
+            landed.report.as_ref().unwrap().deliverables[0].kind,
+            DeliverableKind::Code
+        );
         assert!(app.state().resource_leases.values().any(|resource| {
             resource.flight_lease_id == lease.id && resource.status == ResourceLeaseStatus::Released
         }));
@@ -2817,6 +2863,112 @@ mod tests {
             app.claim_remote_flight(&revoked.id, &agent.name, "WRUN-revoked")
                 .is_err()
         );
+
+        let office = app
+            .authorize_remote_flight_with_manifest(
+                &task_id,
+                &human.name,
+                &agent.name,
+                ExecutorKind::Codex,
+                3_600,
+                FlightManifestDraft {
+                    capability_pack: Some(CapabilityPack::Office),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            office
+                .manifest
+                .as_ref()
+                .unwrap()
+                .output_contract
+                .requires_human_release
+        );
+        app.claim_remote_flight(&office.id, &agent.name, "WRUN-office")
+            .unwrap();
+        let now = Utc::now();
+        let office_landed = app
+            .finish_remote_flight(
+                &office.id,
+                &agent.name,
+                true,
+                RemoteFlightReport {
+                    run_id: "WRUN-office".into(),
+                    executor: ExecutorKind::Codex,
+                    summary: "release notes draft is ready".into(),
+                    base_revision: "abc123".into(),
+                    changed_files: vec!["docs/release-notes.docx".into()],
+                    patch_sha256: Some("c".repeat(64)),
+                    log_sha256: "d".repeat(64),
+                    started_at: now,
+                    finished_at: now,
+                    fuel: Default::default(),
+                    failure_class: None,
+                    budget_exhaustions: Vec::new(),
+                    deliverables: Vec::new(),
+                    contract_violations: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(office_landed.status, FlightLeaseStatus::Landed);
+        assert_eq!(
+            office_landed.report.as_ref().unwrap().deliverables[0].kind,
+            DeliverableKind::Document
+        );
+        assert!(
+            app.state()
+                .find_task(&task_id)
+                .unwrap()
+                .1
+                .evidence
+                .iter()
+                .any(|evidence| evidence.kind == "document"
+                    && evidence.uri.contains("release-notes.docx"))
+        );
+
+        let invalid_office = app
+            .authorize_remote_flight_with_manifest(
+                &task_id,
+                &human.name,
+                &agent.name,
+                ExecutorKind::Codex,
+                3_600,
+                FlightManifestDraft {
+                    capability_pack: Some(CapabilityPack::Office),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.claim_remote_flight(&invalid_office.id, &agent.name, "WRUN-office-invalid")
+            .unwrap();
+        let invalid_office = app
+            .finish_remote_flight(
+                &invalid_office.id,
+                &agent.name,
+                true,
+                RemoteFlightReport {
+                    run_id: "WRUN-office-invalid".into(),
+                    executor: ExecutorKind::Codex,
+                    summary: "unexpected source file".into(),
+                    base_revision: "abc123".into(),
+                    changed_files: vec!["src/unapproved.rs".into()],
+                    patch_sha256: Some("e".repeat(64)),
+                    log_sha256: "f".repeat(64),
+                    started_at: now,
+                    finished_at: now,
+                    fuel: Default::default(),
+                    failure_class: None,
+                    budget_exhaustions: Vec::new(),
+                    deliverables: Vec::new(),
+                    contract_violations: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(invalid_office.status, FlightLeaseStatus::Crashed);
+        let invalid_report = invalid_office.report.as_ref().unwrap();
+        assert_eq!(invalid_report.failure_class, Some(FailureClass::Validation));
+        assert_eq!(invalid_report.contract_violations.len(), 1);
         drop(app);
 
         let replayed = MambaApp::open(&data_dir).unwrap();
@@ -2962,6 +3114,8 @@ mod tests {
                     },
                     failure_class: None,
                     budget_exhaustions: Vec::new(),
+                    deliverables: Vec::new(),
+                    contract_violations: Vec::new(),
                 },
             )
             .unwrap();

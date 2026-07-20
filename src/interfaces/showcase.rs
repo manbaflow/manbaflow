@@ -5,8 +5,9 @@ use serde::Serialize;
 
 use crate::MambaApp;
 use crate::domain::{
-    ExecutorConfig, ExecutorKind, ExternalInteractionAction, FailureClass, Flow, FlowMessageKind,
-    PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskStatus,
+    CapabilityPack, ExecutorConfig, ExecutorKind, ExternalInteractionAction, FailureClass,
+    FlightManifestDraft, Flow, FlowMessageKind, PrincipalKind, RemoteFlightReport, TargetKind,
+    Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::planner::PlannerKind;
@@ -163,12 +164,31 @@ pub async fn seed_showcase(
         "已定位路由、错误模型与 provider adapter 的改动范围",
     )?;
     let (worker, owner, executor) = assigned_agent_and_owner(app, &gateway_core)?;
-    app.authorize_remote_flight(&gateway_core.id, &owner, &worker, executor, 3_600)?;
+    app.authorize_remote_flight_with_manifest(
+        &gateway_core.id,
+        &owner,
+        &worker,
+        executor,
+        3_600,
+        FlightManifestDraft {
+            capability_pack: Some(CapabilityPack::Coding),
+            ..Default::default()
+        },
+    )?;
 
     let auth_policy = start_task(app, &gateway.id, "auth-policy")?;
     let (worker, owner, executor) = assigned_agent_and_owner(app, &auth_policy)?;
-    let crashed_lease =
-        app.authorize_remote_flight(&auth_policy.id, &owner, &worker, executor.clone(), 3_600)?;
+    let crashed_lease = app.authorize_remote_flight_with_manifest(
+        &auth_policy.id,
+        &owner,
+        &worker,
+        executor.clone(),
+        3_600,
+        FlightManifestDraft {
+            capability_pack: Some(CapabilityPack::Coding),
+            ..Default::default()
+        },
+    )?;
     app.claim_remote_flight(&crashed_lease.id, &worker, "WRUN-showcase-crash")?;
     let now = Utc::now();
     app.finish_remote_flight(
@@ -188,6 +208,8 @@ pub async fn seed_showcase(
             fuel: Default::default(),
             failure_class: Some(FailureClass::Permission),
             budget_exhaustions: Vec::new(),
+            deliverables: Vec::new(),
+            contract_violations: Vec::new(),
         },
     )?;
     let command_message_id = if app.state().principal("佐巴扬").is_ok() {

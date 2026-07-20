@@ -155,12 +155,15 @@ function renderFlights(flights) {
   target.replaceChildren(...flights.map((flight) => {
     const item = element("article", "flight");
     const stateBox = element("div");
-    stateBox.append(element("span", `badge ${flight.status}`, flight.status), element("p", "", `A${flight.attempt || "-"} · ${flight.executor}`));
+    stateBox.append(element("span", `badge ${flight.status}`, flight.status), element("p", "", `A${flight.attempt || "-"} · ${flight.capability_pack || "local"} · ${flight.executor}`));
     const identity = element("div");
     identity.append(element("h3", "", flight.objective || flight.task_id), element("p", "", `${flight.principal} · ${flight.id}`));
-    const fuel = renderFuel(flight.fuel, flight.budget_exhaustions || []);
+    const fuel = renderFuel(
+      flight.fuel,
+      [...(flight.budget_exhaustions || []), ...(flight.contract_violations || [])],
+    );
     const resource = element("div");
-    resource.append(element("strong", "", `${flight.active_resource_leases}/${flight.total_resource_claims}`), element("p", "", "ACTIVE LEASES"));
+    resource.append(element("strong", "", `${flight.active_resource_leases}/${flight.total_resource_claims}`), element("p", "", `${flight.deliverable_count} ARTIFACT · ACTIVE LEASES`));
     const command = element("div");
     if (flight.status === "crashed") command.append(button("处置坠机", () => openRecovery(flight), "danger"));
     item.append(stateBox, identity, fuel, resource, command);

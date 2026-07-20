@@ -1,3 +1,4 @@
+pub mod capability;
 pub mod executor;
 pub mod gitlab;
 pub mod interaction;

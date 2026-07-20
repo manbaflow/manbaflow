@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    FailureClass, FlightLeaseStatus, FlowStatus, NotificationStatus, ResourceLeaseStatus,
-    TaskStatus,
+    CapabilityPack, FailureClass, FlightLeaseStatus, FlowStatus, NotificationStatus,
+    ResourceLeaseStatus, TaskStatus,
 };
 use crate::state::OrganizationState;
 
@@ -101,6 +101,10 @@ pub struct DashboardFlight {
     pub total_resource_claims: usize,
     pub failure_class: Option<FailureClass>,
     pub budget_exhaustions: Vec<String>,
+    pub capability_pack: Option<CapabilityPack>,
+    pub deliverable_count: usize,
+    pub requires_human_release: bool,
+    pub contract_violations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -312,6 +316,23 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
                     .as_ref()
                     .map(|report| report.budget_exhaustions.clone())
                     .unwrap_or_default(),
+                capability_pack: lease
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| manifest.capability_pack),
+                deliverable_count: lease
+                    .report
+                    .as_ref()
+                    .map_or(0, |report| report.deliverables.len()),
+                requires_human_release: lease
+                    .manifest
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.output_contract.requires_human_release),
+                contract_violations: lease
+                    .report
+                    .as_ref()
+                    .map(|report| report.contract_violations.clone())
+                    .unwrap_or_default(),
             }
         })
         .chain(state.executions.values().map(|record| {
@@ -338,6 +359,10 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
                 total_resource_claims: 0,
                 failure_class: None,
                 budget_exhaustions: Vec::new(),
+                capability_pack: None,
+                deliverable_count: 0,
+                requires_human_release: false,
+                contract_violations: Vec::new(),
             }
         }))
         .collect::<Vec<_>>();

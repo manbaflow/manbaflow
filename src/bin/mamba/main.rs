@@ -6,8 +6,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use manbaflow::calendar::{parse_workdays, summary as calendar_summary};
 use manbaflow::dashboard::DashboardSnapshot;
 use manbaflow::domain::{
-    ExecutorConfig, ExecutorKind, ExecutorMode, FlightManifestDraft, Flow, FlowChangeRequest,
-    FlowMessage, FlowMessageKind, NotificationConnector, NotificationDelivery,
+    CapabilityPack, ExecutorConfig, ExecutorKind, ExecutorMode, FlightManifestDraft, Flow,
+    FlowChangeRequest, FlowMessage, FlowMessageKind, NotificationConnector, NotificationDelivery,
     NotificationEndpoint, NotificationStatus, OrganizationRole, PrincipalKind, RecoveryAction,
     Task, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
@@ -649,6 +649,8 @@ enum TaskCommand {
         executor: ExecutorKindArg,
         #[arg(long, default_value_t = 3_600)]
         ttl_seconds: u64,
+        #[arg(long, value_enum)]
+        pack: Option<CapabilityPackArg>,
         /// JSON 格式 FlightManifestDraft；省略时由塔台按任务生成
         #[arg(long)]
         manifest: Option<PathBuf>,
@@ -811,6 +813,13 @@ enum RecoveryActionArg {
     HumanHandoff,
     Ground,
     Fork,
+}
+
+#[derive(Clone, ValueEnum)]
+enum CapabilityPackArg {
+    General,
+    Coding,
+    Office,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -1415,15 +1424,19 @@ async fn run(cli: Cli) -> Result<()> {
                 agent,
                 executor,
                 ttl_seconds,
+                pack,
                 manifest,
             } => {
-                let manifest = manifest
+                let mut manifest = manifest
                     .map(|path| {
                         let bytes = std::fs::read(path)?;
                         Ok::<_, MambaError>(serde_json::from_slice::<FlightManifestDraft>(&bytes)?)
                     })
                     .transpose()?
                     .unwrap_or_default();
+                if let Some(pack) = pack {
+                    manifest.capability_pack = Some(pack.into());
+                }
                 let lease = app.authorize_remote_flight_with_manifest(
                     &task,
                     &by,
@@ -2427,6 +2440,16 @@ impl From<RecoveryActionArg> for RecoveryAction {
             RecoveryActionArg::HumanHandoff => Self::HumanHandoff,
             RecoveryActionArg::Ground => Self::Ground,
             RecoveryActionArg::Fork => Self::Fork,
+        }
+    }
+}
+
+impl From<CapabilityPackArg> for CapabilityPack {
+    fn from(value: CapabilityPackArg) -> Self {
+        match value {
+            CapabilityPackArg::General => Self::General,
+            CapabilityPackArg::Coding => Self::Coding,
+            CapabilityPackArg::Office => Self::Office,
         }
     }
 }

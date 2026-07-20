@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::capability::CapabilityAdapter;
 use crate::domain::{
-    Evidence, ExecutorKind, ExecutorMode, FailureClass, FlightLease, FlightLeaseStatus,
-    FlowMessage, FuelUsage, MessageInboxItem, Principal, RemoteFlightReport, Task, TaskStatus,
+    CapabilityPack, Evidence, ExecutorKind, ExecutorMode, FailureClass, FlightLease,
+    FlightLeaseStatus, FlowMessage, FuelUsage, MessageInboxItem, Principal, RemoteFlightReport,
+    Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
@@ -420,6 +422,8 @@ impl RemoteWorker {
             },
             failure_class,
             budget_exhaustions: Vec::new(),
+            deliverables: Vec::new(),
+            contract_violations: Vec::new(),
         };
         fs::write(
             &pending_path,
@@ -714,8 +718,23 @@ fn execute_prompt(
     lease: &FlightLease,
     instructions: &str,
 ) -> String {
+    let pack = lease
+        .manifest
+        .as_ref()
+        .map_or(CapabilityPack::General, |manifest| manifest.capability_pack);
+    let output_contract = lease.manifest.as_ref().map(|manifest| {
+        if manifest.output_contract.allowed_extensions.is_empty() {
+            "task-scoped files".to_string()
+        } else {
+            format!(
+                "files with these extensions only: {}",
+                manifest.output_contract.allowed_extensions.join(", ")
+            )
+        }
+    });
+    let execution_contract = CapabilityAdapter::execution_directive(pack);
     format!(
-        "MambaFlow remote PASS for a Human-authorized coding flight.\n\
+        "MambaFlow remote PASS for a Human-authorized {pack:?} flight.\n\
          Flight lease: {}\n\
          Authorized by: {}\n\
          Worker principal: {} ({})\n\
@@ -724,9 +743,9 @@ fn execute_prompt(
          Description: {}\n\
          Explicit Flow instructions:\n{}\n\n\
          Acceptance criteria:\n- {}\n\n\
-         Implement only this task inside the isolated Git worktree. Run relevant checks. Do not \
-         push, merge, change remotes, or access credentials. Report the changes, verification, and \
-         remaining risks for Human review.",
+         Output contract: {}\n\n\
+         {} Implement only this task. Report deliverables, verification, and remaining risks for \
+         Human review.",
         lease.id,
         lease.authorized_by,
         principal.name,
@@ -737,7 +756,9 @@ fn execute_prompt(
         item.task.title,
         item.task.description,
         instructions,
-        item.task.acceptance_criteria.join("\n- ")
+        item.task.acceptance_criteria.join("\n- "),
+        output_contract.unwrap_or_else(|| "task-scoped files".into()),
+        execution_contract,
     )
 }
 

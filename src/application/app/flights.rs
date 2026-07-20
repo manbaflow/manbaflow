@@ -3,11 +3,12 @@ use std::collections::BTreeSet;
 use chrono::{Duration, Utc};
 
 use super::MambaApp;
+use crate::capability::CapabilityAdapter;
 use crate::domain::{
-    ExecutorKind, FlightLease, FlightLeaseStatus, FlightManifest, FlightManifestDraft,
-    FlightRecoveryDecision, Flow, FuelBudget, Principal, PrincipalKind, RecoveryAction,
-    RecoveryPolicy, ResourceClaim, ResourceKind, ResourceLease, ResourceLeaseStatus, Task,
-    ToolAccess, ToolPermission,
+    CapabilityPack, ExecutorKind, FlightDeliverable, FlightLease, FlightLeaseStatus,
+    FlightManifest, FlightManifestDraft, FlightRecoveryDecision, Flow, FuelBudget, OutputContract,
+    Principal, PrincipalKind, RecoveryAction, RecoveryPolicy, RemoteFlightReport, ResourceClaim,
+    ResourceKind, ResourceLease, ResourceLeaseStatus, Task, ToolAccess, ToolPermission,
 };
 use crate::error::{MambaError, Result};
 use crate::event::DomainEvent;
@@ -22,6 +23,7 @@ impl MambaApp {
         ttl_seconds: u64,
         draft: FlightManifestDraft,
     ) -> Result<FlightManifest> {
+        let capability_pack = draft.capability_pack.unwrap_or_default();
         let objective = draft
             .objective
             .unwrap_or_else(|| format!("{}: {}", task.title, task.description));
@@ -119,6 +121,10 @@ impl MambaApp {
             draft.resources
         };
         validate_resources(&resources)?;
+        let output_contract = draft
+            .output_contract
+            .unwrap_or_else(|| OutputContract::for_pack(capability_pack));
+        validate_output_contract(capability_pack, &output_contract)?;
 
         Ok(FlightManifest {
             id: new_id("MANIFEST"),
@@ -129,6 +135,8 @@ impl MambaApp {
             fuel,
             recovery,
             resources,
+            capability_pack,
+            output_contract,
             declared_by: human.name.clone(),
             declared_at: Utc::now(),
         })
@@ -248,6 +256,29 @@ impl MambaApp {
         exhausted
     }
 
+    pub(super) fn normalize_deliverables(
+        &self,
+        lease: &FlightLease,
+        changed_files: &[String],
+    ) -> Vec<FlightDeliverable> {
+        let requires_human_release = lease
+            .manifest
+            .as_ref()
+            .is_none_or(|manifest| manifest.output_contract.requires_human_release);
+        CapabilityAdapter::derive_deliverables(changed_files, requires_human_release)
+    }
+
+    pub(super) fn output_contract_violations(
+        &self,
+        lease: &FlightLease,
+        report: &RemoteFlightReport,
+    ) -> Vec<String> {
+        let Some(manifest) = &lease.manifest else {
+            return Vec::new();
+        };
+        CapabilityAdapter::contract_violations(&manifest.output_contract, &report.deliverables)
+    }
+
     pub fn recovery_options(&self, lease_id: &str, actor: &str) -> Result<Vec<RecoveryAction>> {
         let principal = self.state.principal(actor)?;
         let lease = self
@@ -350,6 +381,8 @@ impl MambaApp {
                 key: parent.task_id.clone(),
                 exclusive: true,
             }],
+            capability_pack: CapabilityPack::General,
+            output_contract: OutputContract::default(),
             declared_by: human.name.clone(),
             declared_at: Utc::now(),
         });
@@ -397,6 +430,7 @@ impl MambaApp {
         let (flow, task) = self.task_snapshot(&parent.task_id)?;
         let worker = self.state.principal(&parent.principal_id)?.clone();
         let draft = FlightManifestDraft {
+            capability_pack: Some(parent_manifest.capability_pack),
             objective: objective.or(Some(parent_manifest.objective)),
             landing_conditions: parent_manifest.landing_conditions,
             context_refs: {
@@ -408,6 +442,7 @@ impl MambaApp {
             fuel: Some(parent_manifest.fuel),
             recovery: Some(parent_manifest.recovery),
             resources: parent_manifest.resources,
+            output_contract: Some(parent_manifest.output_contract),
         };
         let manifest = self.build_flight_manifest(&flow, &task, &human, ttl_seconds, draft)?;
         let now = Utc::now();
@@ -520,6 +555,38 @@ fn validate_resources(resources: &[ResourceClaim]) -> Result<()> {
                 resource.kind, resource.key
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_output_contract(pack: CapabilityPack, contract: &OutputContract) -> Result<()> {
+    if contract.min_deliverables > 100 || contract.allowed_extensions.len() > 64 {
+        return Err(MambaError::Validation(
+            "output contract exceeds deliverable or extension limits".into(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for extension in &contract.allowed_extensions {
+        if extension.is_empty()
+            || extension.len() > 16
+            || extension.starts_with('.')
+            || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !seen.insert(extension.to_ascii_lowercase())
+        {
+            return Err(MambaError::Validation(
+                "output contract contains an invalid or duplicate file extension".into(),
+            ));
+        }
+    }
+    if pack == CapabilityPack::Office && contract.allowed_extensions.is_empty() {
+        return Err(MambaError::Validation(
+            "office flights require an explicit artifact extension allowlist".into(),
+        ));
+    }
+    if pack == CapabilityPack::Office && !contract.requires_human_release {
+        return Err(MambaError::PermissionDenied(
+            "office artifacts require Human release in this version".into(),
+        ));
     }
     Ok(())
 }

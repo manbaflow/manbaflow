@@ -2816,13 +2816,26 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
                 .budget_exhaustions
                 .first()
                 .cloned()
+                .or_else(|| report.contract_violations.first().cloned())
                 .or_else(|| report.failure_class.map(|class| format!("{class:?}")))
         });
         ListItem::new(Text::from(vec![
             Line::from(vec![
                 Span::styled(format!("{marker} {label} "), Style::new().fg(color).bold()),
                 Span::styled(lease.executor.to_string(), Style::new().fg(CYAN)),
-                Span::styled(format!("  A{}", lease.attempt), Style::new().fg(GOLD)),
+                Span::styled(
+                    format!(
+                        "  {:?} · A{}",
+                        lease
+                            .manifest
+                            .as_ref()
+                            .map_or(crate::domain::CapabilityPack::General, |manifest| {
+                                manifest.capability_pack
+                            }),
+                        lease.attempt
+                    ),
+                    Style::new().fg(GOLD),
+                ),
             ]),
             Line::from(vec![
                 Span::styled(format!("  {}  ", lease.task_id), Style::new().fg(TEXT)),
