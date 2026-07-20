@@ -14,6 +14,7 @@ use manbaflow::domain::{
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
 use manbaflow::showcase::seed_showcase;
+use manbaflow::tenant::{TenantCatalog, TenantRecord, validate_slug};
 use manbaflow::worker::{RemoteWorker, WorkerOptions, WorkerOutcome, WorkerOutcomeStatus};
 use manbaflow::{MambaApp, MambaError, Result};
 use serde::Serialize;
@@ -31,6 +32,10 @@ struct Cli {
 
     #[arg(long, global = true)]
     json: bool,
+
+    /// 选择一个 Tenant ID 或 slug；默认使用根 Ledger
+    #[arg(long, global = true)]
+    tenant: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -60,6 +65,11 @@ enum Command {
         escalate_after_hours: u64,
         #[arg(long, default_value_t = 15)]
         notification_interval: u64,
+    },
+    /// 创建、列举和选择相互隔离的企业 Tenant
+    Tenant {
+        #[command(subcommand)]
+        command: TenantCommand,
     },
     /// 初始化和查看组织塔台
     Org {
@@ -146,6 +156,21 @@ enum Command {
         #[arg(long)]
         showcase: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum TenantCommand {
+    /// 创建一个独立事件账本并登记到 Control Plane
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        slug: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
+    /// 列出 Control Plane 中的所有 Tenant
+    List,
 }
 
 #[derive(Subcommand)]
@@ -898,11 +923,18 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let mut app = MambaApp::open(&cli.data_dir)?;
     let command = cli.command.unwrap_or_else(|| Command::Tui {
         actor: None,
         workspace: PathBuf::from("."),
     });
+    if cli.tenant.is_some() && matches!(&command, Command::Serve { .. } | Command::Tenant { .. }) {
+        return Err(MambaError::Validation(
+            "--tenant selects a CLI Ledger and cannot be combined with serve or tenant management"
+                .into(),
+        ));
+    }
+    let selected_data_dir = selected_tenant_data_dir(&cli.data_dir, cli.tenant.as_deref())?;
+    let mut app = MambaApp::open(&selected_data_dir)?;
     match command {
         Command::Tui { actor, workspace } => {
             manbaflow::tui::run(
@@ -922,8 +954,8 @@ async fn run(cli: Cli) -> Result<()> {
             escalate_after_hours,
             notification_interval,
         } => {
-            manbaflow::server::run(
-                app,
+            manbaflow::server::run_fleet(
+                &cli.data_dir,
                 manbaflow::server::ServerOptions {
                     bind,
                     allow_insecure_public_http,
@@ -934,6 +966,45 @@ async fn run(cli: Cli) -> Result<()> {
                 },
             )
             .await?;
+        }
+        Command::Tenant { command } => {
+            let tenant = app.state().tenant()?.clone();
+            let mut catalog = TenantCatalog::open(&cli.data_dir)?;
+            catalog.adopt_default(&tenant)?;
+            match command {
+                TenantCommand::Create { name, slug, by } => {
+                    let slug = validate_slug(&slug)?;
+                    if catalog.find(&slug)?.is_some() {
+                        return Err(MambaError::Validation(format!(
+                            "tenant already exists: {slug}"
+                        )));
+                    }
+                    let relative_path = PathBuf::from("tenants").join(&slug);
+                    let tenant_data_dir = cli.data_dir.join(&relative_path);
+                    if tenant_data_dir.join("flow.db").exists() {
+                        return Err(MambaError::Validation(format!(
+                            "unregistered tenant Ledger already exists: {}",
+                            tenant_data_dir.display()
+                        )));
+                    }
+                    let mut tenant_app = MambaApp::open(&tenant_data_dir)?;
+                    tenant_app.init_organization(&name, &by)?;
+                    let tenant = tenant_app.state().tenant()?.clone();
+                    let record = catalog.register(&tenant, &slug, &relative_path)?;
+                    output(
+                        &record,
+                        cli.json,
+                        format!(
+                            "Tenant 已起飞：{} ({})，CLI 使用 --tenant {} 进入",
+                            record.name, record.id, record.slug
+                        ),
+                    );
+                }
+                TenantCommand::List => {
+                    let records = catalog.list()?;
+                    output(&records, cli.json, format_tenant_records(&records));
+                }
+            }
         }
         Command::Org { command } => match command {
             OrgCommand::Init { name, by } => {
@@ -1953,6 +2024,45 @@ async fn run(cli: Cli) -> Result<()> {
         } => bootstrap_demo(&mut app, &workspace, showcase, cli.json).await?,
     }
     Ok(())
+}
+
+fn selected_tenant_data_dir(root: &Path, selector: Option<&str>) -> Result<PathBuf> {
+    let Some(selector) = selector else {
+        return Ok(root.to_path_buf());
+    };
+    let catalog = TenantCatalog::open(root)?;
+    let record = catalog
+        .find(selector)?
+        .ok_or_else(|| MambaError::NotFound {
+            entity: "tenant",
+            id: selector.to_string(),
+        })?;
+    if !record.active {
+        return Err(MambaError::PermissionDenied(format!(
+            "tenant {} is inactive",
+            record.id
+        )));
+    }
+    catalog.data_dir(&record)
+}
+
+fn format_tenant_records(records: &[TenantRecord]) -> String {
+    if records.is_empty() {
+        return "No tenants registered".into();
+    }
+    records
+        .iter()
+        .map(|record| {
+            format!(
+                "{} {:<18} {} ({})",
+                if record.is_default { "*" } else { " " },
+                record.slug,
+                record.name,
+                record.id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn bootstrap_demo(

@@ -40,7 +40,12 @@ impl MambaApp {
                 "credential label must contain 1 to 80 characters".into(),
             ));
         }
-        let token = format!("mmb_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let tenant_id = &self.state.tenant()?.id;
+        let token = format!(
+            "mmb_{tenant_id}_{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        );
         let token_hash = credential_hash(&token);
         let created_at = Utc::now();
         let credential = ApiCredential {
@@ -113,10 +118,7 @@ impl MambaApp {
     }
 
     pub fn authenticate_api_token(&self, token: &str) -> Result<Option<Principal>> {
-        if token.len() != 68
-            || !token.starts_with("mmb_")
-            || !token[4..].bytes().all(|value| value.is_ascii_hexdigit())
-        {
+        if !valid_api_token(token) {
             return Ok(None);
         }
         let token_hash = credential_hash(token);
@@ -142,4 +144,42 @@ impl MambaApp {
 
 fn credential_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
+}
+
+pub fn tenant_token_hint(token: &str) -> Option<&str> {
+    let value = token.strip_prefix("mmb_")?;
+    let (tenant_id, secret) = value.rsplit_once('_')?;
+    (tenant_id.starts_with("TEN-")
+        && tenant_id.len() > 4
+        && tenant_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && secret.len() == 64
+        && secret.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(tenant_id)
+}
+
+fn valid_api_token(token: &str) -> bool {
+    let legacy = token.len() == 68
+        && token.starts_with("mmb_")
+        && token[4..].bytes().all(|value| value.is_ascii_hexdigit());
+    legacy || tenant_token_hint(token).is_some()
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn tenant_hint_is_strict_and_legacy_tokens_remain_valid() {
+        let secret = "a".repeat(64);
+        let routed = format!("mmb_TEN-ab12cd34_{secret}");
+        assert_eq!(tenant_token_hint(&routed), Some("TEN-ab12cd34"));
+        assert!(valid_api_token(&format!("mmb_{secret}")));
+        assert!(!valid_api_token(&format!(
+            "mmb_TEN-ab12cd34_{}",
+            "z".repeat(64)
+        )));
+        assert_eq!(tenant_token_hint(&format!("mmb_other_{secret}")), None);
+    }
 }

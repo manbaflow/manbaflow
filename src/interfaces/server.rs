@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::time::{MissedTickBehavior, interval};
+use tower::ServiceExt;
 
 use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
@@ -33,6 +34,7 @@ use crate::interaction::{
 };
 use crate::notification::NotificationDispatchSummary;
 use crate::planner::PlannerKind;
+use crate::tenant::TenantCatalog;
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -49,6 +51,12 @@ struct ApiState {
     app: Arc<Mutex<MambaApp>>,
     gitlab_webhook_auth: Option<GitLabWebhookAuth>,
     interaction_auth: InteractionWebhookAuth,
+}
+
+#[derive(Clone)]
+struct FleetState {
+    routers: Arc<BTreeMap<String, Router>>,
+    default_tenant_id: String,
 }
 
 #[derive(Clone, Default)]
@@ -375,6 +383,110 @@ struct GitLabWebhookResponse {
 }
 
 pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
+    validate_server_options(&options)?;
+    let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
+    let interaction_auth = InteractionWebhookAuth::from_env()?;
+    let listener = TcpListener::bind(options.bind).await?;
+    announce_server(&options, &gitlab_webhook_auth, &interaction_auth, 1);
+    let app = Arc::new(Mutex::new(app));
+    spawn_tracker(app.clone(), &options);
+    spawn_notification_dispatcher(app.clone(), &options);
+    axum::serve(listener, router(app, gitlab_webhook_auth, interaction_auth))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+pub async fn run_fleet(
+    data_dir: impl AsRef<std::path::Path>,
+    options: ServerOptions,
+) -> Result<()> {
+    validate_server_options(&options)?;
+    let data_dir = data_dir.as_ref();
+    let default_app = MambaApp::open(data_dir)?;
+    let default_tenant = default_app.state().tenant()?.clone();
+    let mut catalog = TenantCatalog::open(data_dir)?;
+    let default_record = catalog.adopt_default(&default_tenant)?;
+    let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
+    let interaction_auth = InteractionWebhookAuth::from_env()?;
+    let mut routers = BTreeMap::new();
+    let mut default_app = Some(default_app);
+
+    for record in catalog.active()? {
+        let app = if record.id == default_record.id {
+            if default_record.storage_path != record.storage_path {
+                return Err(MambaError::Validation(
+                    "default tenant storage path changed while loading the fleet".into(),
+                ));
+            }
+            default_app.take().ok_or_else(|| {
+                MambaError::Validation("default tenant appears more than once in catalog".into())
+            })?
+        } else {
+            MambaApp::open(catalog.data_dir(&record)?)?
+        };
+        let actual_tenant_id = &app.state().tenant()?.id;
+        if actual_tenant_id != &record.id {
+            return Err(MambaError::Validation(format!(
+                "tenant catalog entry {} points to a Ledger owned by {actual_tenant_id}",
+                record.id
+            )));
+        }
+        let app = Arc::new(Mutex::new(app));
+        spawn_tracker(app.clone(), &options);
+        spawn_notification_dispatcher(app.clone(), &options);
+        routers.insert(
+            record.id,
+            router(app, gitlab_webhook_auth.clone(), interaction_auth.clone()),
+        );
+    }
+
+    let tenant_count = routers.len();
+    let listener = TcpListener::bind(options.bind).await?;
+    announce_server(
+        &options,
+        &gitlab_webhook_auth,
+        &interaction_auth,
+        tenant_count,
+    );
+    let fleet = Router::new()
+        .fallback(fleet_dispatch)
+        .with_state(FleetState {
+            routers: Arc::new(routers),
+            default_tenant_id: default_record.id,
+        });
+    axum::serve(listener, fleet)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+async fn fleet_dispatch(State(state): State<FleetState>, request: Request) -> Response {
+    let header_tenant = request
+        .headers()
+        .get("x-mamba-tenant")
+        .and_then(|value| value.to_str().ok());
+    let token_tenant = bearer_token(request.headers()).and_then(crate::app::tenant_token_hint);
+    if token_tenant.is_some() && header_tenant.is_some() && token_tenant != header_tenant {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "bearer token and x-mamba-tenant select different tenants"})),
+        )
+            .into_response();
+    }
+    let tenant_id = token_tenant
+        .or(header_tenant)
+        .unwrap_or(&state.default_tenant_id);
+    let Some(router) = state.routers.get(tenant_id) else {
+        return ApiError::unauthorized().into_response();
+    };
+    match router.clone().oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => match error {},
+    }
+}
+
+fn validate_server_options(options: &ServerOptions) -> Result<()> {
     if options.tracker_interval_seconds == 0 {
         return Err(MambaError::Validation(
             "tracker interval must be greater than zero".into(),
@@ -390,12 +502,19 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
             "refusing non-loopback plain HTTP; terminate TLS at a trusted proxy and pass --allow-insecure-public-http to acknowledge the hop".into(),
         ));
     }
-    let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
-    let interaction_auth = InteractionWebhookAuth::from_env()?;
-    let listener = TcpListener::bind(options.bind).await?;
+    Ok(())
+}
+
+fn announce_server(
+    options: &ServerOptions,
+    gitlab_webhook_auth: &Option<GitLabWebhookAuth>,
+    interaction_auth: &InteractionWebhookAuth,
+    tenant_count: usize,
+) {
     println!(
-        "MambaFlow control plane listening on http://{}",
-        options.bind
+        "MambaFlow control plane listening on http://{} ({tenant_count} tenant{})",
+        options.bind,
+        if tenant_count == 1 { "" } else { "s" }
     );
     if gitlab_webhook_auth.is_some() {
         println!("GitLab webhook receiver enabled");
@@ -406,13 +525,6 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
     if interaction_auth.slack_enabled() {
         println!("Slack interaction receiver enabled");
     }
-    let app = Arc::new(Mutex::new(app));
-    spawn_tracker(app.clone(), &options);
-    spawn_notification_dispatcher(app.clone(), &options);
-    axum::serve(listener, router(app, gitlab_webhook_auth, interaction_auth))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
 }
 
 fn router(
@@ -1545,16 +1657,15 @@ async fn deliver_notification_batch(
 }
 
 fn authenticate(app: &MambaApp, headers: &HeaderMap) -> ApiResult<Principal> {
-    let value = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(ApiError::unauthorized)?;
-    let (scheme, token) = value.split_once(' ').ok_or_else(ApiError::unauthorized)?;
-    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
-        return Err(ApiError::unauthorized());
-    }
+    let token = bearer_token(headers).ok_or_else(ApiError::unauthorized)?;
     app.authenticate_api_token(token)?
         .ok_or_else(ApiError::unauthorized)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
 fn webhook_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -1625,6 +1736,107 @@ mod tests {
         }
         assert!(!limiter.allow(key, now));
         assert!(limiter.allow(key, now + Duration::from_secs(61)));
+    }
+
+    #[tokio::test]
+    async fn fleet_routes_tokens_to_isolated_tenant_ledgers() {
+        let directory = tempdir().unwrap();
+        let (first_app, first_token, first_tenant) =
+            tenant_app(directory.path().join("first"), "First Company");
+        let (second_app, second_token, second_tenant) =
+            tenant_app(directory.path().join("second"), "Second Company");
+        let mut routers = BTreeMap::new();
+        routers.insert(
+            first_tenant.clone(),
+            router(
+                Arc::new(Mutex::new(first_app)),
+                None,
+                InteractionWebhookAuth::default(),
+            ),
+        );
+        routers.insert(
+            second_tenant.clone(),
+            router(
+                Arc::new(Mutex::new(second_app)),
+                None,
+                InteractionWebhookAuth::default(),
+            ),
+        );
+        let fleet = Router::new()
+            .fallback(fleet_dispatch)
+            .with_state(FleetState {
+                routers: Arc::new(routers),
+                default_tenant_id: first_tenant.clone(),
+            });
+
+        let first = fleet
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/organization",
+                &first_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&first_body).unwrap()["organization"]["name"],
+            "First Company"
+        );
+
+        let second = fleet
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/organization",
+                &second_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&second_body).unwrap()["organization"]["name"],
+            "Second Company"
+        );
+
+        let conflict = Request::builder()
+            .uri("/api/v1/organization")
+            .header(header::AUTHORIZATION, format!("Bearer {first_token}"))
+            .header("x-mamba-tenant", second_tenant)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            fleet.oneshot(conflict).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    fn tenant_app(data_dir: std::path::PathBuf, name: &str) -> (MambaApp, String, String) {
+        let mut app = MambaApp::open(data_dir).unwrap();
+        app.init_organization(name, "admin").unwrap();
+        let team = app
+            .create_team("Operations", "operations", "admin")
+            .unwrap();
+        let admin = app
+            .register_principal(
+                "Admin",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "operations",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let token = app
+            .issue_api_credential(&admin.id, "fleet test", "admin")
+            .unwrap()
+            .token;
+        let tenant_id = app.state().tenant().unwrap().id.clone();
+        (app, token, tenant_id)
     }
 
     #[tokio::test]

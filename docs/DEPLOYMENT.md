@@ -1,8 +1,8 @@
 # MambaFlow 单节点生产部署
 
-这份手册覆盖当前 v0 能支持的边界：一个 `mamba serve` 进程、一个活动 Tenant、一个 SQLite Ledger，
-远程 Worker 分布在员工工作站。它不是多地域高可用方案，也不替代 OIDC/SCIM、容器沙箱或集中 Secret
-Manager。
+这份手册覆盖当前 v0 能支持的边界：一个 `mamba serve` 进程、一个 Tenant Catalog、每个 Tenant 一个
+SQLite Ledger，远程 Worker 分布在员工工作站。它不是多地域高可用方案，也不替代 OIDC/SCIM、容器
+沙箱或集中 Secret Manager。
 
 ## 1. 数据目录
 
@@ -17,6 +17,19 @@ sudo -u manbaflow mamba --data-dir /var/lib/manbaflow ops doctor
 启动时数据库使用 WAL、`synchronous=FULL`、外键检查、5 秒 busy timeout 和严格 schema 版本。Unix
 数据目录和 SQLite 文件会收紧为 `0700` 与 `0600`。二进制遇到未来版本 schema 会拒绝启动，不会把
 版本号静默改回去。
+
+根 Tenant 使用 `/var/lib/manbaflow/flow.db`。创建额外 Tenant 后，`control.db` 只保存 Tenant ID、slug 和
+相对存储目录，业务事件分别进入 `/var/lib/manbaflow/tenants/<slug>/flow.db`：
+
+```bash
+mamba --data-dir /var/lib/manbaflow tenant create \
+  --name "Mamba APAC" --slug mamba-apac
+mamba --data-dir /var/lib/manbaflow tenant list
+mamba --data-dir /var/lib/manbaflow --tenant mamba-apac ops doctor
+```
+
+禁止手工交换 Tenant 目录或修改 Catalog 指向。服务启动时会核对 Catalog Tenant ID 与 Ledger 内事件状态，
+不一致时拒绝启动。
 
 ## 2. TLS 入口
 
@@ -50,8 +63,9 @@ mamba --data-dir /var/lib/manbaflow principal token issue \
   --for "运维审计" --label prometheus --ttl-days 7 --by "租户管理员"
 ```
 
-原始 Token 只显示一次，数据库仅保存 SHA-256 摘要。Token 有 256 位随机熵；到期或撤销后，数据库查询
-和事件状态都会拒绝鉴权。Connector URL、签名 Secret、GitLab Token 仍只通过环境变量注入。环境文件应
+原始 Token 只显示一次，数据库仅保存 SHA-256 摘要。Token 有 256 位随机熵，并携带 Tenant 路由 ID；
+路由 ID 不授予权限，完整 Token 仍必须在目标 Ledger 通过摘要校验。到期或撤销后，数据库查询和事件状态
+都会拒绝鉴权。Connector URL、签名 Secret、GitLab Token 仍只通过环境变量注入。环境文件应
 由服务用户独占，不要写进 Git、命令参数或 Flow 消息。
 
 ## 4. 健康检查与指标
@@ -85,20 +99,23 @@ mamba --data-dir /var/lib/manbaflow ops backup \
 
 ## 6. 恢复演练
 
-1. 停止 `mamba serve`，确认没有 Worker 或 CLI 仍写入旧 Control Plane。
+1. 停止 `mamba serve`，确认没有 Worker 或 CLI 仍写入旧 Control Plane，并记录 `tenant list` 输出。
 2. 保留损坏数据目录用于取证，不要在原文件上反复尝试修复。
 3. 把选定快照放入一个新的空数据目录并命名为 `flow.db`。
 4. 以服务用户运行 `mamba --data-dir <new-dir> ops doctor`。
 5. 检查 schema、`quick_check=ok`、事件数量和活动凭据数量。
-6. 在 loopback 启动服务，验证 `/health/ready`、管理员 Dashboard 和一条只读 Worker 规划航班。
-7. 切换 TLS 入口，再恢复远程 Worker。
+6. 多 Tenant 部署逐一使用 `--tenant <slug> ops doctor` 验证账本，并恢复原 `control.db` 和完整的
+   `tenants/` 目录层级。
+7. 在 loopback 启动服务，验证每个 Tenant 的 `/health/ready`、管理员 Dashboard 和一条只读 Worker
+   规划航班。
+8. 切换 TLS 入口，再恢复远程 Worker。
 
 快照包含 Token 摘要、角色、组织事件和 Connector 元数据，因此按生产数据库同等级保护。原始 Connector
 Secret 不在数据库内，灾备环境必须从 Secret Manager 单独恢复。
 
 ## 7. 当前限制
 
-- 一个数据目录只能承载一个活动 Tenant；
+- 一个进程可以承载多个隔离 Tenant，但所有 Catalog 和 Ledger 仍位于同一节点；
 - 只支持单个 Control Plane 写进程，不支持水平扩展；
 - 没有 OIDC、SCIM、集中策略引擎和分布式限流；
 - Remote Worker 使用 Git worktree 隔离，不是容器或虚拟机安全边界；

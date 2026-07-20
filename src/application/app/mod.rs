@@ -38,6 +38,8 @@ mod tracking;
 use self::authority::Permission;
 use self::policy::ensure_status;
 
+pub use self::credentials::tenant_token_hint;
+
 pub struct MambaApp {
     data_dir: PathBuf,
     store: EventStore,
