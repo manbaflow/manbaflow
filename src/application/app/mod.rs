@@ -24,6 +24,7 @@ use crate::state::OrganizationState;
 use crate::store::{FlowStore, StorageHealth};
 
 mod actions;
+pub(crate) mod artifacts;
 mod authority;
 mod calendars;
 mod commit;
@@ -33,6 +34,7 @@ mod flights;
 mod interactions;
 mod messages;
 mod notifications;
+mod office;
 mod policy;
 mod tracking;
 
@@ -2465,6 +2467,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn office_release_requires_human_review_and_replays_dispatch_outcomes() {
+        use crate::domain::{
+            OfficeBodyType, OfficeProvider, OfficeReleasePayload, OfficeReleaseResult,
+            OfficeReleaseStatus,
+        };
+
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("office-release");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Mamba Office", "admin").unwrap();
+        let team = app
+            .create_team(
+                "Operations",
+                "product,planning,documentation,analysis,coordination,review,delivery",
+                "admin",
+            )
+            .unwrap();
+        let requester = app
+            .register_principal(
+                "Release Owner",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,planning,documentation,analysis,coordination,review,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let outsider = app
+            .register_principal(
+                "Other Human",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "review",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Prepare and send the weekly operating update",
+                &requester.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        app.approve_flow(&flow.id, &requester.name).unwrap();
+        let task = flow
+            .tasks
+            .iter()
+            .find(|task| {
+                task.assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.owner.id == requester.id)
+            })
+            .unwrap()
+            .clone();
+        app.accept_task(&task.id, &requester.name).unwrap();
+        app.start_task(&task.id, &requester.name).unwrap();
+
+        let payload = OfficeReleasePayload::SendEmail {
+            account_id: "release-owner@example.com".into(),
+            to: vec!["team@example.com".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Weekly operating update".into(),
+            body: "Flight status: on schedule.\nRisks: none.".into(),
+            body_type: OfficeBodyType::Text,
+        };
+        let release = app
+            .request_office_release(
+                &task.id,
+                OfficeProvider::Microsoft365,
+                payload.clone(),
+                &requester.name,
+            )
+            .unwrap();
+        assert_eq!(
+            app.request_office_release(
+                &task.id,
+                OfficeProvider::Microsoft365,
+                payload,
+                &requester.name,
+            )
+            .unwrap()
+            .id,
+            release.id
+        );
+        assert!(
+            app.approve_office_release(&release.id, &outsider.name)
+                .is_err()
+        );
+        app.approve_office_release(&release.id, &requester.name)
+            .unwrap();
+        let claimed = app.claim_office_release().unwrap().unwrap();
+        let dispatch_id = claimed.dispatch_id.clone().unwrap();
+        let failed = app
+            .finish_office_release(
+                &release.id,
+                &dispatch_id,
+                Err(("provider was unavailable before the request".into(), false)),
+            )
+            .unwrap();
+        assert_eq!(failed.status, OfficeReleaseStatus::Failed);
+        app.retry_office_release(&release.id, &requester.name)
+            .unwrap();
+        let retry = app.claim_office_release().unwrap().unwrap();
+        let released = app
+            .finish_office_release(
+                &release.id,
+                retry.dispatch_id.as_deref().unwrap(),
+                Ok(OfficeReleaseResult {
+                    external_id: Some("message-42".into()),
+                    url: None,
+                    response_status: 202,
+                    released_at: Utc::now(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(released.status, OfficeReleaseStatus::Released);
+
+        let calendar = app
+            .request_office_release(
+                &task.id,
+                OfficeProvider::GoogleWorkspace,
+                OfficeReleasePayload::CreateCalendarEvent {
+                    account_id: "me".into(),
+                    calendar_id: "primary".into(),
+                    subject: "Operating review".into(),
+                    body: "Review the weekly update.".into(),
+                    body_type: OfficeBodyType::Text,
+                    start: Utc::now() + Duration::hours(1),
+                    end: Utc::now() + Duration::hours(2),
+                    time_zone: "Asia/Shanghai".into(),
+                    attendees: vec!["team@example.com".into()],
+                    location: None,
+                    send_updates: true,
+                },
+                &requester.name,
+            )
+            .unwrap();
+        app.approve_office_release(&calendar.id, &requester.name)
+            .unwrap();
+        let stale_calendar = app.claim_office_release().unwrap().unwrap();
+        assert_eq!(
+            app.recover_stale_office_dispatches(
+                stale_calendar.dispatch_started_at.unwrap() + Duration::minutes(6),
+                Duration::minutes(5),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            app.state().office_releases[&calendar.id].status,
+            OfficeReleaseStatus::Approved
+        );
+        let recovered_calendar = app.claim_office_release().unwrap().unwrap();
+        app.finish_office_release(
+            &calendar.id,
+            recovered_calendar.dispatch_id.as_deref().unwrap(),
+            Ok(OfficeReleaseResult {
+                external_id: Some("calendar-42".into()),
+                url: Some("https://calendar.example/events/calendar-42".into()),
+                response_status: 201,
+                released_at: Utc::now(),
+            }),
+        )
+        .unwrap();
+
+        let uncertain = app
+            .request_office_release(
+                &task.id,
+                OfficeProvider::GoogleWorkspace,
+                OfficeReleasePayload::SendEmail {
+                    account_id: "me".into(),
+                    to: vec!["team@example.com".into()],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Second update".into(),
+                    body: "A transport timeout after send needs reconciliation.".into(),
+                    body_type: OfficeBodyType::Text,
+                },
+                &requester.name,
+            )
+            .unwrap();
+        app.approve_office_release(&uncertain.id, &requester.name)
+            .unwrap();
+        let claimed = app.claim_office_release().unwrap().unwrap();
+        let uncertain = app
+            .finish_office_release(
+                &uncertain.id,
+                claimed.dispatch_id.as_deref().unwrap(),
+                Err(("connection closed after request body was sent".into(), true)),
+            )
+            .unwrap();
+        assert_eq!(uncertain.status, OfficeReleaseStatus::Indeterminate);
+        assert!(
+            app.retry_office_release(&uncertain.id, &requester.name)
+                .is_err()
+        );
+
+        drop(app);
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        assert_eq!(
+            replayed.state().office_releases[&release.id].status,
+            OfficeReleaseStatus::Released
+        );
+        assert_eq!(
+            replayed.state().office_releases[&uncertain.id].status,
+            OfficeReleaseStatus::Indeterminate
+        );
+    }
+
+    #[tokio::test]
     async fn notification_outbox_is_atomic_retryable_and_replayable() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
@@ -2961,6 +3182,41 @@ mod tests {
         );
         app.claim_remote_flight(&office.id, &agent.name, "WRUN-office")
             .unwrap();
+        let staged = app
+            .stage_flight_artifact(
+                &office.id,
+                "docs/release-notes.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                b"reviewable release notes".to_vec(),
+                &agent.name,
+            )
+            .unwrap();
+        assert_eq!(
+            app.stage_flight_artifact(
+                &office.id,
+                "docs/release-notes.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                b"reviewable release notes".to_vec(),
+                &agent.name,
+            )
+            .unwrap()
+            .id,
+            staged.id
+        );
+        assert!(
+            app.stage_flight_artifact(
+                &office.id,
+                "../escape.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                b"no".to_vec(),
+                &agent.name,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            app.artifact_content(&staged.id, &human.name).unwrap().1,
+            b"reviewable release notes"
+        );
         let now = Utc::now();
         let office_landed = app
             .finish_remote_flight(
@@ -3042,7 +3298,13 @@ mod tests {
         assert_eq!(invalid_office.status, FlightLeaseStatus::Crashed);
         let invalid_report = invalid_office.report.as_ref().unwrap();
         assert_eq!(invalid_report.failure_class, Some(FailureClass::Validation));
-        assert_eq!(invalid_report.contract_violations.len(), 1);
+        assert_eq!(invalid_report.contract_violations.len(), 2);
+        assert!(
+            invalid_report
+                .contract_violations
+                .iter()
+                .any(|violation| violation.contains("not staged"))
+        );
         drop(app);
 
         let replayed = MambaApp::open(&data_dir).unwrap();

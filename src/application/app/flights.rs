@@ -317,7 +317,21 @@ impl MambaApp {
         let Some(manifest) = &lease.manifest else {
             return Vec::new();
         };
-        CapabilityAdapter::contract_violations(&manifest.output_contract, &report.deliverables)
+        let mut violations =
+            CapabilityAdapter::contract_violations(&manifest.output_contract, &report.deliverables);
+        if manifest.capability_pack == CapabilityPack::Office {
+            for deliverable in &report.deliverables {
+                if !self.state.staged_artifacts.values().any(|artifact| {
+                    artifact.flight_lease_id == lease.id && artifact.path == deliverable.path
+                }) {
+                    violations.push(format!(
+                        "Office deliverable was not staged with immutable content: {}",
+                        deliverable.path
+                    ));
+                }
+            }
+        }
+        violations
     }
 
     pub fn recovery_options(&self, lease_id: &str, actor: &str) -> Result<Vec<RecoveryAction>> {

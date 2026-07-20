@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     CapabilityPack, FailureClass, FlightLeaseStatus, FlowStatus, NotificationStatus,
-    ResourceLeaseStatus, TaskStatus,
+    OfficeReleasePayload, OfficeReleaseStatus, ResourceLeaseStatus, TaskStatus,
 };
 use crate::state::OrganizationState;
 
@@ -16,6 +16,7 @@ pub struct DashboardSnapshot {
     pub flows: Vec<DashboardFlow>,
     pub action_items: Vec<DashboardAction>,
     pub flights: Vec<DashboardFlight>,
+    pub office_releases: Vec<DashboardOfficeRelease>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,6 +32,8 @@ pub struct DashboardMetrics {
     pub open_flights: usize,
     pub pending_notifications: usize,
     pub failed_notifications: usize,
+    pub pending_office_releases: usize,
+    pub indeterminate_office_releases: usize,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -105,6 +108,22 @@ pub struct DashboardFlight {
     pub deliverable_count: usize,
     pub requires_human_release: bool,
     pub contract_violations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DashboardOfficeRelease {
+    pub id: String,
+    pub flow_id: String,
+    pub task_id: String,
+    pub provider: String,
+    pub kind: String,
+    pub status: OfficeReleaseStatus,
+    pub summary: String,
+    pub payload_sha256: String,
+    pub requested_by: String,
+    pub requested_at: DateTime<Utc>,
+    pub reviewed_by: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -368,6 +387,53 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
         .collect::<Vec<_>>();
     flights.sort_by_key(|flight| std::cmp::Reverse(flight.updated_at));
 
+    let mut office_releases = state
+        .office_releases
+        .values()
+        .map(|release| {
+            let (kind, summary) = match &release.payload {
+                OfficeReleasePayload::DriveUpload { file_name, .. } => {
+                    ("drive_upload", format!("发布文件 {file_name}"))
+                }
+                OfficeReleasePayload::SendEmail { subject, to, .. } => (
+                    "send_email",
+                    format!("发送邮件《{subject}》给 {} 人", to.len()),
+                ),
+                OfficeReleasePayload::CreateCalendarEvent {
+                    subject, attendees, ..
+                } => (
+                    "create_calendar_event",
+                    format!("创建日程《{subject}》，{} 位参与者", attendees.len()),
+                ),
+            };
+            DashboardOfficeRelease {
+                id: release.id.clone(),
+                flow_id: release.flow_id.clone(),
+                task_id: release.task_id.clone(),
+                provider: format!("{:?}", release.provider).to_lowercase(),
+                kind: kind.into(),
+                status: release.status,
+                summary,
+                payload_sha256: release.payload_sha256.clone(),
+                requested_by: state
+                    .principals
+                    .get(&release.requested_by)
+                    .map(|principal| principal.name.clone())
+                    .unwrap_or_else(|| release.requested_by.clone()),
+                requested_at: release.requested_at,
+                reviewed_by: release.reviewed_by.as_ref().map(|reviewer| {
+                    state
+                        .principals
+                        .get(reviewer)
+                        .map(|principal| principal.name.clone())
+                        .unwrap_or_else(|| reviewer.clone())
+                }),
+                last_error: release.last_error.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    office_releases.sort_by_key(|release| std::cmp::Reverse(release.requested_at));
+
     let total_tasks = state.flows.values().map(|flow| flow.tasks.len()).sum();
     let completed_tasks = state
         .flows
@@ -381,12 +447,18 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
         .flat_map(|flow| &flow.tasks)
         .filter(|task| task.status == TaskStatus::Blocked)
         .count();
-    let awaiting_human = state
+    let awaiting_human_tasks = state
         .flows
         .values()
         .flat_map(|flow| &flow.tasks)
         .filter(|task| task.status == TaskStatus::Submitted)
         .count();
+    let awaiting_human = awaiting_human_tasks
+        + state
+            .office_releases
+            .values()
+            .filter(|release| release.status == OfficeReleaseStatus::Requested)
+            .count();
     let open_flights = state
         .flight_leases
         .values()
@@ -418,10 +490,21 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
                 .values()
                 .filter(|delivery| delivery.status == NotificationStatus::Failed)
                 .count(),
+            pending_office_releases: state
+                .office_releases
+                .values()
+                .filter(|release| release.status == OfficeReleaseStatus::Requested)
+                .count(),
+            indeterminate_office_releases: state
+                .office_releases
+                .values()
+                .filter(|release| release.status == OfficeReleaseStatus::Indeterminate)
+                .count(),
         },
         flows,
         action_items,
         flights,
+        office_releases,
     }
 }
 

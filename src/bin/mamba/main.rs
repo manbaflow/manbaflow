@@ -2056,12 +2056,13 @@ async fn run(cli: Cli) -> Result<()> {
                     &report,
                     cli.json,
                     format!(
-                        "PostgreSQL 数据面就位：{} Tenant，迁移 {}，幂等复核 {}，{} events，{} credentials",
+                        "PostgreSQL 数据面就位：{} Tenant，迁移 {}，幂等复核 {}，{} events，{} credentials，{} artifacts",
                         report.tenants,
                         report.migrated_tenants,
                         report.replayed_tenants,
                         report.events,
-                        report.credentials
+                        report.credentials,
+                        report.artifacts
                     ),
                 );
             }

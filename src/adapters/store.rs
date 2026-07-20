@@ -11,7 +11,7 @@ use crate::error::{MambaError, Result};
 use crate::event::{CURRENT_EVENT_VERSION, DomainEvent, EventEnvelope};
 use crate::ids::new_id;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct StorageHealth {
@@ -128,6 +128,20 @@ impl FlowStore {
         }
     }
 
+    pub(crate) fn put_artifact(&mut self, artifact: &ArtifactBlob) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => store.put_artifact(artifact),
+            Self::Postgres(store) => store.put_artifact(artifact),
+        }
+    }
+
+    pub(crate) fn load_artifact(&self, sha256: &str) -> Result<Option<ArtifactBlob>> {
+        match self {
+            Self::Sqlite(store) => store.load_artifact(sha256),
+            Self::Postgres(store) => store.load_artifact(sha256),
+        }
+    }
+
     pub fn tenant_id(&self) -> Option<&str> {
         match self {
             Self::Sqlite(_) => None,
@@ -164,6 +178,15 @@ pub(crate) struct CredentialSnapshot {
     pub revoked_at: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactBlob {
+    pub sha256: String,
+    pub media_type: String,
+    pub size_bytes: i64,
+    pub content: Vec<u8>,
+    pub created_at: String,
+}
+
 pub struct EventStore {
     connection: Connection,
     path: PathBuf,
@@ -190,7 +213,7 @@ impl EventStore {
                 [],
                 |row| row.get::<_, i64>(0),
             )?;
-            if !matches!(existing_version, 2 | SCHEMA_VERSION) {
+            if !matches!(existing_version, 2 | 3 | SCHEMA_VERSION) {
                 return Err(MambaError::Validation(format!(
                     "unsupported storage schema version {existing_version}; this binary requires {SCHEMA_VERSION}"
                 )));
@@ -225,11 +248,18 @@ impl EventStore {
             );
             CREATE INDEX IF NOT EXISTS idx_api_credentials_principal
                 ON api_credentials(principal_id, revoked_at);
+            CREATE TABLE IF NOT EXISTS artifacts (
+                sha256     TEXT PRIMARY KEY,
+                media_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                content    BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS metadata (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            INSERT INTO metadata(key, value) VALUES ('schema_version', '3')
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '4')
                 ON CONFLICT(key) DO NOTHING;
             ",
         )?;
@@ -246,6 +276,13 @@ impl EventStore {
             )?;
             transaction.commit()?;
             schema_version = 3;
+        }
+        if schema_version == 3 {
+            connection.execute(
+                "UPDATE metadata SET value = '4' WHERE key = 'schema_version'",
+                [],
+            )?;
+            schema_version = 4;
         }
         if schema_version != SCHEMA_VERSION {
             return Err(MambaError::Validation(format!(
@@ -534,6 +571,53 @@ impl EventStore {
         }
     }
 
+    pub(crate) fn put_artifact(&mut self, artifact: &ArtifactBlob) -> Result<()> {
+        let inserted = self.connection.execute(
+            "INSERT INTO artifacts(sha256, media_type, size_bytes, content, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(sha256) DO NOTHING",
+            params![
+                artifact.sha256,
+                artifact.media_type,
+                artifact.size_bytes,
+                artifact.content,
+                artifact.created_at
+            ],
+        )?;
+        if inserted == 0 {
+            let existing = self.load_artifact(&artifact.sha256)?.ok_or_else(|| {
+                MambaError::Validation("artifact disappeared after a hash conflict".into())
+            })?;
+            if existing.content != artifact.content
+                || existing.media_type != artifact.media_type
+                || existing.size_bytes != artifact.size_bytes
+            {
+                return Err(MambaError::Validation(
+                    "artifact hash already exists with different content or metadata".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn load_artifact(&self, sha256: &str) -> Result<Option<ArtifactBlob>> {
+        let mut statement = self.connection.prepare(
+            "SELECT sha256, media_type, size_bytes, content, created_at
+             FROM artifacts WHERE sha256 = ?1",
+        )?;
+        let mut rows = statement.query([sha256])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(ArtifactBlob {
+            sha256: row.get(0)?,
+            media_type: row.get(1)?,
+            size_bytes: row.get(2)?,
+            content: row.get(3)?,
+            created_at: row.get(4)?,
+        }))
+    }
+
     pub(crate) fn export_credentials(&self) -> Result<Vec<CredentialSnapshot>> {
         let mut statement = self.connection.prepare(
             "SELECT id, principal_id, token_hash, created_at, expires_at, revoked_at
@@ -554,6 +638,24 @@ impl EventStore {
             credentials.push(row?);
         }
         Ok(credentials)
+    }
+
+    pub(crate) fn export_artifacts(&self) -> Result<Vec<ArtifactBlob>> {
+        let mut statement = self.connection.prepare(
+            "SELECT sha256, media_type, size_bytes, content, created_at
+             FROM artifacts ORDER BY created_at, sha256",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ArtifactBlob {
+                sha256: row.get(0)?,
+                media_type: row.get(1)?,
+                size_bytes: row.get(2)?,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn load_where<const N: usize>(
@@ -718,9 +820,26 @@ mod tests {
         assert_eq!(health.integrity, "ok");
         assert_eq!(health.journal_mode, "wal");
         assert_eq!(health.event_count, 1);
+        let artifact = ArtifactBlob {
+            sha256: "a".repeat(64),
+            media_type: "text/plain".into(),
+            size_bytes: 12,
+            content: b"office draft".to_vec(),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        store.put_artifact(&artifact).unwrap();
+        store.put_artifact(&artifact).unwrap();
+        assert_eq!(
+            store.load_artifact(&artifact.sha256).unwrap(),
+            Some(artifact.clone())
+        );
         store.backup(&backup_path).unwrap();
         let backup = EventStore::open(&backup_path).unwrap();
         assert_eq!(backup.load_all().unwrap().len(), 1);
+        assert_eq!(
+            backup.load_artifact(&artifact.sha256).unwrap(),
+            Some(artifact)
+        );
         assert!(store.backup(&backup_path).is_err());
         store
             .insert_credential(
@@ -749,7 +868,7 @@ mod tests {
         .unwrap();
         drop(v2);
         let migrated = EventStore::open(v2_path).unwrap();
-        assert_eq!(migrated.health().unwrap().schema_version, 3);
+        assert_eq!(migrated.health().unwrap().schema_version, 4);
 
         let future_path = directory.path().join("future.sqlite");
         let future = Connection::open(&future_path).unwrap();

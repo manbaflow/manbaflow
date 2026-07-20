@@ -22,6 +22,7 @@ rm -rf .mambaflow-showcase
 - 为两名 Human 配置 UTC+08:00 的工作日历，让排期避开夜间和周末；
 - 生成三条真实 Flow，并写入需求、PRD、审批、Assignment、Heartbeat、Evidence 和 Tracker 事件；
 - 由牢大向佐巴扬与 Codex 副驾发送一条等待回执的生产放行指令；
+- 生成一份带内容摘要的 Office Release Request，等待牢大点击 `放行发布`；
 - 签发一张远程 Flight Lease，然后自动聚焦风险最高的 LLM Gateway。
 
 底栏的 `SHOWCASE` 只在空塔台出现，避免误把演示数据灌进真实组织。
@@ -34,11 +35,13 @@ rm -rf .mambaflow-showcase
 Open Flights、Flow Health 和 Action Queue。重点说明：管理员看到的是整个组织的交付状态和下一步动作，
 不是某个 Agent 的聊天记录。`OUTBOX` 同时显示等待投递或失败的企业通知；没有配置 Endpoint 时保持为零。
 配置 Endpoint 后，底部 `投递通知` 可以现场触发一次非阻塞投递，落地或坠机结果会回到同一条时间线。
+点击底部 `放行发布` 会把当前最早的 Office Release 从 `requested` 推进为 `approved`；演示数据不配置
+真实 Provider Token，所以不会向外部收件人发送内容。
 
 当前三条 Flow 分别是：
 
 - `LLM Gateway v0`：Scope 已落地，Gateway Core 正在执行，鉴权任务因 Secret 轮换边界阻塞；
-- `Q3 客户发布说明`：草案已经提交，正在等待牢大验收；
+- `Q3 客户发布说明`：草案已经提交，同时有一封客户邮件等待牢大放行；
 - `生产值班手册`：所有任务已经完成并安全落地。
 
 点击 `阵容 ROSTER` 可以看到成员产能、终端和工作日历。Human 使用工作日时间，副驾默认保持 24×7；

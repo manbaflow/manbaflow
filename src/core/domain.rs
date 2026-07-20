@@ -994,6 +994,134 @@ pub struct FlightDeliverable {
     pub requires_human_release: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StagedArtifact {
+    pub id: String,
+    pub flight_lease_id: String,
+    pub flow_id: String,
+    pub task_id: String,
+    pub path: String,
+    pub kind: DeliverableKind,
+    pub media_type: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub staged_by: String,
+    pub staged_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficeProvider {
+    Microsoft365,
+    GoogleWorkspace,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficeBodyType {
+    Text,
+    Html,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OfficeReleasePayload {
+    DriveUpload {
+        artifact_id: String,
+        account_id: String,
+        parent_id: String,
+        file_name: String,
+        #[serde(default)]
+        file_id: Option<String>,
+    },
+    SendEmail {
+        account_id: String,
+        to: Vec<String>,
+        #[serde(default)]
+        cc: Vec<String>,
+        #[serde(default)]
+        bcc: Vec<String>,
+        subject: String,
+        body: String,
+        body_type: OfficeBodyType,
+    },
+    CreateCalendarEvent {
+        account_id: String,
+        calendar_id: String,
+        subject: String,
+        body: String,
+        body_type: OfficeBodyType,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        time_zone: String,
+        #[serde(default)]
+        attendees: Vec<String>,
+        #[serde(default)]
+        location: Option<String>,
+        #[serde(default)]
+        send_updates: bool,
+    },
+}
+
+impl OfficeReleasePayload {
+    pub fn artifact_id(&self) -> Option<&str> {
+        match self {
+            Self::DriveUpload { artifact_id, .. } => Some(artifact_id),
+            Self::SendEmail { .. } | Self::CreateCalendarEvent { .. } => None,
+        }
+    }
+
+    pub fn retry_safe(&self, provider: OfficeProvider) -> bool {
+        match self {
+            Self::DriveUpload { file_id, .. } => {
+                provider == OfficeProvider::Microsoft365 || file_id.is_some()
+            }
+            Self::CreateCalendarEvent { .. } => true,
+            Self::SendEmail { .. } => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficeReleaseStatus {
+    Requested,
+    Approved,
+    Dispatching,
+    Released,
+    Failed,
+    Indeterminate,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OfficeReleaseResult {
+    pub external_id: Option<String>,
+    pub url: Option<String>,
+    pub response_status: u16,
+    pub released_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OfficeReleaseRequest {
+    pub id: String,
+    pub flow_id: String,
+    pub task_id: String,
+    pub provider: OfficeProvider,
+    pub payload: OfficeReleasePayload,
+    pub payload_sha256: String,
+    pub requested_by: String,
+    pub requested_at: DateTime<Utc>,
+    pub status: OfficeReleaseStatus,
+    pub reviewed_by: Option<String>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    pub review_reason: Option<String>,
+    pub dispatch_id: Option<String>,
+    pub dispatch_started_at: Option<DateTime<Utc>>,
+    pub result: Option<OfficeReleaseResult>,
+    pub last_error: Option<String>,
+}
+
 impl FlightDeliverable {
     pub fn from_path(path: String, requires_human_release: bool) -> Self {
         let extension = std::path::Path::new(&path)

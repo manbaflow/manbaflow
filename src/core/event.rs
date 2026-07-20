@@ -6,8 +6,9 @@ use crate::domain::{
     ExecutionRecord, ExternalArtifact, ExternalIdentityBinding, ExternalInteractionReceipt,
     FlightLease, FlightRecoveryDecision, Flow, FlowChangeRequest, FlowMessage,
     FlowScheduleRevision, MessageAcknowledgement, NotificationDelivery, NotificationEndpoint,
-    Organization, PrdDraft, Principal, RemoteFlightReport, ResourceLease, RoleBinding, Task, Team,
-    Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
+    OfficeReleaseRequest, OfficeReleaseResult, Organization, PrdDraft, Principal,
+    RemoteFlightReport, ResourceLease, RoleBinding, StagedArtifact, Task, Team, Tenant,
+    TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 
 pub const CURRENT_EVENT_VERSION: u16 = 2;
@@ -302,6 +303,65 @@ pub enum DomainEvent {
         run_id: String,
         claimed_at: DateTime<Utc>,
     },
+    FlightArtifactStaged {
+        artifact: StagedArtifact,
+    },
+    OfficeReleaseRequested {
+        request: OfficeReleaseRequest,
+    },
+    OfficeReleaseApproved {
+        flow_id: String,
+        task_id: String,
+        release_id: String,
+        approved_by: String,
+        approved_at: DateTime<Utc>,
+    },
+    OfficeReleaseRejected {
+        flow_id: String,
+        task_id: String,
+        release_id: String,
+        rejected_by: String,
+        reason: String,
+        rejected_at: DateTime<Utc>,
+    },
+    OfficeReleaseDispatchClaimed {
+        flow_id: String,
+        task_id: String,
+        release_id: String,
+        dispatch_id: String,
+        claimed_at: DateTime<Utc>,
+    },
+    OfficeReleaseSucceeded {
+        flow_id: String,
+        task_id: String,
+        release_id: String,
+        dispatch_id: String,
+        result: OfficeReleaseResult,
+    },
+    OfficeReleaseFailed {
+        flow_id: String,
+        task_id: String,
+        release_id: String,
+        dispatch_id: String,
+        error: String,
+        indeterminate: bool,
+        failed_at: DateTime<Utc>,
+    },
+    OfficeReleaseRetryApproved {
+        flow_id: String,
+        task_id: String,
+        release_id: String,
+        approved_by: String,
+        approved_at: DateTime<Utc>,
+    },
+    OfficeReleaseDispatchExpired {
+        flow_id: String,
+        task_id: String,
+        release_id: String,
+        dispatch_id: String,
+        retry_safe: bool,
+        expired_at: DateTime<Utc>,
+    },
     RemoteFlightRevoked {
         flow_id: String,
         task_id: String,
@@ -393,6 +453,27 @@ impl DomainEvent {
             Self::ResourceLeaseAcquired { .. } => "resource_lease.acquired",
             Self::ResourceLeaseReleased { .. } => "resource_lease.released",
             Self::RemoteFlightClaimed { .. } => "remote_flight.claimed",
+            Self::FlightArtifactStaged { .. } => "remote_flight.artifact_staged",
+            Self::OfficeReleaseRequested { .. } => "office_release.requested",
+            Self::OfficeReleaseApproved { .. } => "office_release.approved",
+            Self::OfficeReleaseRejected { .. } => "office_release.rejected",
+            Self::OfficeReleaseDispatchClaimed { .. } => "office_release.dispatch_claimed",
+            Self::OfficeReleaseSucceeded { .. } => "office_release.succeeded",
+            Self::OfficeReleaseFailed {
+                indeterminate: true,
+                ..
+            } => "office_release.indeterminate",
+            Self::OfficeReleaseFailed {
+                indeterminate: false,
+                ..
+            } => "office_release.failed",
+            Self::OfficeReleaseRetryApproved { .. } => "office_release.retry_approved",
+            Self::OfficeReleaseDispatchExpired {
+                retry_safe: true, ..
+            } => "office_release.dispatch_recovered",
+            Self::OfficeReleaseDispatchExpired {
+                retry_safe: false, ..
+            } => "office_release.dispatch_indeterminate",
             Self::RemoteFlightRevoked { .. } => "remote_flight.revoked",
             Self::RemoteFlightExpired { .. } => "remote_flight.expired",
             Self::RemoteFlightFinished { landed: true, .. } => "remote_flight.landed",
@@ -434,6 +515,13 @@ impl DomainEvent {
             | Self::RemoteFlightFinished { flow_id, .. }
             | Self::ResourceLeaseReleased { flow_id, .. }
             | Self::FlightRecoveryDecided { flow_id, .. }
+            | Self::OfficeReleaseApproved { flow_id, .. }
+            | Self::OfficeReleaseRejected { flow_id, .. }
+            | Self::OfficeReleaseDispatchClaimed { flow_id, .. }
+            | Self::OfficeReleaseSucceeded { flow_id, .. }
+            | Self::OfficeReleaseFailed { flow_id, .. }
+            | Self::OfficeReleaseRetryApproved { flow_id, .. }
+            | Self::OfficeReleaseDispatchExpired { flow_id, .. }
             | Self::FlowCompleted { flow_id, .. } => Some(flow_id),
             Self::NotificationQueued { delivery } => delivery.flow_id.as_deref(),
             Self::NotificationDelivered { flow_id, .. }
@@ -444,6 +532,8 @@ impl DomainEvent {
             Self::FlowChangeProposed { request } => Some(&request.flow_id),
             Self::ExecutorFinished { record } => Some(&record.flow_id),
             Self::RemoteFlightAuthorized { lease } => Some(&lease.flow_id),
+            Self::FlightArtifactStaged { artifact } => Some(&artifact.flow_id),
+            Self::OfficeReleaseRequested { request } => Some(&request.flow_id),
             Self::ResourceLeaseAcquired { lease } => Some(&lease.flow_id),
             Self::ExternalInteractionProcessed { receipt } => receipt.flow_id.as_deref(),
             Self::TenantInitialized { .. }

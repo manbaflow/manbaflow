@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -55,6 +55,12 @@ pub struct WorkerOutcome {
 struct PendingFlightResult {
     landed: bool,
     report: RemoteFlightReport,
+}
+
+struct PendingArtifact {
+    path: String,
+    media_type: String,
+    content: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -307,6 +313,10 @@ impl RemoteWorker {
         let prompt = execute_prompt(&principal, item, &lease, &instructions);
         let context_bytes = prompt.len() as u64;
 
+        let pack = lease
+            .manifest
+            .as_ref()
+            .map_or(CapabilityPack::General, |manifest| manifest.capability_pack);
         let (result, artifact) = {
             let worktree = if worktree_root.exists() {
                 IsolatedWorktree::resume(&self.options.workspace, worktree_root)
@@ -327,7 +337,14 @@ impl RemoteWorker {
                         log_path: log_path.clone(),
                     })
                     .await;
-                    let collected = worktree.collect(&patch_path);
+                    let collected = worktree.collect(&patch_path).and_then(|artifact| {
+                        let files = if pack == CapabilityPack::Office {
+                            collect_staged_files(worktree.workspace(), &artifact.changed_files)?
+                        } else {
+                            Vec::new()
+                        };
+                        Ok((artifact, files))
+                    });
                     let cleanup = worktree.cleanup();
                     let artifact = collected.and_then(|artifact| cleanup.map(|_| artifact));
                     (execution, artifact)
@@ -336,66 +353,91 @@ impl RemoteWorker {
                     write_setup_blackbox(&log_path, &run_id, &error)?;
                     (
                         Err(error),
-                        Ok(WorktreeArtifact {
-                            base_revision: "unavailable".into(),
-                            changed_files: vec![],
-                            patch_path: None,
-                            patch_sha256: None,
-                        }),
+                        Ok((
+                            WorktreeArtifact {
+                                base_revision: "unavailable".into(),
+                                changed_files: vec![],
+                                patch_path: None,
+                                patch_sha256: None,
+                            },
+                            Vec::new(),
+                        )),
                     )
                 }
             }
         };
 
-        let (landed, summary, artifact, cost_usd, failure_class) = match (result, artifact) {
-            (Ok(output), Ok(artifact)) => {
-                let suffix = match artifact.changed_files.len() {
-                    0 => "no file changes".to_string(),
-                    1 => "1 changed file captured in the isolated patch".to_string(),
-                    count => format!("{count} changed files captured in the isolated patch"),
-                };
-                (
-                    true,
-                    truncate(&format!("{}; {suffix}", output.summary), 4_000),
-                    artifact,
-                    output.cost_usd,
-                    None,
-                )
-            }
-            (Err(error), Ok(artifact)) => {
-                let failure = classify_worker_error(&error);
-                (
-                    false,
-                    truncate(&error.to_string(), 4_000),
-                    artifact,
-                    None,
-                    Some(failure),
-                )
-            }
-            (Ok(output), Err(error)) => {
-                let failure = classify_worker_error(&error);
-                (
-                    false,
-                    truncate(&format!("artifact collection failed: {error}"), 4_000),
-                    empty_artifact(),
-                    output.cost_usd,
-                    Some(failure),
-                )
-            }
-            (Err(execution), Err(collection)) => {
-                let failure = classify_worker_error(&execution);
-                (
-                    false,
-                    truncate(
-                        &format!("{execution}; artifact collection failed: {collection}"),
+        let (mut landed, mut summary, artifact, staged_files, cost_usd, mut failure_class) =
+            match (result, artifact) {
+                (Ok(output), Ok((artifact, staged_files))) => {
+                    let suffix = match artifact.changed_files.len() {
+                        0 => "no file changes".to_string(),
+                        1 => "1 changed file captured in the isolated patch".to_string(),
+                        count => format!("{count} changed files captured in the isolated patch"),
+                    };
+                    (
+                        true,
+                        truncate(&format!("{}; {suffix}", output.summary), 4_000),
+                        artifact,
+                        staged_files,
+                        output.cost_usd,
+                        None,
+                    )
+                }
+                (Err(error), Ok((artifact, staged_files))) => {
+                    let failure = classify_worker_error(&error);
+                    (
+                        false,
+                        truncate(&error.to_string(), 4_000),
+                        artifact,
+                        staged_files,
+                        None,
+                        Some(failure),
+                    )
+                }
+                (Ok(output), Err(error)) => {
+                    let failure = classify_worker_error(&error);
+                    (
+                        false,
+                        truncate(&format!("artifact collection failed: {error}"), 4_000),
+                        empty_artifact(),
+                        Vec::new(),
+                        output.cost_usd,
+                        Some(failure),
+                    )
+                }
+                (Err(execution), Err(collection)) => {
+                    let failure = classify_worker_error(&execution);
+                    (
+                        false,
+                        truncate(
+                            &format!("{execution}; artifact collection failed: {collection}"),
+                            4_000,
+                        ),
+                        empty_artifact(),
+                        Vec::new(),
+                        None,
+                        Some(failure),
+                    )
+                }
+            };
+        if landed {
+            for file in staged_files {
+                if let Err(error) = self
+                    .control_plane
+                    .stage_artifact(&lease.id, &file.path, &file.media_type, file.content)
+                    .await
+                {
+                    landed = false;
+                    failure_class = Some(FailureClass::Tool);
+                    summary = truncate(
+                        &format!("{summary}; artifact staging failed: {error}"),
                         4_000,
-                    ),
-                    empty_artifact(),
-                    None,
-                    Some(failure),
-                )
+                    );
+                    break;
+                }
             }
-        };
+        }
         if !log_path.is_file() {
             write_setup_blackbox(&log_path, &run_id, &MambaError::Validation(summary.clone()))?;
         }
@@ -590,6 +632,46 @@ impl ControlPlaneClient {
         .await
     }
 
+    async fn stage_artifact(
+        &self,
+        lease_id: &str,
+        path: &str,
+        media_type: &str,
+        content: Vec<u8>,
+    ) -> Result<crate::domain::StagedArtifact> {
+        let mut url = self.api_base.clone();
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                MambaError::Validation("MambaFlow server URL cannot form an endpoint".into())
+            })?;
+            segments.pop_if_empty();
+            for segment in ["flight-leases", lease_id, "artifacts"] {
+                segments.push(segment);
+            }
+        }
+        url.query_pairs_mut().append_pair("path", path);
+        let response = self
+            .client
+            .put(url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, media_type)
+            .body(content)
+            .send()
+            .await
+            .map_err(|error| {
+                MambaError::ExternalConnector(format!("artifact staging request failed: {error}"))
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(control_plane_error(status, response).await);
+        }
+        response.json().await.map_err(|_| {
+            MambaError::ExternalConnector(
+                "control plane returned an invalid staged artifact".into(),
+            )
+        })
+    }
+
     async fn request<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -762,6 +844,70 @@ fn execute_prompt(
     )
 }
 
+fn collect_staged_files(
+    workspace: &Path,
+    changed_files: &[String],
+) -> Result<Vec<PendingArtifact>> {
+    let workspace = workspace.canonicalize()?;
+    let mut total_bytes = 0usize;
+    let mut files = Vec::with_capacity(changed_files.len());
+    for path in changed_files {
+        let source = workspace.join(path);
+        let metadata = fs::symlink_metadata(&source).map_err(|_| {
+            MambaError::Validation(format!(
+                "Office deliverable is missing or was deleted: {path}"
+            ))
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(MambaError::Validation(format!(
+                "Office deliverable must be a regular file: {path}"
+            )));
+        }
+        let canonical = source.canonicalize()?;
+        if !canonical.starts_with(&workspace) {
+            return Err(MambaError::Validation(format!(
+                "Office deliverable escapes the isolated workspace: {path}"
+            )));
+        }
+        let content = fs::read(canonical)?;
+        total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
+            MambaError::Validation("Office deliverables exceed the staging budget".into())
+        })?;
+        if total_bytes > crate::application::app::artifacts::MAX_ARTIFACT_BYTES {
+            return Err(MambaError::Validation(format!(
+                "Office deliverables exceed the {} byte staging budget",
+                crate::application::app::artifacts::MAX_ARTIFACT_BYTES
+            )));
+        }
+        files.push(PendingArtifact {
+            path: path.clone(),
+            media_type: office_media_type(path).into(),
+            content,
+        });
+    }
+    Ok(files)
+}
+
+fn office_media_type(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("md" | "txt") => "text/plain",
+        Some("html") => "text/html",
+        Some("pdf") => "application/pdf",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("csv") => "text/csv",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("eml") => "message/rfc822",
+        Some("ics") => "text/calendar",
+        _ => "application/octet-stream",
+    }
+}
+
 fn relevant_inbox_messages<'a>(
     messages: &'a [MessageInboxItem],
     item: &'a InboxItem,
@@ -871,15 +1017,19 @@ fn classify_worker_error(error: &MambaError) -> FailureClass {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use axum::extract::{Path, State};
+    use axum::body::Bytes;
+    use axum::extract::{Path, Query, State};
     use axum::http::HeaderMap;
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
     use axum::{Json, Router};
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::tempdir;
 
     use super::*;
-    use crate::domain::{Assignment, AssignmentTarget, Estimate, PrincipalKind, TargetKind};
+    use crate::domain::{
+        Assignment, AssignmentTarget, Estimate, FlightManifest, OutputContract, PrincipalKind,
+        RecoveryPolicy, StagedArtifact, TargetKind,
+    };
 
     #[derive(Clone)]
     struct MockState {
@@ -1020,7 +1170,20 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
             finished_at: None,
             run_id: None,
             report: None,
-            manifest: None,
+            manifest: Some(FlightManifest {
+                id: "MANIFEST-1".into(),
+                objective: "produce a reviewable Office document".into(),
+                landing_conditions: vec!["generated.txt is staged".into()],
+                context_refs: Vec::new(),
+                tool_permissions: Vec::new(),
+                fuel: Default::default(),
+                recovery: RecoveryPolicy::default(),
+                resources: Vec::new(),
+                capability_pack: CapabilityPack::Office,
+                output_contract: OutputContract::for_pack(CapabilityPack::Office),
+                declared_by: "Engineer".into(),
+                declared_at: now,
+            }),
             parent_lease_id: None,
             root_lease_id: Some("LEASE-1".into()),
             attempt: 1,
@@ -1044,6 +1207,10 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
             .route(
                 "/api/v1/flight-leases/{lease}/finish",
                 post(mock_finish_flight),
+            )
+            .route(
+                "/api/v1/flight-leases/{lease}/artifacts",
+                put(mock_stage_artifact),
             )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1100,7 +1267,7 @@ printf '%s\n' '{"thread_id":"execute-thread"}'
         );
         assert_eq!(
             state.actions.lock().unwrap().as_slice(),
-            ["claim", "finish"]
+            ["claim", "stage", "finish"]
         );
         let lease = state.lease.lock().unwrap().clone().unwrap();
         assert_eq!(lease.status, FlightLeaseStatus::Landed);
@@ -1201,6 +1368,38 @@ printf '%s\n' '{"thread_id":"execute-thread"}'
         lease.finished_at = Some(Utc::now());
         lease.report = Some(body.report);
         Json(lease.clone())
+    }
+
+    async fn mock_stage_artifact(
+        State(state): State<MockState>,
+        Path(lease_id): Path<String>,
+        Query(query): Query<std::collections::BTreeMap<String, String>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<StagedArtifact> {
+        state.actions.lock().unwrap().push("stage".into());
+        assert_eq!(lease_id, "LEASE-1");
+        assert_eq!(query.get("path").map(String::as_str), Some("generated.txt"));
+        assert_eq!(
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain")
+        );
+        assert_eq!(body.as_ref(), b"isolated change\n");
+        Json(StagedArtifact {
+            id: "ART-1".into(),
+            flight_lease_id: lease_id,
+            flow_id: "FLOW-1".into(),
+            task_id: state.task.lock().unwrap().id.clone(),
+            path: "generated.txt".into(),
+            kind: crate::domain::DeliverableKind::Document,
+            media_type: "text/plain".into(),
+            sha256: "a".repeat(64),
+            size_bytes: body.len() as u64,
+            staged_by: state.principal.name.clone(),
+            staged_at: Utc::now(),
+        })
     }
 
     async fn mock_task_action(

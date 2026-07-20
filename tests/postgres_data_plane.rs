@@ -1,4 +1,8 @@
-use manbaflow::domain::PrincipalKind;
+use chrono::Utc;
+use manbaflow::domain::{
+    CapabilityPack, ExecutorKind, FlightManifestDraft, OrganizationRole, PrincipalKind,
+    RemoteFlightReport,
+};
 use manbaflow::ids::new_id;
 use manbaflow::migration::sqlite_fleet_to_postgres;
 use manbaflow::tenant::TenantCatalog;
@@ -62,6 +66,104 @@ async fn postgres_replicas_share_tenant_events_and_credentials() {
             .unwrap()
             .id,
         admin.id
+    );
+
+    let office_human = stale
+        .register_principal(
+            "Office Owner",
+            PrincipalKind::Human,
+            Some("Platform"),
+            None,
+            "product,documentation,delivery",
+            100,
+            None,
+            &admin.id,
+        )
+        .unwrap();
+    let agent = stale
+        .register_principal(
+            "Office Agent",
+            PrincipalKind::Agent,
+            Some("Platform"),
+            Some(&office_human.id),
+            "product,documentation,delivery",
+            100,
+            None,
+            &admin.id,
+        )
+        .unwrap();
+    stale
+        .grant_role(&office_human.id, OrganizationRole::Manager, &admin.id)
+        .unwrap();
+    let flow = stale
+        .create_demand(
+            "Prepare a reviewable Office release",
+            &office_human.name,
+            manbaflow::planner::PlannerKind::Local,
+            directory.path(),
+            10,
+        )
+        .await
+        .unwrap();
+    stale.approve_flow(&flow.id, &office_human.name).unwrap();
+    let task = flow.tasks[0].clone();
+    stale.accept_task(&task.id, &office_human.name).unwrap();
+    let lease = stale
+        .authorize_remote_flight_with_manifest(
+            &task.id,
+            &office_human.name,
+            &agent.name,
+            ExecutorKind::Codex,
+            3_600,
+            FlightManifestDraft {
+                capability_pack: Some(CapabilityPack::Office),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stale
+        .claim_remote_flight(&lease.id, &agent.name, "WRUN-pg-office")
+        .unwrap();
+    let artifact = stale
+        .stage_flight_artifact(
+            &lease.id,
+            "reports/weekly.txt",
+            "text/plain",
+            b"shared office artifact".to_vec(),
+            &agent.name,
+        )
+        .unwrap();
+    let now = Utc::now();
+    stale
+        .finish_remote_flight(
+            &lease.id,
+            &agent.name,
+            true,
+            RemoteFlightReport {
+                run_id: "WRUN-pg-office".into(),
+                executor: ExecutorKind::Codex,
+                summary: "Office draft staged".into(),
+                base_revision: "pg-test".into(),
+                changed_files: vec!["reports/weekly.txt".into()],
+                patch_sha256: Some("a".repeat(64)),
+                log_sha256: "b".repeat(64),
+                started_at: now,
+                finished_at: now,
+                fuel: Default::default(),
+                failure_class: None,
+                budget_exhaustions: Vec::new(),
+                deliverables: Vec::new(),
+                contract_violations: Vec::new(),
+            },
+        )
+        .unwrap();
+    first.refresh_shared_state().unwrap();
+    assert_eq!(
+        first
+            .artifact_content(&artifact.id, &office_human.id)
+            .unwrap()
+            .1,
+        b"shared office artifact"
     );
 
     let slug = format!(

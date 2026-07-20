@@ -23,9 +23,10 @@ use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
     AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, FlightManifestDraft,
     Flow, FlowChangeRequest, FlowMessage, FlowMessageKind, IssuedCredential, MessageInboxItem,
-    NotificationConnector, NotificationDelivery, NotificationEndpoint, Organization,
-    OrganizationRole, Principal, PrincipalKind, RecoveryAction, RemoteFlightReport, RoleBinding,
-    Task, Team, Tenant, TrackingEscalation, WorkCalendar, Workday,
+    NotificationConnector, NotificationDelivery, NotificationEndpoint, OfficeProvider,
+    OfficeReleasePayload, OfficeReleaseRequest, Organization, OrganizationRole, Principal,
+    PrincipalKind, RecoveryAction, RemoteFlightReport, RoleBinding, Task, Team, Tenant,
+    TrackingEscalation, WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
@@ -34,6 +35,7 @@ use crate::interaction::{
     ExternalInteractionInput, InteractionWebhookAuth, parse_slack_interaction, slack_delivery_id,
 };
 use crate::notification::NotificationDispatchSummary;
+use crate::office::OfficeBridge;
 use crate::planner::PlannerKind;
 use crate::tenant::{TenantCatalog, database_url_from_env};
 
@@ -55,6 +57,7 @@ struct ApiState {
     interaction_auth: InteractionWebhookAuth,
     oidc: Option<OidcProvider>,
     scim_auth: ScimAuthenticator,
+    office_bridge: OfficeBridge,
 }
 
 #[derive(Clone)]
@@ -419,6 +422,11 @@ struct FinishFlightInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct StageArtifactQuery {
+    path: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct RecoverFlightInput {
     action: RecoveryAction,
     reason: String,
@@ -452,20 +460,48 @@ struct OidcCallbackQuery {
     state: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct OfficeReleasesQuery {
+    #[serde(default)]
+    flow_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RequestOfficeReleaseInput {
+    task_id: String,
+    provider: OfficeProvider,
+    payload: OfficeReleasePayload,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RejectOfficeReleaseInput {
+    reason: String,
+}
+
 pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
     validate_server_options(&options)?;
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
     let interaction_auth = InteractionWebhookAuth::from_env()?;
     let oidc = OidcProvider::from_env().await?;
     let scim_auth = ScimAuthenticator::from_env()?;
+    let office_bridge = OfficeBridge::from_env()?;
     let listener = TcpListener::bind(options.bind).await?;
     announce_server(&options, &gitlab_webhook_auth, &interaction_auth, 1);
+    let tenant_id = app.state().tenant()?.id.clone();
     let app = Arc::new(Mutex::new(app));
     spawn_tracker(app.clone(), &options);
     spawn_notification_dispatcher(app.clone(), &options);
+    spawn_office_dispatcher(app.clone(), office_bridge.clone(), tenant_id, &options);
     axum::serve(
         listener,
-        router_with_identity(app, gitlab_webhook_auth, interaction_auth, oidc, scim_auth),
+        router_with_identity(
+            app,
+            gitlab_webhook_auth,
+            interaction_auth,
+            oidc,
+            scim_auth,
+            office_bridge,
+        ),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
@@ -496,6 +532,7 @@ pub async fn run_fleet(
     let interaction_auth = InteractionWebhookAuth::from_env()?;
     let oidc = OidcProvider::from_env().await?;
     let scim_auth = ScimAuthenticator::from_env()?;
+    let office_bridge = OfficeBridge::from_env()?;
     let mut routers = BTreeMap::new();
 
     for record in catalog.active()? {
@@ -523,6 +560,12 @@ pub async fn run_fleet(
         let app = Arc::new(Mutex::new(app));
         spawn_tracker(app.clone(), &options);
         spawn_notification_dispatcher(app.clone(), &options);
+        spawn_office_dispatcher(
+            app.clone(),
+            office_bridge.clone(),
+            record.id.clone(),
+            &options,
+        );
         routers.insert(
             record.id,
             router_with_identity(
@@ -531,6 +574,7 @@ pub async fn run_fleet(
                 interaction_auth.clone(),
                 oidc.clone(),
                 scim_auth.clone(),
+                office_bridge.clone(),
             ),
         );
     }
@@ -647,6 +691,7 @@ fn router(
         interaction_auth,
         None,
         ScimAuthenticator::default(),
+        OfficeBridge::disabled(),
     )
 }
 
@@ -656,6 +701,7 @@ fn router_with_identity(
     interaction_auth: InteractionWebhookAuth,
     oidc: Option<OidcProvider>,
     scim_auth: ScimAuthenticator,
+    office_bridge: OfficeBridge,
 ) -> Router {
     let rate_limit = RateLimitState::default();
     let tenant_id = app
@@ -673,6 +719,7 @@ fn router_with_identity(
         interaction_auth,
         oidc,
         scim_auth,
+        office_bridge,
     };
     Router::new()
         .route("/console", get(crate::console::index))
@@ -779,6 +826,35 @@ fn router_with_identity(
         .route("/api/v1/flight-leases/{id}/claim", post(claim_flight))
         .route("/api/v1/flight-leases/{id}/revoke", post(revoke_flight))
         .route("/api/v1/flight-leases/{id}/finish", post(finish_flight))
+        .route(
+            "/api/v1/flight-leases/{id}/artifacts",
+            get(flight_artifacts)
+                .put(stage_flight_artifact)
+                .layer(DefaultBodyLimit::max(
+                    crate::application::app::artifacts::MAX_ARTIFACT_BYTES,
+                )),
+        )
+        .route("/api/v1/artifacts/{id}/content", get(artifact_content))
+        .route(
+            "/api/v1/office/releases",
+            get(office_releases).post(request_office_release),
+        )
+        .route(
+            "/api/v1/office/releases/{id}/approve",
+            post(approve_office_release),
+        )
+        .route(
+            "/api/v1/office/releases/{id}/reject",
+            post(reject_office_release),
+        )
+        .route(
+            "/api/v1/office/releases/{id}/retry",
+            post(retry_office_release),
+        )
+        .route(
+            "/api/v1/office/releases/dispatch",
+            post(dispatch_office_release),
+        )
         .route(
             "/api/v1/flight-leases/{id}/recovery-options",
             get(flight_recovery_options),
@@ -909,6 +985,32 @@ fn spawn_notification_dispatcher(app: Arc<Mutex<MambaApp>>, options: &ServerOpti
             .await
             {
                 eprintln!("notification dispatch failed: {error}");
+            }
+        }
+    });
+}
+
+fn spawn_office_dispatcher(
+    app: Arc<Mutex<MambaApp>>,
+    bridge: OfficeBridge,
+    tenant_id: String,
+    options: &ServerOptions,
+) {
+    let interval_seconds = options.notification_interval_seconds;
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(interval_seconds));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            loop {
+                match dispatch_office_once(&app, &bridge, &tenant_id).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(error) => {
+                        eprintln!("Office release dispatch failed: {error}");
+                        break;
+                    }
+                }
             }
         }
     });
@@ -1380,6 +1482,8 @@ async fn metrics(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult
          # TYPE manbaflow_blocked_tasks gauge\nmanbaflow_blocked_tasks {}\n\
          # TYPE manbaflow_open_flights gauge\nmanbaflow_open_flights {}\n\
          # TYPE manbaflow_pending_notifications gauge\nmanbaflow_pending_notifications {}\n\
+         # TYPE manbaflow_pending_office_releases gauge\nmanbaflow_pending_office_releases {}\n\
+         # TYPE manbaflow_indeterminate_office_releases gauge\nmanbaflow_indeterminate_office_releases {}\n\
          # TYPE manbaflow_ledger_events counter\nmanbaflow_ledger_events {}\n",
         metrics.total_flows,
         metrics.active_flows,
@@ -1387,6 +1491,8 @@ async fn metrics(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult
         metrics.blocked_tasks,
         metrics.open_flights,
         metrics.pending_notifications,
+        metrics.pending_office_releases,
+        metrics.indeterminate_office_releases,
         storage.event_count,
     );
     Ok((
@@ -1996,6 +2102,208 @@ async fn finish_flight(
     .await
 }
 
+async fn stage_flight_artifact(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    Query(query): Query<StageArtifactQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<crate::domain::StagedArtifact>> {
+    let media_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_string();
+    let mut app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.stage_flight_artifact(
+        &lease_id,
+        &query.path,
+        &media_type,
+        body.to_vec(),
+        &principal.id,
+    )?))
+}
+
+async fn flight_artifacts(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<crate::domain::StagedArtifact>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.flight_artifacts(&lease_id, &principal.id)?))
+}
+
+async fn artifact_content(
+    State(state): State<ApiState>,
+    Path(artifact_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    let (artifact, content) = app.artifact_content(&artifact_id, &principal.id)?;
+    let filename = artifact
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or("artifact")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    Ok((
+        [
+            (header::CONTENT_TYPE, artifact.media_type),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        content,
+    )
+        .into_response())
+}
+
+async fn office_releases(
+    State(state): State<ApiState>,
+    Query(query): Query<OfficeReleasesQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<OfficeReleaseRequest>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.office_releases(
+        &principal.id,
+        query.flow_id.as_deref(),
+    )?))
+}
+
+async fn request_office_release(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<RequestOfficeReleaseInput>,
+) -> ApiResult<Json<OfficeReleaseRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.request_office_release(&input.task_id, input.provider, input.payload, actor)
+    })
+    .await
+}
+
+async fn approve_office_release(
+    State(state): State<ApiState>,
+    Path(release_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<OfficeReleaseRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.approve_office_release(&release_id, actor)
+    })
+    .await
+}
+
+async fn reject_office_release(
+    State(state): State<ApiState>,
+    Path(release_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<RejectOfficeReleaseInput>,
+) -> ApiResult<Json<OfficeReleaseRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.reject_office_release(&release_id, &input.reason, actor)
+    })
+    .await
+}
+
+async fn retry_office_release(
+    State(state): State<ApiState>,
+    Path(release_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<OfficeReleaseRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.retry_office_release(&release_id, actor)
+    })
+    .await
+}
+
+async fn dispatch_office_release(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Option<OfficeReleaseRequest>>> {
+    {
+        let app = state.app.lock().await;
+        let principal = authenticate(&app, &headers)?;
+        app.authorize_notification_admin(&principal.id)?;
+    }
+    Ok(Json(
+        dispatch_office_once(&state.app, &state.office_bridge, &state.tenant_id).await?,
+    ))
+}
+
+async fn dispatch_office_once(
+    app: &Arc<Mutex<MambaApp>>,
+    bridge: &OfficeBridge,
+    tenant_id: &str,
+) -> Result<Option<OfficeReleaseRequest>> {
+    let release = {
+        let mut app = app.lock().await;
+        app.claim_office_release()?
+    };
+    let Some(release) = release else {
+        return Ok(None);
+    };
+    let dispatch_id = release
+        .dispatch_id
+        .as_deref()
+        .ok_or_else(|| MambaError::Validation("claimed Office release has no dispatch ID".into()))?
+        .to_string();
+    let artifact = if let Some(artifact_id) = release.payload.artifact_id() {
+        match app
+            .lock()
+            .await
+            .artifact_content(artifact_id, &release.requested_by)
+        {
+            Ok((_, content)) => Some(content),
+            Err(error) => {
+                let outcome = Err((error.to_string(), false));
+                return finish_office_dispatch(app, &release.id, &dispatch_id, outcome)
+                    .await
+                    .map(Some);
+            }
+        }
+    } else {
+        None
+    };
+    let outcome = bridge
+        .dispatch(tenant_id, &release, artifact.as_deref())
+        .await
+        .map_err(|error| (error.message, error.indeterminate));
+    finish_office_dispatch(app, &release.id, &dispatch_id, outcome)
+        .await
+        .map(Some)
+}
+
+async fn finish_office_dispatch(
+    app: &Arc<Mutex<MambaApp>>,
+    release_id: &str,
+    dispatch_id: &str,
+    outcome: std::result::Result<crate::domain::OfficeReleaseResult, (String, bool)>,
+) -> Result<OfficeReleaseRequest> {
+    let mut app = app.lock().await;
+    match app.finish_office_release(release_id, dispatch_id, outcome.clone()) {
+        Err(MambaError::ConcurrentModification { .. }) => {
+            app.finish_office_release(release_id, dispatch_id, outcome)
+        }
+        result => result,
+    }
+}
+
 async fn revoke_flight(
     State(state): State<ApiState>,
     Path(lease_id): Path<String>,
@@ -2431,6 +2739,7 @@ mod tests {
             InteractionWebhookAuth::default(),
             None,
             ScimAuthenticator::new(scim_token).unwrap(),
+            OfficeBridge::disabled(),
         );
         let user_body = json!({
             "schemas": [crate::scim::USER_SCHEMA],
@@ -3233,6 +3542,77 @@ mod tests {
                 .estimate
                 .effort_hours,
             12.0
+        );
+
+        let started = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/tasks/{task_id}/start"),
+                &observer_token.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+        let requested = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/api/v1/office/releases",
+                &observer_token.token,
+                json!({
+                    "task_id": task_id,
+                    "provider": "microsoft365",
+                    "payload": {
+                        "kind": "send_email",
+                        "account_id": "observer@example.com",
+                        "to": ["team@example.com"],
+                        "subject": "Launch update",
+                        "body": "The launch brief is ready for review.",
+                        "body_type": "text"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(requested.status(), StatusCode::OK);
+        let body = to_bytes(requested.into_body(), usize::MAX).await.unwrap();
+        let release: OfficeReleaseRequest = serde_json::from_slice(&body).unwrap();
+        let denied = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/office/releases/{}/approve", release.id),
+                &observer_token.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let approved = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/office/releases/{}/approve", release.id),
+                &issued.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+        let dispatched = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/api/v1/office/releases/dispatch",
+                &issued.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dispatched.status(), StatusCode::OK);
+        let body = to_bytes(dispatched.into_body(), usize::MAX).await.unwrap();
+        let dispatched: Option<OfficeReleaseRequest> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            dispatched.unwrap().status,
+            crate::domain::OfficeReleaseStatus::Failed
         );
 
         let proposed = service

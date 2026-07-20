@@ -24,8 +24,8 @@ use crate::MambaApp;
 use crate::dashboard::{ActionPriority, FlowHealth, build_dashboard};
 use crate::domain::{
     AssignmentTarget, AttentionSeverity, ExecutorMode, FlightLease, FlightLeaseStatus, Flow,
-    FlowMessageKind, FlowStatus, MessageInboxItem, PrincipalKind, RecoveryAction, Task, TaskStatus,
-    TrackingEscalation,
+    FlowMessageKind, FlowStatus, MessageInboxItem, OfficeReleaseStatus, PrincipalKind,
+    RecoveryAction, Task, TaskStatus, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -162,6 +162,7 @@ enum MouseAction {
     RejectChange,
     ScanTracker,
     DispatchNotifications,
+    ApproveOfficeRelease,
     AcknowledgeEscalation,
     RecoverFlight(RecoveryAction),
     CycleActor,
@@ -488,6 +489,7 @@ impl UiState {
             MouseAction::RejectChange => self.open_reject_change_input(app),
             MouseAction::ScanTracker => self.scan_tracker(app, true),
             MouseAction::DispatchNotifications => self.dispatch_notification_now(app),
+            MouseAction::ApproveOfficeRelease => self.approve_next_office_release(app),
             MouseAction::AcknowledgeEscalation => self.acknowledge_next_inbox(app),
             MouseAction::RecoverFlight(action) => self.open_recovery_input(app, action),
             MouseAction::CycleActor => self.cycle_actor(app),
@@ -824,6 +826,34 @@ impl UiState {
                 .and_then(|task_id| app.accept_task(&task_id, &actor))
                 .map(|task| format!("{} 已接球", task.id))
         };
+        self.finish_action(app, result);
+    }
+
+    fn approve_next_office_release(&mut self, app: &mut MambaApp) {
+        let Some(actor) = self.actor_name(app).map(str::to_string) else {
+            self.failure(MambaError::Validation(
+                "没有可用的 Human 操作人".to_string(),
+            ));
+            return;
+        };
+        let principal = app.state().principal(&actor).ok();
+        let release_id = principal.and_then(|principal| {
+            app.state()
+                .office_releases
+                .values()
+                .filter(|release| release.status == OfficeReleaseStatus::Requested)
+                .find(|release| {
+                    app.state().flows.get(&release.flow_id).is_some_and(|flow| {
+                        flow.demand.requester == principal.id
+                            || flow.demand.requester == principal.name
+                    })
+                })
+                .map(|release| release.id.clone())
+        });
+        let result = release_id
+            .ok_or_else(|| MambaError::Validation("当前没有待你放行的 Office 发布".into()))
+            .and_then(|release_id| app.approve_office_release(&release_id, &actor))
+            .map(|release| format!("{} 已由 Human 放行，等待 Tower 发布", release.id));
         self.finish_action(app, result);
     }
 
@@ -2036,31 +2066,85 @@ fn render_action_queue(frame: &mut Frame, app: &MambaApp, area: Rect) {
     let dashboard = build_dashboard(app.state());
     let max_items = usize::from(area.height.saturating_sub(2) / 2).max(1);
     let mut items = dashboard
-        .action_items
+        .office_releases
         .iter()
+        .filter(|release| {
+            matches!(
+                release.status,
+                OfficeReleaseStatus::Requested
+                    | OfficeReleaseStatus::Failed
+                    | OfficeReleaseStatus::Indeterminate
+            )
+        })
         .take(max_items)
-        .map(|action| {
-            let (marker, color) = match action.priority {
-                ActionPriority::Critical => ("!!", RED),
-                ActionPriority::High => ("! ", ORANGE),
-                ActionPriority::Normal => ("· ", CYAN),
+        .map(|release| {
+            let (marker, color, reason) = match release.status {
+                OfficeReleaseStatus::Requested => (
+                    "! ",
+                    GOLD,
+                    format!(
+                        "等待 Human 放行 · SHA {}",
+                        release.payload_sha256.chars().take(12).collect::<String>()
+                    ),
+                ),
+                OfficeReleaseStatus::Failed => (
+                    "!!",
+                    RED,
+                    release
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "Office Bridge 发布失败".into()),
+                ),
+                OfficeReleaseStatus::Indeterminate => {
+                    ("??", ORANGE, "Provider 结果不确定，禁止自动重试".into())
+                }
+                _ => unreachable!(),
             };
             ListItem::new(Text::from(vec![
                 Line::from(vec![
                     Span::styled(format!("{marker} "), Style::new().fg(color).bold()),
                     Span::styled(
-                        compact_summary(&action.task_title, 26),
+                        compact_summary(&release.summary, 26),
                         Style::new().fg(TEXT).bold(),
                     ),
-                    Span::styled(format!("  {}", action.owner), Style::new().fg(MUTED)),
+                    Span::styled(format!("  {}", release.provider), Style::new().fg(MUTED)),
                 ]),
                 Line::styled(
-                    format!("   {}", compact_summary(&action.reason, 42)),
+                    format!("   {}", compact_summary(&reason, 42)),
                     Style::new().fg(color),
                 ),
             ]))
         })
         .collect::<Vec<_>>();
+    let remaining = max_items.saturating_sub(items.len());
+    items.extend(
+        dashboard
+            .action_items
+            .iter()
+            .take(remaining)
+            .map(|action| {
+                let (marker, color) = match action.priority {
+                    ActionPriority::Critical => ("!!", RED),
+                    ActionPriority::High => ("! ", ORANGE),
+                    ActionPriority::Normal => ("· ", CYAN),
+                };
+                ListItem::new(Text::from(vec![
+                    Line::from(vec![
+                        Span::styled(format!("{marker} "), Style::new().fg(color).bold()),
+                        Span::styled(
+                            compact_summary(&action.task_title, 26),
+                            Style::new().fg(TEXT).bold(),
+                        ),
+                        Span::styled(format!("  {}", action.owner), Style::new().fg(MUTED)),
+                    ]),
+                    Line::styled(
+                        format!("   {}", compact_summary(&action.reason, 42)),
+                        Style::new().fg(color),
+                    ),
+                ]))
+            })
+            .collect::<Vec<_>>(),
+    );
     if items.is_empty() {
         items.push(ListItem::new(Line::styled(
             "当前没有需要管理者介入的事项",
@@ -3015,6 +3099,19 @@ fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
         };
         actions.insert(index, ("驳回变更", MouseAction::RejectChange));
     }
+    if state.actor_name(app).is_some_and(|actor| {
+        app.state().principal(actor).is_ok_and(|principal| {
+            app.state().office_releases.values().any(|release| {
+                release.status == OfficeReleaseStatus::Requested
+                    && app.state().flows.get(&release.flow_id).is_some_and(|flow| {
+                        flow.demand.requester == principal.id
+                            || flow.demand.requester == principal.name
+                    })
+            })
+        })
+    }) {
+        actions.insert(0, ("放行发布", MouseAction::ApproveOfficeRelease));
+    }
     frame.render_widget(Block::default().style(Style::new().bg(PANEL)), area);
     let mut x = area.x;
     let mut y = area.y;
@@ -3388,6 +3485,7 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::Block | MouseAction::Quit => RED,
         MouseAction::ScanTracker => ORANGE,
         MouseAction::DispatchNotifications => CYAN,
+        MouseAction::ApproveOfficeRelease => GOLD,
         MouseAction::AcknowledgeEscalation => GOLD,
         MouseAction::RecoverFlight(RecoveryAction::Retry | RecoveryAction::ReduceScope) => ORANGE,
         MouseAction::RecoverFlight(RecoveryAction::HumanHandoff) => GOLD,
@@ -3933,6 +4031,20 @@ mod tests {
         assert!(content.contains("OUTBOX"));
         assert!(content.contains("LLM Gateway v0"));
         assert!(content.contains("BLOCKED"));
+        let release_button = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::ApproveOfficeRelease))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(release_button))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.state().office_releases[&showcase.office_release_id].status,
+            OfficeReleaseStatus::Approved
+        );
 
         let compact_backend = TestBackend::new(80, 24);
         let mut compact_terminal = Terminal::new(compact_backend).unwrap();

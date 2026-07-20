@@ -6,9 +6,10 @@ use crate::domain::{
     ApiCredential, ExecutionRecord, ExternalIdentityBinding, ExternalInteractionReceipt,
     FlightLease, FlightLeaseStatus, FlightRecoveryDecision, Flow, FlowChangeRequest,
     FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, NotificationDelivery,
-    NotificationEndpoint, NotificationStatus, Organization, OrganizationRole, Principal,
-    PrincipalKind, ResourceLease, ResourceLeaseStatus, RoleBinding, TargetKind, TaskStatus, Team,
-    Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
+    NotificationEndpoint, NotificationStatus, OfficeReleaseRequest, OfficeReleaseStatus,
+    Organization, OrganizationRole, Principal, PrincipalKind, ResourceLease, ResourceLeaseStatus,
+    RoleBinding, StagedArtifact, TargetKind, TaskStatus, Team, Tenant, TrackingAttention,
+    TrackingEscalation, WorkCalendar,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -33,6 +34,8 @@ pub struct OrganizationState {
     pub flow_changes: BTreeMap<String, FlowChangeRequest>,
     pub executions: BTreeMap<String, ExecutionRecord>,
     pub flight_leases: BTreeMap<String, FlightLease>,
+    pub staged_artifacts: BTreeMap<String, StagedArtifact>,
+    pub office_releases: BTreeMap<String, OfficeReleaseRequest>,
     pub resource_leases: BTreeMap<String, ResourceLease>,
     pub flight_recoveries: BTreeMap<String, FlightRecoveryDecision>,
     pub attentions: BTreeMap<String, TrackingAttention>,
@@ -904,6 +907,201 @@ impl OrganizationState {
                 lease.run_id = Some(run_id.clone());
                 lease.claimed_at = Some(*claimed_at);
             }
+            DomainEvent::FlightArtifactStaged { artifact } => {
+                let lease = self
+                    .flight_leases
+                    .get(&artifact.flight_lease_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "flight lease",
+                        id: artifact.flight_lease_id.clone(),
+                    })?;
+                if lease.flow_id != artifact.flow_id || lease.task_id != artifact.task_id {
+                    return Err(MambaError::Validation(format!(
+                        "artifact {} does not match flight scope",
+                        artifact.id
+                    )));
+                }
+                if lease.status != FlightLeaseStatus::Active {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "flight {} cannot stage artifacts while {:?}",
+                        lease.id, lease.status
+                    )));
+                }
+                if self.staged_artifacts.values().any(|existing| {
+                    existing.flight_lease_id == artifact.flight_lease_id
+                        && existing.path == artifact.path
+                }) {
+                    return Err(MambaError::Validation(format!(
+                        "flight artifact path already staged: {}",
+                        artifact.path
+                    )));
+                }
+                self.staged_artifacts
+                    .insert(artifact.id.clone(), artifact.clone());
+            }
+            DomainEvent::OfficeReleaseRequested { request } => {
+                self.task_mut(&request.flow_id, &request.task_id)?;
+                if request.status != OfficeReleaseStatus::Requested
+                    || request.payload_sha256.len() != 64
+                    || request.reviewed_by.is_some()
+                    || request.dispatch_id.is_some()
+                    || request.result.is_some()
+                {
+                    return Err(MambaError::Validation(format!(
+                        "Office release {} has invalid initial state",
+                        request.id
+                    )));
+                }
+                if self.office_releases.contains_key(&request.id) {
+                    return Err(MambaError::Validation(format!(
+                        "Office release already exists: {}",
+                        request.id
+                    )));
+                }
+                self.office_releases
+                    .insert(request.id.clone(), request.clone());
+            }
+            DomainEvent::OfficeReleaseApproved {
+                flow_id,
+                task_id,
+                release_id,
+                approved_by,
+                approved_at,
+            } => {
+                let release = self.office_release_mut(release_id, flow_id, task_id)?;
+                if release.status != OfficeReleaseStatus::Requested {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "Office release {release_id} is {:?}, expected requested",
+                        release.status
+                    )));
+                }
+                release.status = OfficeReleaseStatus::Approved;
+                release.reviewed_by = Some(approved_by.clone());
+                release.reviewed_at = Some(*approved_at);
+                release.review_reason = None;
+            }
+            DomainEvent::OfficeReleaseRejected {
+                flow_id,
+                task_id,
+                release_id,
+                rejected_by,
+                reason,
+                rejected_at,
+            } => {
+                let release = self.office_release_mut(release_id, flow_id, task_id)?;
+                if release.status != OfficeReleaseStatus::Requested {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "Office release {release_id} is {:?}, expected requested",
+                        release.status
+                    )));
+                }
+                release.status = OfficeReleaseStatus::Rejected;
+                release.reviewed_by = Some(rejected_by.clone());
+                release.reviewed_at = Some(*rejected_at);
+                release.review_reason = Some(reason.clone());
+            }
+            DomainEvent::OfficeReleaseDispatchClaimed {
+                flow_id,
+                task_id,
+                release_id,
+                dispatch_id,
+                claimed_at,
+            } => {
+                let release = self.office_release_mut(release_id, flow_id, task_id)?;
+                if release.status != OfficeReleaseStatus::Approved {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "Office release {release_id} is {:?}, expected approved",
+                        release.status
+                    )));
+                }
+                release.status = OfficeReleaseStatus::Dispatching;
+                release.dispatch_id = Some(dispatch_id.clone());
+                release.dispatch_started_at = Some(*claimed_at);
+                release.last_error = None;
+            }
+            DomainEvent::OfficeReleaseSucceeded {
+                flow_id,
+                task_id,
+                release_id,
+                dispatch_id,
+                result,
+            } => {
+                let release = self.office_release_mut(release_id, flow_id, task_id)?;
+                ensure_office_dispatch(release, dispatch_id)?;
+                release.status = OfficeReleaseStatus::Released;
+                release.result = Some(result.clone());
+                release.last_error = None;
+            }
+            DomainEvent::OfficeReleaseFailed {
+                flow_id,
+                task_id,
+                release_id,
+                dispatch_id,
+                error,
+                indeterminate,
+                ..
+            } => {
+                let release = self.office_release_mut(release_id, flow_id, task_id)?;
+                ensure_office_dispatch(release, dispatch_id)?;
+                release.status = if *indeterminate {
+                    OfficeReleaseStatus::Indeterminate
+                } else {
+                    OfficeReleaseStatus::Failed
+                };
+                release.last_error = Some(error.clone());
+            }
+            DomainEvent::OfficeReleaseRetryApproved {
+                flow_id,
+                task_id,
+                release_id,
+                approved_by,
+                approved_at,
+            } => {
+                let release = self.office_release_mut(release_id, flow_id, task_id)?;
+                if release.status != OfficeReleaseStatus::Failed {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "Office release {release_id} is {:?}, expected failed",
+                        release.status
+                    )));
+                }
+                release.status = OfficeReleaseStatus::Approved;
+                release.reviewed_by = Some(approved_by.clone());
+                release.reviewed_at = Some(*approved_at);
+                release.dispatch_id = None;
+                release.dispatch_started_at = None;
+                release.last_error = None;
+            }
+            DomainEvent::OfficeReleaseDispatchExpired {
+                flow_id,
+                task_id,
+                release_id,
+                dispatch_id,
+                retry_safe,
+                ..
+            } => {
+                let release = self.office_release_mut(release_id, flow_id, task_id)?;
+                ensure_office_dispatch(release, dispatch_id)?;
+                if release.payload.retry_safe(release.provider) != *retry_safe {
+                    return Err(MambaError::Validation(format!(
+                        "Office release {release_id} recovery safety does not match its payload"
+                    )));
+                }
+                release.status = if *retry_safe {
+                    OfficeReleaseStatus::Approved
+                } else {
+                    OfficeReleaseStatus::Indeterminate
+                };
+                release.last_error = Some(if *retry_safe {
+                    "Tower restarted during dispatch; retrying an idempotent Office operation"
+                        .into()
+                } else {
+                    "Tower restarted during a non-idempotent Office operation; reconcile with the provider before creating another release".into()
+                });
+                if *retry_safe {
+                    release.dispatch_id = None;
+                    release.dispatch_started_at = None;
+                }
+            }
             DomainEvent::RemoteFlightRevoked {
                 flow_id,
                 task_id,
@@ -1113,6 +1311,27 @@ impl OrganizationState {
         Ok(lease)
     }
 
+    fn office_release_mut(
+        &mut self,
+        release_id: &str,
+        flow_id: &str,
+        task_id: &str,
+    ) -> Result<&mut OfficeReleaseRequest> {
+        let release =
+            self.office_releases
+                .get_mut(release_id)
+                .ok_or_else(|| MambaError::NotFound {
+                    entity: "Office release",
+                    id: release_id.to_string(),
+                })?;
+        if release.flow_id != flow_id || release.task_id != task_id {
+            return Err(MambaError::Validation(format!(
+                "Office release {release_id} does not match its task"
+            )));
+        }
+        Ok(release)
+    }
+
     fn escalation_mut(
         &mut self,
         escalation_id: &str,
@@ -1180,6 +1399,18 @@ impl OrganizationState {
         flow.critical_path = revision.critical_path.clone();
         Ok(())
     }
+}
+
+fn ensure_office_dispatch(release: &OfficeReleaseRequest, dispatch_id: &str) -> Result<()> {
+    if release.status != OfficeReleaseStatus::Dispatching
+        || release.dispatch_id.as_deref() != Some(dispatch_id)
+    {
+        return Err(MambaError::InvalidTransition(format!(
+            "Office release {} is not owned by dispatch {dispatch_id}",
+            release.id
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

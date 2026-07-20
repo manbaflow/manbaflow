@@ -38,7 +38,8 @@ export MAMBA_DATABASE_URL='postgresql://mamba@db.internal/manbaflow?sslmode=requ
 mamba --data-dir /var/lib/manbaflow serve --bind 127.0.0.1:7777
 ```
 
-所有副本共享 `mamba_tenants`、`mamba_events`、`mamba_streams` 和 `mamba_api_credentials`。每次提交在事务
+所有副本共享 `mamba_tenants`、`mamba_events`、`mamba_streams`、`mamba_api_credentials` 和
+`mamba_artifacts`。每次提交在事务
 内对 Tenant 的 `mamba_streams` 行执行 `FOR UPDATE`，校验预期 sequence 后才追加事件；每个 API 请求先
 刷新事件投影。`--data-dir` 仍需可写空间存放本副本运行产物，但不能在多个副本之间当作状态源。
 
@@ -84,6 +85,18 @@ mamba --data-dir /var/lib/manbaflow principal token issue \
 Human、分配 Team 和 `member` 角色，并在离职时停用账号；OIDC 不会因为看到一个新 `sub` 就自动创建
 组织成员。完整配置和 IdP 字段映射见 [企业身份接入](IDENTITY.md)。
 
+Office Bridge 的 OAuth Access Token 同样只从 Secret 注入。多 Tenant 部署使用 Tenant ID 到 Token 的 JSON
+映射，单 Token 回退只用于单 Tenant：
+
+```bash
+export MAMBA_MICROSOFT_GRAPH_TOKENS_JSON='{"TEN-aaaaaaaa":"graph-access-token"}'
+export MAMBA_GOOGLE_WORKSPACE_TOKENS_JSON='{"TEN-aaaaaaaa":"workspace-access-token"}'
+```
+
+Token 获取和刷新由企业 Credential Broker 负责；更新环境 Secret 后滚动重启 Control Plane。不要把
+Refresh Token 或 Client Secret 放进 Release Request。完整 Scope、动作和故障恢复矩阵见
+[Office Human Release Gate](OFFICE.md)。
+
 ## 4. 健康检查与指标
 
 负载均衡器使用：
@@ -123,8 +136,9 @@ export MAMBA_TARGET_DATABASE_URL='postgresql://mamba@db.internal/manbaflow?sslmo
 mamba --data-dir /var/lib/manbaflow ops migrate-postgres
 ```
 
-迁移保留事件 ID、sequence、发生时间、Credential 摘要、到期和撤销状态。第二次运行必须报告全部 Tenant
-为“幂等复核”；如果目标已有不同计数或 Catalog 定义，命令会拒绝覆盖。
+迁移保留事件 ID、sequence、发生时间、Credential 摘要、到期和撤销状态，以及按摘要寻址的 Office
+Artifact 内容。第二次运行必须报告全部 Tenant 为“幂等复核”；如果目标已有不同计数或 Catalog 定义，
+命令会拒绝覆盖。
 
 ## 6. 恢复演练
 
@@ -139,15 +153,15 @@ mamba --data-dir /var/lib/manbaflow ops migrate-postgres
    规划航班。
 8. 切换 TLS 入口，再恢复远程 Worker。
 
-快照包含 Token 摘要、角色、组织事件和 Connector 元数据，因此按生产数据库同等级保护。原始 Connector
-Secret 不在数据库内，灾备环境必须从 Secret Manager 单独恢复。
+快照包含 Token 摘要、角色、组织事件、Office Artifact 和 Connector 元数据，因此按生产数据库同等级
+保护。原始 Connector Secret 不在数据库内，灾备环境必须从 Secret Manager 单独恢复。
 
 ## 7. 当前限制
 
 - SQLite 模式仍只支持单个写进程；PostgreSQL 模式支持多个 Control Plane 副本；
 - 没有集中策略引擎和分布式限流；
 - Remote Worker 使用 Git worktree 隔离，不是容器或虚拟机安全边界；
-- Office Pack 只生成待 Human 发布的本地草稿，不直接写 Microsoft 365 或 Google Workspace；
+- Office Bridge 不负责 OAuth Token 获取和刷新；企业必须提供 Credential Broker 和最小 Scope；
 - GitLab 连接器不创建、评论、合并 MR。
 
 这些限制需要在上线评审中显式接受。涉及敏感源码、个人数据、受监管数据或不可信 Agent 时，继续使用

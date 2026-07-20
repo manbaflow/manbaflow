@@ -74,7 +74,7 @@ async function loadDashboard(showMessage = true) {
 function renderDashboard(dashboard) {
   $("#generated-at").textContent = formatDate(dashboard.generated_at);
   renderMetrics(dashboard.metrics);
-  renderActions(dashboard.action_items);
+  renderActions(dashboard.action_items, dashboard.office_releases || []);
   renderFlows(dashboard.flows);
   renderFlights(dashboard.flights);
 }
@@ -96,8 +96,9 @@ function renderMetrics(metrics) {
   }));
 }
 
-function renderActions(actions) {
-  $("#action-count").textContent = `${actions.length} 项`;
+function renderActions(actions, releases) {
+  const releaseActions = releases.filter((release) => ["requested", "failed", "indeterminate"].includes(release.status));
+  $("#action-count").textContent = `${actions.length + releaseActions.length} 项`;
   const rows = actions.map((action) => {
     const row = document.createElement("tr");
     row.append(
@@ -115,7 +116,50 @@ function renderActions(actions) {
     row.append(command);
     return row;
   });
+  rows.push(...releaseActions.map((release) => {
+    const row = document.createElement("tr");
+    const reason = release.status === "requested"
+      ? `等待 Human 放行 · SHA ${release.payload_sha256.slice(0, 12)}`
+      : (release.last_error || "需要人工核对 Provider 结果");
+    row.append(
+      cellBadge(release.status === "requested" ? "high" : "critical"),
+      taskCell(release.summary, release.id),
+      textCell(release.requested_by),
+      textCell(reason),
+      textCell(shortDate(release.requested_at)),
+    );
+    const command = document.createElement("td");
+    if (release.status === "requested") {
+      command.append(
+        button("放行", () => mutateRelease(release.id, "approve"), "primary"),
+        button("驳回", () => rejectRelease(release.id), "danger"),
+      );
+    } else if (release.status === "failed") {
+      command.append(button("再次放行", () => mutateRelease(release.id, "retry")));
+    }
+    row.append(command);
+    return row;
+  }));
   replaceRows("#action-rows", rows, "当前没有需要 Human 处置的任务", 6);
+}
+
+async function mutateRelease(releaseId, action, body) {
+  try {
+    setStatus(`正在处理 Office Release ${releaseId}...`);
+    await api(`/office/releases/${releaseId}/${action}`, {
+      method: "POST",
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    await loadDashboard(false);
+    setStatus(`Office Release ${releaseId} 已写入 Flow Ledger`);
+  } catch (error) {
+    setStatus(error.message, true);
+  }
+}
+
+function rejectRelease(releaseId) {
+  const reason = window.prompt("驳回原因");
+  if (reason && reason.trim()) mutateRelease(releaseId, "reject", { reason: reason.trim() });
 }
 
 function renderFlows(flows) {

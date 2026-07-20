@@ -15,6 +15,7 @@ pub struct PostgresMigrationReport {
     pub replayed_tenants: usize,
     pub events: usize,
     pub credentials: usize,
+    pub artifacts: usize,
 }
 
 pub fn sqlite_fleet_to_postgres(
@@ -34,6 +35,7 @@ pub fn sqlite_fleet_to_postgres(
         replayed_tenants: 0,
         events: 0,
         credentials: 0,
+        artifacts: 0,
     };
 
     for record in source_tenants {
@@ -49,6 +51,7 @@ pub fn sqlite_fleet_to_postgres(
             )));
         }
         let credentials = source_store.export_credentials()?;
+        let artifacts = source_store.export_artifacts()?;
         if let Some(existing) = target_catalog.find(&record.id)? {
             if existing.slug != record.slug
                 || existing.name != record.name
@@ -68,7 +71,7 @@ pub fn sqlite_fleet_to_postgres(
 
         let runtime_dir = postgres_runtime_dir(data_dir, &record.slug);
         let mut target = PostgresEventStore::connect(database_url, &record.id)?;
-        if target.import_sqlite_snapshot(&events, &credentials)? {
+        if target.import_sqlite_snapshot(&events, &credentials, &artifacts)? {
             report.migrated_tenants += 1;
         } else {
             report.replayed_tenants += 1;
@@ -76,6 +79,7 @@ pub fn sqlite_fleet_to_postgres(
         std::fs::create_dir_all(runtime_dir)?;
         report.events += events.len();
         report.credentials += credentials.len();
+        report.artifacts += artifacts.len();
     }
     Ok(report)
 }

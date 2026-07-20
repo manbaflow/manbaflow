@@ -6,8 +6,8 @@ use serde::Serialize;
 use crate::MambaApp;
 use crate::domain::{
     CapabilityPack, ExecutorConfig, ExecutorKind, ExternalInteractionAction, FailureClass,
-    FlightManifestDraft, Flow, FlowMessageKind, PrincipalKind, RemoteFlightReport, TargetKind,
-    Task, TaskStatus,
+    FlightManifestDraft, Flow, FlowMessageKind, OfficeBodyType, OfficeProvider,
+    OfficeReleasePayload, PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::planner::PlannerKind;
@@ -20,6 +20,7 @@ pub struct ShowcaseSummary {
     pub waiting_review_task_id: String,
     pub completed_flow_id: String,
     pub command_message_id: Option<String>,
+    pub office_release_id: String,
     pub flows: Vec<Flow>,
 }
 
@@ -250,6 +251,20 @@ pub async fn seed_showcase(
         "发布说明、迁移指南和 FAQ 草案已经完成",
     )?;
     app.submit_task(&deliver.id, &deliver_actor)?;
+    let office_release = app.request_office_release(
+        &deliver.id,
+        OfficeProvider::Microsoft365,
+        OfficeReleasePayload::SendEmail {
+            account_id: "release-owner@mamba.example".into(),
+            to: vec!["customers@mamba.example".into()],
+            cc: vec!["support@mamba.example".into()],
+            bcc: Vec::new(),
+            subject: "Q3 客户发布说明".into(),
+            body: "发布说明、迁移指南和 FAQ 已完成 Human Review，详见发布包。".into(),
+            body_type: OfficeBodyType::Text,
+        },
+        &deliver_actor,
+    )?;
 
     let completed = app
         .create_demand(
@@ -273,6 +288,7 @@ pub async fn seed_showcase(
         waiting_review_task_id: deliver.id,
         completed_flow_id: completed.id.clone(),
         command_message_id,
+        office_release_id: office_release.id,
         flows: [gateway.id, review.id, completed.id]
             .iter()
             .map(|id| app.state().flow(id).cloned())
@@ -433,7 +449,9 @@ mod tests {
         assert_eq!(showcase.flows.len(), 3);
         assert_eq!(dashboard.metrics.total_flows, 3);
         assert_eq!(dashboard.metrics.blocked_tasks, 1);
-        assert_eq!(dashboard.metrics.awaiting_human, 1);
+        assert_eq!(dashboard.metrics.awaiting_human, 2);
+        assert_eq!(dashboard.metrics.pending_office_releases, 1);
+        assert_eq!(dashboard.office_releases.len(), 1);
         assert_eq!(dashboard.metrics.open_flights, 1);
         assert_eq!(app.state().external_interactions.len(), 1);
         assert_eq!(

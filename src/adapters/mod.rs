@@ -5,6 +5,7 @@ pub mod identity;
 pub mod interaction;
 pub mod migration;
 pub mod notification;
+pub mod office;
 mod postgres_store;
 pub mod store;
 pub mod tenant;

@@ -9,9 +9,9 @@ use serde::Serialize;
 
 use crate::error::{MambaError, Result};
 use crate::event::{CURRENT_EVENT_VERSION, EventEnvelope};
-use crate::store::{CredentialSnapshot, StorageHealth, decode_event_payload};
+use crate::store::{ArtifactBlob, CredentialSnapshot, StorageHealth, decode_event_payload};
 
-const POSTGRES_SCHEMA_VERSION: i64 = 1;
+const POSTGRES_SCHEMA_VERSION: i64 = 2;
 
 type DatabaseOperation = Box<dyn FnOnce(&mut Client) + Send + 'static>;
 
@@ -131,7 +131,16 @@ impl PostgresEventStore {
                      PRIMARY KEY (tenant_id, id)
                  );
                  CREATE INDEX IF NOT EXISTS idx_mamba_credentials_principal
-                     ON mamba_api_credentials(tenant_id, principal_id, revoked_at);",
+                     ON mamba_api_credentials(tenant_id, principal_id, revoked_at);
+                 CREATE TABLE IF NOT EXISTS mamba_artifacts (
+                     tenant_id  TEXT NOT NULL,
+                     sha256     TEXT NOT NULL,
+                     media_type TEXT NOT NULL,
+                     size_bytes BIGINT NOT NULL,
+                     content    BYTEA NOT NULL,
+                     created_at TEXT NOT NULL,
+                     PRIMARY KEY (tenant_id, sha256)
+                 );",
             )?;
             client.execute(
                 "INSERT INTO mamba_metadata(key, value) VALUES ('schema_version', $1)
@@ -144,7 +153,12 @@ impl PostgresEventStore {
                     &[],
                 )?
                 .get::<_, i64>(0);
-            if schema_version != POSTGRES_SCHEMA_VERSION {
+            if schema_version == 1 {
+                client.execute(
+                    "UPDATE mamba_metadata SET value = $1 WHERE key = 'schema_version'",
+                    &[&POSTGRES_SCHEMA_VERSION.to_string()],
+                )?;
+            } else if schema_version != POSTGRES_SCHEMA_VERSION {
                 return Err(MambaError::Validation(format!(
                     "unsupported PostgreSQL schema version {schema_version}; this binary requires {POSTGRES_SCHEMA_VERSION}"
                 )));
@@ -174,10 +188,12 @@ impl PostgresEventStore {
         &mut self,
         events: &[EventEnvelope],
         credentials: &[CredentialSnapshot],
+        artifacts: &[ArtifactBlob],
     ) -> Result<bool> {
         let tenant_id = self.tenant_id.clone();
         let events = events.to_vec();
         let credentials = credentials.to_vec();
+        let artifacts = artifacts.to_vec();
         self.database.call(move |client| {
             let mut transaction = client.transaction()?;
             let current_sequence = transaction
@@ -193,7 +209,13 @@ impl PostgresEventStore {
                     &[&tenant_id],
                 )?
                 .get::<_, i64>(0);
-            if current_sequence != 0 || credential_count != 0 {
+            let artifact_count = transaction
+                .query_one(
+                    "SELECT COUNT(*) FROM mamba_artifacts WHERE tenant_id = $1",
+                    &[&tenant_id],
+                )?
+                .get::<_, i64>(0);
+            if current_sequence != 0 || credential_count != 0 || artifact_count != 0 {
                 let expected_sequence = events.last().map_or(0, |event| event.sequence);
                 let actual_events = transaction
                     .query_one(
@@ -213,9 +235,36 @@ impl PostgresEventStore {
                 let expected_credentials = i64::try_from(credentials.len()).map_err(|_| {
                     MambaError::Validation("SQLite credential set is too large to migrate".into())
                 })?;
+                let actual_artifacts = transaction
+                    .query_one(
+                        "SELECT COUNT(*) FROM mamba_artifacts WHERE tenant_id = $1",
+                        &[&tenant_id],
+                    )?
+                    .get::<_, i64>(0);
+                let expected_artifacts = i64::try_from(artifacts.len()).map_err(|_| {
+                    MambaError::Validation("SQLite artifact set is too large to migrate".into())
+                })?;
+                let stored_artifacts = transaction
+                    .query(
+                        "SELECT sha256, media_type, size_bytes, content, created_at
+                         FROM mamba_artifacts WHERE tenant_id = $1
+                         ORDER BY created_at, sha256",
+                        &[&tenant_id],
+                    )?
+                    .into_iter()
+                    .map(|row| ArtifactBlob {
+                        sha256: row.get(0),
+                        media_type: row.get(1),
+                        size_bytes: row.get(2),
+                        content: row.get(3),
+                        created_at: row.get(4),
+                    })
+                    .collect::<Vec<_>>();
                 if current_sequence == expected_sequence
                     && actual_events == expected_events
                     && actual_credentials == expected_credentials
+                    && actual_artifacts == expected_artifacts
+                    && stored_artifacts == artifacts
                 {
                     transaction.commit()?;
                     return Ok(false);
@@ -261,6 +310,21 @@ impl PostgresEventStore {
                         &credential.created_at,
                         &credential.expires_at,
                         &credential.revoked_at,
+                    ],
+                )?;
+            }
+            for artifact in &artifacts {
+                transaction.execute(
+                    "INSERT INTO mamba_artifacts(
+                        tenant_id, sha256, media_type, size_bytes, content, created_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6)",
+                    &[
+                        &tenant_id,
+                        &artifact.sha256,
+                        &artifact.media_type,
+                        &artifact.size_bytes,
+                        &artifact.content,
+                        &artifact.created_at,
                     ],
                 )?;
             }
@@ -484,6 +548,67 @@ impl PostgresEventStore {
                 &[&tenant_id, &id],
             )?;
             Ok(())
+        })
+    }
+
+    pub(crate) fn put_artifact(&mut self, artifact: &ArtifactBlob) -> Result<()> {
+        let tenant_id = self.tenant_id.clone();
+        let artifact = artifact.clone();
+        self.database.call(move |client| {
+            let inserted = client.execute(
+                "INSERT INTO mamba_artifacts(
+                    tenant_id, sha256, media_type, size_bytes, content, created_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT(tenant_id, sha256) DO NOTHING",
+                &[
+                    &tenant_id,
+                    &artifact.sha256,
+                    &artifact.media_type,
+                    &artifact.size_bytes,
+                    &artifact.content,
+                    &artifact.created_at,
+                ],
+            )?;
+            if inserted == 0 {
+                let existing = client.query_opt(
+                    "SELECT media_type, size_bytes, content FROM mamba_artifacts
+                     WHERE tenant_id = $1 AND sha256 = $2",
+                    &[&tenant_id, &artifact.sha256],
+                )?;
+                let Some(existing) = existing else {
+                    return Err(MambaError::Validation(
+                        "artifact disappeared after a hash conflict".into(),
+                    ));
+                };
+                if existing.get::<_, String>(0) != artifact.media_type
+                    || existing.get::<_, i64>(1) != artifact.size_bytes
+                    || existing.get::<_, Vec<u8>>(2) != artifact.content
+                {
+                    return Err(MambaError::Validation(
+                        "artifact hash already exists with different content or metadata".into(),
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn load_artifact(&self, sha256: &str) -> Result<Option<ArtifactBlob>> {
+        let tenant_id = self.tenant_id.clone();
+        let sha256 = sha256.to_string();
+        self.database.call(move |client| {
+            let row = client.query_opt(
+                "SELECT sha256, media_type, size_bytes, content, created_at
+                 FROM mamba_artifacts WHERE tenant_id = $1 AND sha256 = $2",
+                &[&tenant_id, &sha256],
+            )?;
+            Ok(row.map(|row| ArtifactBlob {
+                sha256: row.get(0),
+                media_type: row.get(1),
+                size_bytes: row.get(2),
+                content: row.get(3),
+                created_at: row.get(4),
+            }))
         })
     }
 
