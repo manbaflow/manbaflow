@@ -154,6 +154,7 @@ async fn postgres_replicas_share_tenant_events_and_credentials() {
                 budget_exhaustions: Vec::new(),
                 deliverables: Vec::new(),
                 contract_violations: Vec::new(),
+                sandbox: None,
             },
         )
         .unwrap();

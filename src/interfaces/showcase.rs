@@ -223,6 +223,7 @@ pub async fn seed_showcase(
             budget_exhaustions: Vec::new(),
             deliverables: Vec::new(),
             contract_violations: Vec::new(),
+            sandbox: None,
         },
     )?;
     let command_message_id = if app.state().principal("佐巴扬").is_ok() {

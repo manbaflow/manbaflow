@@ -10,12 +10,13 @@ use uuid::Uuid;
 
 use crate::capability::CapabilityAdapter;
 use crate::domain::{
-    CapabilityPack, Evidence, ExecutorKind, ExecutorMode, FailureClass, FlightLease,
-    FlightLeaseStatus, FlowMessage, FuelUsage, MessageInboxItem, Principal, RemoteFlightReport,
-    Task, TaskStatus,
+    CapabilityPack, Evidence, ExecutionSandboxReport, ExecutorKind, ExecutorMode, FailureClass,
+    FlightLease, FlightLeaseStatus, FlowMessage, FuelUsage, MessageInboxItem, Principal,
+    RemoteFlightReport, Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
+use crate::sandbox::{DockerSandboxConfig, ResolvedDockerSandbox, SandboxBackend};
 use crate::worktree::{IsolatedWorktree, WorktreeArtifact, sha256_file};
 
 #[derive(Clone)]
@@ -30,6 +31,8 @@ pub struct WorkerOptions {
     pub task_id: Option<String>,
     pub timeout_seconds: u64,
     pub data_dir: PathBuf,
+    pub sandbox: SandboxBackend,
+    pub docker: Option<DockerSandboxConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -75,10 +78,16 @@ struct InboxItem {
 pub struct RemoteWorker {
     options: WorkerOptions,
     control_plane: ControlPlaneClient,
+    sandbox: WorkerSandbox,
+}
+
+enum WorkerSandbox {
+    Process,
+    Docker(ResolvedDockerSandbox),
 }
 
 impl RemoteWorker {
-    pub fn new(options: WorkerOptions) -> Result<Self> {
+    pub fn new(mut options: WorkerOptions) -> Result<Self> {
         if options.token.trim().is_empty() {
             return Err(MambaError::Validation(
                 "MAMBA_TOKEN is required for a remote worker".into(),
@@ -93,10 +102,32 @@ impl RemoteWorker {
             ));
         }
         fs::create_dir_all(options.data_dir.join("worker-runs"))?;
+        let sandbox = match options.sandbox {
+            SandboxBackend::Process => {
+                if options.docker.is_some() {
+                    return Err(MambaError::Validation(
+                        "Docker sandbox configuration requires --sandbox docker".into(),
+                    ));
+                }
+                WorkerSandbox::Process
+            }
+            SandboxBackend::Docker => WorkerSandbox::Docker(
+                options
+                    .docker
+                    .take()
+                    .ok_or_else(|| {
+                        MambaError::Validation(
+                            "Docker sandbox backend requires Docker configuration".into(),
+                        )
+                    })?
+                    .resolve()?,
+            ),
+        };
         let control_plane = ControlPlaneClient::new(&options.server_url, &options.token)?;
         Ok(Self {
             options,
             control_plane,
+            sandbox,
         })
     }
 
@@ -159,18 +190,22 @@ impl RemoteWorker {
             )
             .await?;
         let prompt = worker_prompt(&principal, item, &task, &instructions);
-        let result = TerminalExecutor::run(ExecutionRequest {
-            kind: self.options.executor.clone(),
-            command: self.options.command.clone(),
-            workspace: self.options.workspace.clone(),
-            model: self.options.model.clone(),
-            mode: ExecutorMode::Plan,
-            prompt,
-            output_schema: None,
-            timeout_seconds: self.options.timeout_seconds,
-            log_path: log_path.clone(),
-        })
-        .await;
+        let result = self
+            .run_executor(
+                ExecutionRequest {
+                    kind: self.options.executor.clone(),
+                    command: self.options.command.clone(),
+                    workspace: self.options.workspace.clone(),
+                    model: self.options.model.clone(),
+                    mode: ExecutorMode::Plan,
+                    prompt,
+                    output_schema: None,
+                    timeout_seconds: self.options.timeout_seconds,
+                    log_path: log_path.clone(),
+                },
+                &format!("mamba-{run_id}"),
+            )
+            .await;
 
         match result {
             Ok(output) => {
@@ -325,18 +360,22 @@ impl RemoteWorker {
             };
             match worktree {
                 Ok(mut worktree) => {
-                    let execution = TerminalExecutor::run(ExecutionRequest {
-                        kind: self.options.executor.clone(),
-                        command: self.options.command.clone(),
-                        workspace: worktree.workspace().to_path_buf(),
-                        model: self.options.model.clone(),
-                        mode: ExecutorMode::Execute,
-                        prompt,
-                        output_schema: None,
-                        timeout_seconds: self.options.timeout_seconds,
-                        log_path: log_path.clone(),
-                    })
-                    .await;
+                    let execution = self
+                        .run_executor(
+                            ExecutionRequest {
+                                kind: self.options.executor.clone(),
+                                command: self.options.command.clone(),
+                                workspace: worktree.workspace().to_path_buf(),
+                                model: self.options.model.clone(),
+                                mode: ExecutorMode::Execute,
+                                prompt,
+                                output_schema: None,
+                                timeout_seconds: self.options.timeout_seconds,
+                                log_path: log_path.clone(),
+                            },
+                            &format!("mamba-{run_id}"),
+                        )
+                        .await;
                     let collected = worktree.collect(&patch_path).and_then(|artifact| {
                         let files = if pack == CapabilityPack::Office {
                             collect_staged_files(worktree.workspace(), &artifact.changed_files)?
@@ -466,6 +505,7 @@ impl RemoteWorker {
             budget_exhaustions: Vec::new(),
             deliverables: Vec::new(),
             contract_violations: Vec::new(),
+            sandbox: Some(self.sandbox_report()),
         };
         fs::write(
             &pending_path,
@@ -490,6 +530,37 @@ impl RemoteWorker {
             summary,
             log_path: Some(log_path),
         })
+    }
+
+    async fn run_executor(
+        &self,
+        request: ExecutionRequest,
+        container_name: &str,
+    ) -> Result<crate::executor::ExecutionOutput> {
+        match &self.sandbox {
+            WorkerSandbox::Process => TerminalExecutor::run(request).await,
+            WorkerSandbox::Docker(sandbox) => {
+                TerminalExecutor::run_in_docker(request, sandbox, container_name).await
+            }
+        }
+    }
+
+    fn sandbox_report(&self) -> ExecutionSandboxReport {
+        match &self.sandbox {
+            WorkerSandbox::Process => ExecutionSandboxReport {
+                backend: "process".into(),
+                image: None,
+                image_id: None,
+                network: "host".into(),
+                root_read_only: false,
+                user: None,
+                cpus_millis: None,
+                memory_bytes: None,
+                pids_limit: None,
+                forwarded_environment: Vec::new(),
+            },
+            WorkerSandbox::Docker(sandbox) => sandbox.report(),
+        }
     }
 }
 
@@ -1094,6 +1165,8 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
             task_id: None,
             timeout_seconds: 10,
             data_dir: directory.path().join("data"),
+            sandbox: SandboxBackend::Process,
+            docker: None,
         })
         .unwrap();
         let outcome = worker.run_once().await.unwrap();
@@ -1249,6 +1322,8 @@ printf '%s\n' '{"thread_id":"execute-thread"}'
             task_id: None,
             timeout_seconds: 10,
             data_dir: data_dir.clone(),
+            sandbox: SandboxBackend::Process,
+            docker: None,
         })
         .unwrap();
         let outcome = worker.run_once().await.unwrap();
@@ -1275,6 +1350,7 @@ printf '%s\n' '{"thread_id":"execute-thread"}'
         assert_eq!(report.changed_files, ["generated.txt"]);
         assert!(report.patch_sha256.is_some());
         assert_eq!(report.log_sha256.len(), 64);
+        assert_eq!(report.sandbox.as_ref().unwrap().backend, "process");
         assert_eq!(
             fs::read_dir(data_dir.join("worker-worktrees"))
                 .unwrap()

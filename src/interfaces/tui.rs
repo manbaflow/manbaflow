@@ -3022,6 +3022,20 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
                 .or_else(|| report.contract_violations.first().cloned())
                 .or_else(|| report.failure_class.map(|class| format!("{class:?}")))
         });
+        let sandbox = lease
+            .report
+            .as_ref()
+            .and_then(|report| report.sandbox.as_ref())
+            .map(|sandbox| {
+                let image = sandbox
+                    .image_id
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("sha256:"))
+                    .map(|value| value.chars().take(12).collect::<String>())
+                    .unwrap_or_else(|| "host".into());
+                format!("BOX {} · {} · {image}", sandbox.backend, sandbox.network)
+            })
+            .unwrap_or_else(|| "BOX legacy".into());
         ListItem::new(Text::from(vec![
             Line::from(vec![
                 Span::styled(format!("{marker} {label} "), Style::new().fg(color).bold()),
@@ -3044,7 +3058,7 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
                 Span::styled(format!("  {}  ", lease.task_id), Style::new().fg(TEXT)),
                 Span::styled(lease.principal_name.clone(), Style::new().fg(MUTED)),
             ]),
-            Line::styled(format!("  {fuel}"), Style::new().fg(MUTED)),
+            Line::styled(format!("  {fuel} · {sandbox}"), Style::new().fg(MUTED)),
             Line::from(vec![
                 Span::styled(
                     format!("  LEASE {active_resources}/{resources} · {}", lease.id),

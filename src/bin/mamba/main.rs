@@ -14,6 +14,7 @@ use manbaflow::domain::{
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::ids::new_id;
 use manbaflow::planner::PlannerKind;
+use manbaflow::sandbox::{DockerSandboxConfig, SandboxBackend, SandboxNetwork};
 use manbaflow::showcase::seed_showcase;
 use manbaflow::tenant::{TenantCatalog, TenantRecord, database_url_from_env, validate_slug};
 use manbaflow::worker::{RemoteWorker, WorkerOptions, WorkerOutcome, WorkerOutcomeStatus};
@@ -493,6 +494,30 @@ struct WorkerArgs {
     task: Option<String>,
     #[arg(long, default_value_t = 900)]
     timeout: u64,
+    /// 执行进程隔离后端；生产 Remote Worker 应使用 docker
+    #[arg(long, value_enum, default_value = "docker")]
+    sandbox: SandboxBackendArg,
+    #[arg(long, default_value = "docker")]
+    sandbox_runtime: PathBuf,
+    #[arg(long, default_value = "manbaflow-agent-runtime:0.1.0")]
+    sandbox_image: String,
+    /// none 禁止联网；云端模型需要显式选择 bridge 并由出口策略约束
+    #[arg(long, value_enum, default_value = "none")]
+    sandbox_network: SandboxNetworkArg,
+    #[arg(long, default_value_t = 2_000)]
+    sandbox_cpus_millis: u32,
+    #[arg(long, default_value_t = 4_096)]
+    sandbox_memory_mb: u64,
+    #[arg(long, default_value_t = 256)]
+    sandbox_pids: u32,
+    #[arg(long, default_value_t = 512)]
+    sandbox_tmpfs_mb: u64,
+    /// 容器内非 root UID:GID；默认沿用 Worker 宿主用户
+    #[arg(long)]
+    sandbox_user: Option<String>,
+    /// 仅按变量名转发；可重复，例如 --sandbox-env OPENAI_API_KEY
+    #[arg(long = "sandbox-env")]
+    sandbox_environment: Vec<String>,
 }
 
 #[derive(Args)]
@@ -856,6 +881,18 @@ enum PlannerKindArg {
 enum ExecutorModeArg {
     Plan,
     Execute,
+}
+
+#[derive(Clone, ValueEnum)]
+enum SandboxBackendArg {
+    Process,
+    Docker,
+}
+
+#[derive(Clone, ValueEnum)]
+enum SandboxNetworkArg {
+    None,
+    Bridge,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -2517,8 +2554,13 @@ fn dashboard_text(dashboard: &DashboardSnapshot) -> String {
         lines.push("\nFLIGHT DECK".into());
         lines.extend(dashboard.flights.iter().take(5).map(|flight| {
             format!(
-                "{}\t{}\t{}\t{}\t{}",
-                flight.status, flight.executor, flight.principal, flight.task_id, flight.id
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                flight.status,
+                flight.executor,
+                flight.sandbox_backend.as_deref().unwrap_or("legacy"),
+                flight.principal,
+                flight.task_id,
+                flight.id
             )
         }));
     }
@@ -2533,6 +2575,18 @@ fn remote_worker(args: WorkerArgs, data_dir: &Path) -> Result<RemoteWorker> {
         .server
         .or_else(|| std::env::var("MAMBA_SERVER").ok())
         .unwrap_or_else(|| "http://127.0.0.1:7777".into());
+    let sandbox: SandboxBackend = args.sandbox.into();
+    let docker = (sandbox == SandboxBackend::Docker).then(|| DockerSandboxConfig {
+        runtime: args.sandbox_runtime,
+        image: args.sandbox_image,
+        network: args.sandbox_network.into(),
+        cpus_millis: args.sandbox_cpus_millis,
+        memory_mb: args.sandbox_memory_mb,
+        pids_limit: args.sandbox_pids,
+        tmpfs_mb: args.sandbox_tmpfs_mb,
+        user: args.sandbox_user,
+        environment: args.sandbox_environment,
+    });
     RemoteWorker::new(WorkerOptions {
         server_url,
         token,
@@ -2544,6 +2598,8 @@ fn remote_worker(args: WorkerArgs, data_dir: &Path) -> Result<RemoteWorker> {
         task_id: args.task,
         timeout_seconds: args.timeout,
         data_dir: data_dir.to_path_buf(),
+        sandbox,
+        docker,
     })
 }
 
@@ -2681,6 +2737,24 @@ impl From<ExecutorModeArg> for ExecutorMode {
         match value {
             ExecutorModeArg::Plan => Self::Plan,
             ExecutorModeArg::Execute => Self::Execute,
+        }
+    }
+}
+
+impl From<SandboxBackendArg> for SandboxBackend {
+    fn from(value: SandboxBackendArg) -> Self {
+        match value {
+            SandboxBackendArg::Process => Self::Process,
+            SandboxBackendArg::Docker => Self::Docker,
+        }
+    }
+}
+
+impl From<SandboxNetworkArg> for SandboxNetwork {
+    fn from(value: SandboxNetworkArg) -> Self {
+        match value {
+            SandboxNetworkArg::None => Self::None,
+            SandboxNetworkArg::Bridge => Self::Bridge,
         }
     }
 }

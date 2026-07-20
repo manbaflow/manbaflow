@@ -8,6 +8,7 @@ pub mod migration;
 pub mod notification;
 pub mod office;
 mod postgres_store;
+pub mod sandbox;
 pub mod store;
 pub mod tenant;
 pub mod worktree;

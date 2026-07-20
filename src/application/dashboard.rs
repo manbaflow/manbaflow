@@ -112,6 +112,9 @@ pub struct DashboardFlight {
     pub deliverable_count: usize,
     pub requires_human_release: bool,
     pub contract_violations: Vec<String>,
+    pub sandbox_backend: Option<String>,
+    pub sandbox_image_id: Option<String>,
+    pub sandbox_network: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,6 +375,21 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
                     .as_ref()
                     .map(|report| report.contract_violations.clone())
                     .unwrap_or_default(),
+                sandbox_backend: lease
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.sandbox.as_ref())
+                    .map(|sandbox| sandbox.backend.clone()),
+                sandbox_image_id: lease
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.sandbox.as_ref())
+                    .and_then(|sandbox| sandbox.image_id.clone()),
+                sandbox_network: lease
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.sandbox.as_ref())
+                    .map(|sandbox| sandbox.network.clone()),
             }
         })
         .chain(state.executions.values().map(|record| {
@@ -402,6 +420,9 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
                 deliverable_count: 0,
                 requires_human_release: false,
                 contract_violations: Vec::new(),
+                sandbox_backend: Some("process".into()),
+                sandbox_image_id: None,
+                sandbox_network: Some("host".into()),
             }
         }))
         .collect::<Vec<_>>();

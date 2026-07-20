@@ -41,3 +41,14 @@ jobs:
         run: cargo test --all-targets --locked
       - name: Release build
         run: cargo build --release --locked
+
+  agent-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Remote Worker runtime
+        run: >-
+          docker build
+          --file docker/agent-runtime/Dockerfile
+          --tag manbaflow-agent-runtime:ci
+          .

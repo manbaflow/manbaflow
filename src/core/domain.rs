@@ -1307,6 +1307,21 @@ impl FlightLeaseStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionSandboxReport {
+    pub backend: String,
+    pub image: Option<String>,
+    pub image_id: Option<String>,
+    pub network: String,
+    pub root_read_only: bool,
+    pub user: Option<String>,
+    pub cpus_millis: Option<u32>,
+    pub memory_bytes: Option<u64>,
+    pub pids_limit: Option<u32>,
+    #[serde(default)]
+    pub forwarded_environment: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RemoteFlightReport {
     pub run_id: String,
     pub executor: ExecutorKind,
@@ -1327,6 +1342,8 @@ pub struct RemoteFlightReport {
     pub deliverables: Vec<FlightDeliverable>,
     #[serde(default)]
     pub contract_violations: Vec<String>,
+    #[serde(default)]
+    pub sandbox: Option<ExecutionSandboxReport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

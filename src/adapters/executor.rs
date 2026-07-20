@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -10,6 +11,10 @@ use tokio::process::Command;
 
 use crate::domain::{ExecutorKind, ExecutorMode};
 use crate::error::{MambaError, Result};
+use crate::sandbox::{
+    CONTAINER_OUTPUT, CONTAINER_WORKSPACE, DockerContainerGuard, DockerRunSpec,
+    ResolvedDockerSandbox,
+};
 
 #[derive(Clone, Debug)]
 pub struct ExecutionRequest {
@@ -52,6 +57,21 @@ pub struct TerminalExecutor;
 
 impl TerminalExecutor {
     pub async fn run(request: ExecutionRequest) -> Result<ExecutionOutput> {
+        Self::run_inner(request, None).await
+    }
+
+    pub async fn run_in_docker(
+        request: ExecutionRequest,
+        sandbox: &ResolvedDockerSandbox,
+        container_name: &str,
+    ) -> Result<ExecutionOutput> {
+        Self::run_inner(request, Some((sandbox, container_name))).await
+    }
+
+    async fn run_inner(
+        request: ExecutionRequest,
+        sandbox: Option<(&ResolvedDockerSandbox, &str)>,
+    ) -> Result<ExecutionOutput> {
         if let Some(parent) = request.log_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -66,7 +86,12 @@ impl TerminalExecutor {
             write_failure_log(&request, &requested_command, started_at, error.to_string())?;
             return Err(error);
         }
-        let (mut command, result_file, command_label) = match build_command(&request) {
+        let BuiltCommand {
+            mut command,
+            result_file,
+            command_label,
+            _container_guard,
+        } = match build_command(&request, sandbox) {
             Ok(command) => command,
             Err(error) => {
                 write_failure_log(&request, &requested_command, started_at, error.to_string())?;
@@ -160,7 +185,20 @@ impl TerminalExecutor {
     }
 }
 
-fn build_command(request: &ExecutionRequest) -> Result<(Command, Option<PathBuf>, String)> {
+struct BuiltCommand {
+    command: Command,
+    result_file: Option<PathBuf>,
+    command_label: String,
+    _container_guard: Option<DockerContainerGuard>,
+}
+
+fn build_command(
+    request: &ExecutionRequest,
+    sandbox: Option<(&ResolvedDockerSandbox, &str)>,
+) -> Result<BuiltCommand> {
+    if let Some((sandbox, container_name)) = sandbox {
+        return build_docker_command(request, sandbox, container_name);
+    }
     let executable = request
         .command
         .clone()
@@ -192,7 +230,12 @@ fn build_command(request: &ExecutionRequest) -> Result<(Command, Option<PathBuf>
                     .arg("--json-schema")
                     .arg(serde_json::to_string(schema)?);
             }
-            Ok((command, None, command_label))
+            Ok(BuiltCommand {
+                command,
+                result_file: None,
+                command_label,
+                _container_guard: None,
+            })
         }
         ExecutorKind::Codex => {
             let artifact_dir = request.log_path.parent().unwrap_or_else(|| Path::new("."));
@@ -221,9 +264,114 @@ fn build_command(request: &ExecutionRequest) -> Result<(Command, Option<PathBuf>
                 command.arg("--output-schema").arg(schema_path);
             }
             command.arg(&request.prompt);
-            Ok((command, Some(result_path), command_label))
+            Ok(BuiltCommand {
+                command,
+                result_file: Some(result_path),
+                command_label,
+                _container_guard: None,
+            })
         }
     }
+}
+
+fn build_docker_command(
+    request: &ExecutionRequest,
+    sandbox: &ResolvedDockerSandbox,
+    container_name: &str,
+) -> Result<BuiltCommand> {
+    let executable = request
+        .command
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(default_command(&request.kind)));
+    let artifact_dir = request.log_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(artifact_dir)?;
+    let result_path = request.log_path.with_extension("result.json");
+    let container_result = container_artifact_path(&result_path)?;
+    let mut args = Vec::<OsString>::new();
+    let result_file = match request.kind {
+        ExecutorKind::ClaudeCode => {
+            args.extend([
+                "-p".into(),
+                request.prompt.clone().into(),
+                "--output-format".into(),
+                "json".into(),
+                "--no-session-persistence".into(),
+                "--permission-mode".into(),
+                match request.mode {
+                    ExecutorMode::Plan => "plan",
+                    ExecutorMode::Execute => "acceptEdits",
+                }
+                .into(),
+            ]);
+            if request.mode == ExecutorMode::Plan {
+                args.extend(["--tools".into(), "".into()]);
+            }
+            if let Some(model) = &request.model {
+                args.extend(["--model".into(), model.into()]);
+            }
+            if let Some(schema) = &request.output_schema {
+                args.extend([
+                    "--json-schema".into(),
+                    serde_json::to_string(schema)?.into(),
+                ]);
+            }
+            None
+        }
+        ExecutorKind::Codex => {
+            args.extend([
+                "exec".into(),
+                "--json".into(),
+                "--ephemeral".into(),
+                "--skip-git-repo-check".into(),
+                "--sandbox".into(),
+                match request.mode {
+                    ExecutorMode::Plan => "read-only",
+                    ExecutorMode::Execute => "workspace-write",
+                }
+                .into(),
+                "--cd".into(),
+                CONTAINER_WORKSPACE.into(),
+                "--output-last-message".into(),
+                container_result.as_os_str().into(),
+            ]);
+            if let Some(model) = &request.model {
+                args.extend(["--model".into(), model.into()]);
+            }
+            if let Some(schema) = &request.output_schema {
+                let schema_path = request.log_path.with_extension("schema.json");
+                fs::write(&schema_path, serde_json::to_vec_pretty(schema)?)?;
+                let container_schema = container_artifact_path(&schema_path)?;
+                args.extend([
+                    "--output-schema".into(),
+                    container_schema.as_os_str().into(),
+                ]);
+            }
+            args.push(request.prompt.clone().into());
+            Some(result_path)
+        }
+    };
+    let command = sandbox.command(DockerRunSpec {
+        name: container_name,
+        workspace: &request.workspace,
+        workspace_writable: request.mode == ExecutorMode::Execute,
+        output_dir: artifact_dir,
+        program: executable.as_os_str(),
+        args: &args,
+    })?;
+    let command_label = format!("docker:{}:{}", sandbox.image_id(), executable.display());
+    Ok(BuiltCommand {
+        command,
+        result_file,
+        command_label,
+        _container_guard: Some(sandbox.cleanup_guard(container_name)?),
+    })
+}
+
+fn container_artifact_path(host_path: &Path) -> Result<PathBuf> {
+    let file_name = host_path.file_name().ok_or_else(|| {
+        MambaError::Validation("executor artifact path requires a file name".into())
+    })?;
+    Ok(Path::new(CONTAINER_OUTPUT).join(file_name))
 }
 
 fn parse_claude(stdout: &str, expects_structured: bool) -> Result<ExecutionOutput> {
@@ -345,6 +493,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::sandbox::{DockerSandboxConfig, SandboxNetwork};
 
     #[tokio::test]
     async fn unavailable_executor_still_writes_a_blackbox() {
@@ -367,5 +516,93 @@ mod tests {
         assert!(matches!(error, MambaError::ExecutorUnavailable(_)));
         let log: ExecutorLog = serde_json::from_slice(&fs::read(log_path).unwrap()).unwrap();
         assert!(log.stderr.contains("executor not found"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_executor_maps_artifacts_and_keeps_closed_runtime_flags() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let output = directory.path().join("output");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let runtime = directory.path().join("fake-docker");
+        let arguments = directory.path().join("docker-args.txt");
+        fs::write(
+            &runtime,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  printf '%s\n' 'sha256:{digest}'
+  exit 0
+fi
+if [ "$1" = "container" ]; then
+  exit 0
+fi
+printf '%s\n' "$@" > '{arguments}'
+output=''
+result=''
+previous=''
+for value in "$@"; do
+  case "$value" in
+    type=bind,src=*,dst=/mamba-output)
+      output="${{value#type=bind,src=}}"
+      output="${{output%,dst=/mamba-output}}"
+      ;;
+  esac
+  if [ "$previous" = "--output-last-message" ]; then
+    result="${{value##*/}}"
+  fi
+  previous="$value"
+done
+printf '%s' 'Container flight landed.' > "$output/$result"
+printf '%s\n' '{{"thread_id":"docker-thread"}}'
+"#,
+                digest = "a".repeat(64),
+                arguments = arguments.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+        let sandbox = DockerSandboxConfig {
+            runtime,
+            image: "manbaflow-agent-runtime:0.1.0".into(),
+            network: SandboxNetwork::None,
+            cpus_millis: 1_000,
+            memory_mb: 512,
+            pids_limit: 64,
+            tmpfs_mb: 64,
+            user: Some("1000:1000".into()),
+            environment: Vec::new(),
+        }
+        .resolve()
+        .unwrap();
+        let log_path = output.join("blackbox.json");
+        let result = TerminalExecutor::run_in_docker(
+            ExecutionRequest {
+                kind: ExecutorKind::Codex,
+                command: Some("codex".into()),
+                workspace,
+                model: None,
+                mode: ExecutorMode::Plan,
+                prompt: "inspect only".into(),
+                output_schema: None,
+                timeout_seconds: 5,
+                log_path,
+            },
+            &sandbox,
+            "mamba-WRUN-test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.summary, "Container flight landed.");
+        let args = fs::read_to_string(arguments).unwrap();
+        assert!(args.contains("--read-only"));
+        assert!(args.contains("--cap-drop=ALL"));
+        assert!(args.contains("--network\nnone"));
+        assert!(args.contains("readonly"));
+        assert!(args.contains(&format!("sha256:{}", "a".repeat(64))));
     }
 }

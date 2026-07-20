@@ -7,11 +7,11 @@ use chrono::{DateTime, Duration, Utc};
 use crate::dashboard::{DashboardSnapshot, build_dashboard};
 use crate::domain::{
     Assignment, AssignmentTarget, DeliverableKind, Demand, Estimate, Evidence, ExecutionRecord,
-    ExecutorConfig, ExecutorKind, ExecutorMode, ExternalArtifact, FailureClass, FlightLease,
-    FlightLeaseStatus, FlightManifestDraft, Flow, FlowChangeImpact, FlowChangeRequest,
-    FlowChangeStatus, FlowScheduleRevision, FlowStatus, Organization, OrganizationRole, Principal,
-    PrincipalKind, RemoteFlightReport, RoleBinding, TargetKind, Task, TaskDraft, TaskStatus, Team,
-    Tenant,
+    ExecutionSandboxReport, ExecutorConfig, ExecutorKind, ExecutorMode, ExternalArtifact,
+    FailureClass, FlightLease, FlightLeaseStatus, FlightManifestDraft, Flow, FlowChangeImpact,
+    FlowChangeRequest, FlowChangeStatus, FlowScheduleRevision, FlowStatus, Organization,
+    OrganizationRole, Principal, PrincipalKind, RemoteFlightReport, RoleBinding, TargetKind, Task,
+    TaskDraft, TaskStatus, Team, Tenant,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -2268,6 +2268,108 @@ fn validate_remote_flight_report(lease: &FlightLease, report: &RemoteFlightRepor
             "remote flight report contains an unsafe changed-file path".into(),
         ));
     }
+    if let Some(sandbox) = &report.sandbox {
+        validate_execution_sandbox_report(sandbox)?;
+    }
+    Ok(())
+}
+
+fn validate_execution_sandbox_report(report: &ExecutionSandboxReport) -> Result<()> {
+    match report.backend.as_str() {
+        "process" => {
+            let is_host_process = report.image.is_none()
+                && report.image_id.is_none()
+                && report.network == "host"
+                && !report.root_read_only
+                && report.user.is_none()
+                && report.cpus_millis.is_none()
+                && report.memory_bytes.is_none()
+                && report.pids_limit.is_none()
+                && report.forwarded_environment.is_empty();
+            if !is_host_process {
+                return Err(MambaError::Validation(
+                    "process sandbox report contains contradictory isolation claims".into(),
+                ));
+            }
+        }
+        "docker" => {
+            let image_is_valid = report.image.as_ref().is_some_and(|image| {
+                !image.is_empty()
+                    && image.len() <= 512
+                    && !image.starts_with('-')
+                    && !image.chars().any(char::is_whitespace)
+                    && !image.chars().any(char::is_control)
+            });
+            let image_id_is_valid = report
+                .image_id
+                .as_deref()
+                .is_some_and(|image_id| image_id.strip_prefix("sha256:").is_some_and(is_sha256));
+            let user_is_valid = report.user.as_deref().is_some_and(|user| {
+                user.split_once(':').is_some_and(|(uid, gid)| {
+                    uid.parse::<u32>().is_ok_and(|value| value > 0)
+                        && gid.parse::<u32>().is_ok_and(|value| value > 0)
+                })
+            });
+            let resources_are_valid = report
+                .cpus_millis
+                .is_some_and(|value| (100..=64_000).contains(&value))
+                && report.memory_bytes.is_some_and(|value| {
+                    (128 * 1024 * 1024..=262_144 * 1024 * 1024).contains(&value)
+                })
+                && report
+                    .pids_limit
+                    .is_some_and(|value| (16..=32_768).contains(&value));
+            if !image_is_valid
+                || !image_id_is_valid
+                || !matches!(report.network.as_str(), "none" | "bridge")
+                || !report.root_read_only
+                || !user_is_valid
+                || !resources_are_valid
+            {
+                return Err(MambaError::Validation(
+                    "Docker sandbox report does not describe a closed, bounded runtime".into(),
+                ));
+            }
+            validate_forwarded_environment(&report.forwarded_environment)?;
+        }
+        _ => {
+            return Err(MambaError::Validation(
+                "remote flight report uses an unknown sandbox backend".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_forwarded_environment(environment: &[String]) -> Result<()> {
+    const DENIED: &[&str] = &[
+        "MAMBA_TOKEN",
+        "DOCKER_HOST",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "HOME",
+        "PATH",
+    ];
+    if environment.len() > 64 {
+        return Err(MambaError::Validation(
+            "sandbox report contains too many forwarded environment variables".into(),
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    if environment.iter().any(|name| {
+        name.is_empty()
+            || name.len() > 128
+            || name.as_bytes()[0].is_ascii_digit()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || DENIED.contains(&name.as_str())
+            || !unique.insert(name)
+    }) {
+        return Err(MambaError::Validation(
+            "sandbox report contains an invalid, denied, or duplicate environment name".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2337,6 +2439,43 @@ mod tests {
         ResourceKind, ResourceLeaseStatus,
     };
     use crate::notification::NotificationAttempt;
+
+    #[test]
+    fn sandbox_reports_enforce_closed_runtime_claims() {
+        let mut report = ExecutionSandboxReport {
+            backend: "docker".into(),
+            image: Some("manbaflow-agent-runtime:0.1.0".into()),
+            image_id: Some(format!("sha256:{}", "a".repeat(64))),
+            network: "none".into(),
+            root_read_only: true,
+            user: Some("1000:1000".into()),
+            cpus_millis: Some(2_000),
+            memory_bytes: Some(4 * 1024 * 1024 * 1024),
+            pids_limit: Some(256),
+            forwarded_environment: vec!["OPENAI_API_KEY".into()],
+        };
+        validate_execution_sandbox_report(&report).unwrap();
+
+        report.user = Some("0:0".into());
+        assert!(validate_execution_sandbox_report(&report).is_err());
+        report.user = Some("1000:1000".into());
+        report.forwarded_environment = vec!["MAMBA_TOKEN".into()];
+        assert!(validate_execution_sandbox_report(&report).is_err());
+
+        let process = ExecutionSandboxReport {
+            backend: "process".into(),
+            image: None,
+            image_id: None,
+            network: "host".into(),
+            root_read_only: false,
+            user: None,
+            cpus_millis: None,
+            memory_bytes: None,
+            pids_limit: None,
+            forwarded_environment: Vec::new(),
+        };
+        validate_execution_sandbox_report(&process).unwrap();
+    }
 
     #[tokio::test]
     async fn external_human_interactions_are_bound_atomic_idempotent_and_replayable() {
@@ -3257,6 +3396,7 @@ mod tests {
             budget_exhaustions: Vec::new(),
             deliverables: Vec::new(),
             contract_violations: Vec::new(),
+            sandbox: None,
         };
         let landed = app
             .finish_remote_flight(&lease.id, &agent.name, true, report.clone())
@@ -3382,6 +3522,7 @@ mod tests {
                     budget_exhaustions: Vec::new(),
                     deliverables: Vec::new(),
                     contract_violations: Vec::new(),
+                    sandbox: None,
                 },
             )
             .unwrap();
@@ -3436,6 +3577,7 @@ mod tests {
                     budget_exhaustions: Vec::new(),
                     deliverables: Vec::new(),
                     contract_violations: Vec::new(),
+                    sandbox: None,
                 },
             )
             .unwrap();
@@ -3596,6 +3738,7 @@ mod tests {
                     budget_exhaustions: Vec::new(),
                     deliverables: Vec::new(),
                     contract_violations: Vec::new(),
+                    sandbox: None,
                 },
             )
             .unwrap();
