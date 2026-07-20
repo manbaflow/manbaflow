@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -16,8 +16,23 @@ impl MambaApp {
         label: &str,
         actor: &str,
     ) -> Result<IssuedCredential> {
+        self.issue_api_credential_with_ttl(target, label, actor, 30)
+    }
+
+    pub fn issue_api_credential_with_ttl(
+        &mut self,
+        target: &str,
+        label: &str,
+        actor: &str,
+        ttl_days: u32,
+    ) -> Result<IssuedCredential> {
         self.state.organization()?;
         self.ensure_permission(actor, Permission::CredentialManage)?;
+        if !(1..=365).contains(&ttl_days) {
+            return Err(MambaError::Validation(
+                "credential TTL must be between 1 and 365 days".into(),
+            ));
+        }
         let principal = self.state.principal(target)?.clone();
         let label = label.trim();
         if label.is_empty() || label.chars().count() > 80 {
@@ -27,11 +42,13 @@ impl MambaApp {
         }
         let token = format!("mmb_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let token_hash = credential_hash(&token);
+        let created_at = Utc::now();
         let credential = ApiCredential {
             id: new_id("CRED"),
             principal_id: principal.id,
             label: label.to_string(),
-            created_at: Utc::now(),
+            created_at,
+            expires_at: Some(created_at + Duration::days(i64::from(ttl_days))),
             revoked_at: None,
         };
         self.store.insert_credential(
@@ -39,6 +56,7 @@ impl MambaApp {
             &credential.principal_id,
             &token_hash,
             credential.created_at,
+            credential.expires_at,
         )?;
         if let Err(error) = self.commit(
             actor,
@@ -69,7 +87,7 @@ impl MambaApp {
             .clone();
         if !credential.is_active() {
             return Err(MambaError::InvalidTransition(format!(
-                "API credential {} is already revoked",
+                "API credential {} is no longer active",
                 credential.id
             )));
         }

@@ -49,6 +49,9 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:7777")]
         bind: SocketAddr,
+        /// 明确确认非 loopback 监听的 HTTP 跳点由可信 TLS 代理保护
+        #[arg(long)]
+        allow_insecure_public_http: bool,
         #[arg(long, default_value_t = 30)]
         tracker_interval: u64,
         #[arg(long, default_value_t = 24)]
@@ -129,6 +132,11 @@ enum Command {
     Executor {
         #[command(subcommand)]
         command: ExecutorCommand,
+    },
+    /// 检查 Ledger 健康度并创建一致性备份
+    Ops {
+        #[command(subcommand)]
+        command: OpsCommand,
     },
     /// 初始化一套牢大、佐巴扬与两个副驾的演示阵容
     Demo {
@@ -281,6 +289,8 @@ enum CredentialCommand {
         target: String,
         #[arg(long, default_value = "remote client")]
         label: String,
+        #[arg(long, default_value_t = 30)]
+        ttl_days: u32,
         #[arg(long, default_value = "admin")]
         by: String,
     },
@@ -748,6 +758,17 @@ enum ExecutorCommand {
 }
 
 #[derive(Subcommand)]
+enum OpsCommand {
+    /// 执行 SQLite quick_check 并报告 Schema、WAL、事件与凭据状态
+    Doctor,
+    /// 使用 SQLite VACUUM INTO 创建不覆盖已有文件的一致性快照
+    Backup {
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum TrackCommand {
     /// 扫描未接单、失联、阻塞、待验收和超期任务
     Scan {
@@ -895,6 +916,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Serve {
             bind,
+            allow_insecure_public_http,
             tracker_interval,
             stale_hours,
             escalate_after_hours,
@@ -904,6 +926,7 @@ async fn run(cli: Cli) -> Result<()> {
                 app,
                 manbaflow::server::ServerOptions {
                     bind,
+                    allow_insecure_public_http,
                     tracker_interval_seconds: tracker_interval,
                     stale_after_hours: stale_hours,
                     escalate_after_hours,
@@ -1079,14 +1102,22 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             },
             PrincipalCommand::Token { command } => match command {
-                CredentialCommand::Issue { target, label, by } => {
-                    let issued = app.issue_api_credential(&target, &label, &by)?;
+                CredentialCommand::Issue {
+                    target,
+                    label,
+                    ttl_days,
+                    by,
+                } => {
+                    let issued =
+                        app.issue_api_credential_with_ttl(&target, &label, &by, ttl_days)?;
                     output(
                         &issued,
                         cli.json,
                         format!(
-                            "{}\nToken 只显示一次：{}",
-                            issued.credential.id, issued.token
+                            "{} · {} 到期\nToken 只显示一次：{}",
+                            issued.credential.id,
+                            issued.credential.expires_at.as_ref().unwrap(),
+                            issued.token
                         ),
                     );
                 }
@@ -1881,6 +1912,38 @@ async fn run(cli: Cli) -> Result<()> {
                     &json!({"executor": kind, "command": command, "version": version}),
                     cli.json,
                     format!("{} ready: {}", kind, version),
+                );
+            }
+        },
+        Command::Ops { command } => match command {
+            OpsCommand::Doctor => {
+                let health = app.storage_health()?;
+                output(
+                    &health,
+                    cli.json,
+                    format!(
+                        "Ledger OK · schema {} · {} · {} events · {} active credentials",
+                        health.schema_version,
+                        health.journal_mode.to_uppercase(),
+                        health.event_count,
+                        health.active_credentials
+                    ),
+                );
+            }
+            OpsCommand::Backup {
+                output: destination,
+            } => {
+                let destination = destination.unwrap_or_else(|| {
+                    app.data_dir().join("backups").join(format!(
+                        "mambaflow-{}.sqlite",
+                        Utc::now().format("%Y%m%dT%H%M%SZ")
+                    ))
+                });
+                let path = app.backup_storage(&destination)?;
+                output(
+                    &json!({"backup": path}),
+                    cli.json,
+                    format!("Ledger 快照已落地：{}", path.display()),
                 );
             }
         },

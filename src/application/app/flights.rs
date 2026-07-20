@@ -180,7 +180,13 @@ impl MambaApp {
                     claim: claim.clone(),
                     status: ResourceLeaseStatus::Active,
                     issued_at: flight.issued_at,
-                    expires_at: flight.expires_at,
+                    expires_at: flight.expires_at
+                        + Duration::seconds(
+                            flight
+                                .manifest
+                                .as_ref()
+                                .map_or(0, |manifest| manifest.fuel.max_duration_seconds as i64),
+                        ),
                     released_at: None,
                     release_reason: None,
                 },
@@ -208,6 +214,41 @@ impl MambaApp {
                 reason: reason.to_string(),
             })
             .collect()
+    }
+
+    pub fn expire_remote_flights(&mut self, actor: &str) -> Result<usize> {
+        self.expire_remote_flights_at(actor, Utc::now())
+    }
+
+    pub(super) fn expire_remote_flights_at(
+        &mut self,
+        actor: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<usize> {
+        let expired = self
+            .state
+            .flight_leases
+            .values()
+            .filter(|lease| {
+                lease.status == FlightLeaseStatus::Authorized && lease.expires_at <= now
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if expired.is_empty() {
+            return Ok(0);
+        }
+        let mut events = Vec::new();
+        for lease in &expired {
+            events.push(DomainEvent::RemoteFlightExpired {
+                flow_id: lease.flow_id.clone(),
+                task_id: lease.task_id.clone(),
+                lease_id: lease.id.clone(),
+                expired_at: now,
+            });
+            events.extend(self.resource_release_events(lease, now, "flight clearance expired"));
+        }
+        self.commit(actor, events)?;
+        Ok(expired.len())
     }
 
     pub(super) fn fuel_exhaustions(
@@ -327,6 +368,7 @@ impl MambaApp {
         objective: Option<String>,
         ttl_seconds: u64,
     ) -> Result<Option<FlightLease>> {
+        self.expire_remote_flights("tower://lease-reaper")?;
         let reason = reason.trim();
         validate_text(reason, "recovery reason", 1_000)?;
         if !(60..=86_400).contains(&ttl_seconds) {

@@ -21,7 +21,7 @@ use crate::matcher::Matcher;
 use crate::planner::{PlannerKind, generate_plan, generate_revision_plan};
 use crate::scheduler::{reschedule, schedule};
 use crate::state::OrganizationState;
-use crate::store::EventStore;
+use crate::store::{EventStore, StorageHealth};
 
 mod actions;
 mod authority;
@@ -51,10 +51,24 @@ pub(crate) struct ExternalDeliverySync {
     pub changed_tasks: usize,
 }
 
+#[cfg(unix)]
+fn restrict_data_dir_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_data_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 impl MambaApp {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
+        restrict_data_dir_permissions(&data_dir)?;
         let store = EventStore::open(data_dir.join("flow.db"))?;
         let state = OrganizationState::replay(&store.load_all()?)?;
         let mut app = Self {
@@ -74,6 +88,14 @@ impl MambaApp {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn storage_health(&self) -> Result<StorageHealth> {
+        self.store.health()
+    }
+
+    pub fn backup_storage(&mut self, destination: impl AsRef<Path>) -> Result<PathBuf> {
+        self.store.backup(destination)
     }
 
     pub fn reload(&mut self) -> Result<()> {
@@ -1312,6 +1334,7 @@ impl MambaApp {
         ttl_seconds: u64,
         manifest: FlightManifestDraft,
     ) -> Result<FlightLease> {
+        self.expire_remote_flights("tower://lease-reaper")?;
         if !(60..=86_400).contains(&ttl_seconds) {
             return Err(MambaError::Validation(
                 "flight lease TTL must be between 60 and 86400 seconds".into(),
@@ -3149,11 +3172,28 @@ mod tests {
         assert_eq!(child.attempt, 2);
         assert_eq!(child.status, FlightLeaseStatus::Authorized);
         assert!(app.state().resource_leases.values().any(|resource| {
-            resource.flight_lease_id == child.id && resource.status == ResourceLeaseStatus::Active
+            resource.flight_lease_id == child.id
+                && resource.status == ResourceLeaseStatus::Active
+                && resource.expires_at > child.expires_at
         }));
         let decision = app.state().flight_recoveries.values().next().unwrap();
         assert_eq!(decision.parent_lease_id, lease.id);
         assert_eq!(decision.child_lease_id.as_deref(), Some(child.id.as_str()));
+        assert_eq!(
+            app.expire_remote_flights_at(
+                "tower://test-reaper",
+                child.expires_at + Duration::seconds(1),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            app.state().flight_leases[&child.id].status,
+            FlightLeaseStatus::Expired
+        );
+        assert!(app.state().resource_leases.values().any(|resource| {
+            resource.flight_lease_id == child.id && resource.status == ResourceLeaseStatus::Released
+        }));
 
         drop(app);
         let replayed = MambaApp::open(&data_dir).unwrap();
@@ -3162,6 +3202,10 @@ mod tests {
             FlightLeaseStatus::Crashed
         );
         assert_eq!(replayed.state().flight_leases[&child.id].attempt, 2);
+        assert_eq!(
+            replayed.state().flight_leases[&child.id].status,
+            FlightLeaseStatus::Expired
+        );
         assert!(replayed.state().flight_recoveries.values().any(|decision| {
             decision.parent_lease_id == lease.id
                 && decision.child_lease_id.as_deref() == Some(child.id.as_str())
@@ -3190,6 +3234,13 @@ mod tests {
         let issued = app
             .issue_api_credential(&human.id, "laptop", "admin")
             .unwrap();
+        let expires_at = issued.credential.expires_at.unwrap();
+        assert!(expires_at > Utc::now() + Duration::days(29));
+        assert!(expires_at < Utc::now() + Duration::days(31));
+        assert!(
+            app.issue_api_credential_with_ttl(&human.id, "invalid", "admin", 0)
+                .is_err()
+        );
         assert_eq!(
             app.authenticate_api_token(&issued.token)
                 .unwrap()

@@ -2784,6 +2784,7 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
             FlightLeaseStatus::Landed => ("✓", "LANDED", GREEN),
             FlightLeaseStatus::Crashed => ("✕", "CRASHED", RED),
             FlightLeaseStatus::Revoked => ("−", "REVOKED", MUTED),
+            FlightLeaseStatus::Expired => ("−", "EXPIRED", MUTED),
         };
         let resources = lease
             .manifest

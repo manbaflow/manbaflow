@@ -10,6 +10,18 @@ use crate::error::{MambaError, Result};
 use crate::event::{CURRENT_EVENT_VERSION, DomainEvent, EventEnvelope};
 use crate::ids::new_id;
 
+const SCHEMA_VERSION: i64 = 3;
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct StorageHealth {
+    pub path: PathBuf,
+    pub schema_version: i64,
+    pub journal_mode: String,
+    pub integrity: String,
+    pub event_count: i64,
+    pub active_credentials: i64,
+}
+
 #[derive(Serialize)]
 struct StoredEvent<'a> {
     version: u16,
@@ -28,10 +40,33 @@ impl EventStore {
             fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(&path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let has_metadata = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_metadata {
+            let existing_version = connection.query_row(
+                "SELECT CAST(value AS INTEGER) FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if !matches!(existing_version, 2 | SCHEMA_VERSION) {
+                return Err(MambaError::Validation(format!(
+                    "unsupported storage schema version {existing_version}; this binary requires {SCHEMA_VERSION}"
+                )));
+            }
+        }
         connection.execute_batch(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
+            PRAGMA synchronous = FULL;
+            PRAGMA wal_autocheckpoint = 1000;
+            PRAGMA trusted_schema = OFF;
             CREATE TABLE IF NOT EXISTS events (
                 sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
                 id              TEXT NOT NULL UNIQUE,
@@ -49,6 +84,7 @@ impl EventStore {
                 principal_id TEXT NOT NULL,
                 token_hash   BLOB NOT NULL UNIQUE,
                 created_at   TEXT NOT NULL,
+                expires_at   TEXT,
                 revoked_at   TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_api_credentials_principal
@@ -57,15 +93,98 @@ impl EventStore {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            INSERT INTO metadata(key, value) VALUES ('schema_version', '2')
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '3')
+                ON CONFLICT(key) DO NOTHING;
             ",
         )?;
+        let mut schema_version = connection.query_row(
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if schema_version == 2 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(
+                "ALTER TABLE api_credentials ADD COLUMN expires_at TEXT;
+                 UPDATE metadata SET value = '3' WHERE key = 'schema_version';",
+            )?;
+            transaction.commit()?;
+            schema_version = 3;
+        }
+        if schema_version != SCHEMA_VERSION {
+            return Err(MambaError::Validation(format!(
+                "unsupported storage schema version {schema_version}; this binary requires {SCHEMA_VERSION}"
+            )));
+        }
+        restrict_file_permissions(&path)?;
+        restrict_file_permissions(&sidecar_path(&path, "-wal"))?;
+        restrict_file_permissions(&sidecar_path(&path, "-shm"))?;
         Ok(Self { connection, path })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn health(&self) -> Result<StorageHealth> {
+        let schema_version = self.connection.query_row(
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        let journal_mode = self
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?;
+        let integrity = self
+            .connection
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;
+        let event_count = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        let active_credentials = self.connection.query_row(
+            "SELECT COUNT(*) FROM api_credentials
+             WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?1)",
+            [Utc::now().to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        Ok(StorageHealth {
+            path: self.path.clone(),
+            schema_version,
+            journal_mode,
+            integrity,
+            event_count,
+            active_credentials,
+        })
+    }
+
+    pub fn backup(&mut self, destination: impl AsRef<Path>) -> Result<PathBuf> {
+        let destination = destination.as_ref().to_path_buf();
+        if destination.exists() {
+            return Err(MambaError::Validation(format!(
+                "backup destination already exists: {}",
+                destination.display()
+            )));
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(FULL);")?;
+        let destination_text = destination.to_str().ok_or_else(|| {
+            MambaError::Validation("backup destination is not valid UTF-8".into())
+        })?;
+        self.connection
+            .execute("VACUUM INTO ?1", [destination_text])?;
+        restrict_file_permissions(&destination)?;
+        let backup = EventStore::open(&destination)?;
+        let health = backup.health()?;
+        if health.integrity != "ok" {
+            return Err(MambaError::Validation(format!(
+                "backup integrity check failed: {}",
+                health.integrity
+            )));
+        }
+        Ok(destination)
     }
 
     #[cfg(test)]
@@ -219,11 +338,18 @@ impl EventStore {
         principal_id: &str,
         token_hash: &[u8],
         created_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO api_credentials(id, principal_id, token_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![id, principal_id, token_hash, created_at.to_rfc3339()],
+            "INSERT INTO api_credentials(id, principal_id, token_hash, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                principal_id,
+                token_hash,
+                created_at.to_rfc3339(),
+                expires_at.map(|value| value.to_rfc3339())
+            ],
         )?;
         Ok(())
     }
@@ -252,9 +378,10 @@ impl EventStore {
     pub fn authenticate_credential(&self, token_hash: &[u8]) -> Result<Option<(String, String)>> {
         let mut statement = self.connection.prepare(
             "SELECT id, principal_id FROM api_credentials
-             WHERE token_hash = ?1 AND revoked_at IS NULL",
+             WHERE token_hash = ?1 AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?2)",
         )?;
-        let mut rows = statement.query(params![token_hash])?;
+        let mut rows = statement.query(params![token_hash, Utc::now().to_rfc3339()])?;
         if let Some(row) = rows.next()? {
             Ok(Some((row.get(0)?, row.get(1)?)))
         } else {
@@ -308,6 +435,27 @@ impl EventStore {
         }
         Ok(events)
     }
+}
+
+#[cfg(unix)]
+fn restrict_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if path.exists() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn decode_event_payload(payload: &str) -> Result<(u16, DomainEvent)> {
@@ -378,6 +526,77 @@ mod tests {
         let payload = serde_json::from_str::<Value>(&payload).unwrap();
         assert_eq!(payload["version"], CURRENT_EVENT_VERSION);
         assert!(payload.get("event").is_some());
+    }
+
+    #[test]
+    fn online_backup_is_consistent_and_future_schemas_are_rejected() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("source.sqlite");
+        let backup_path = directory.path().join("backups").join("snapshot.sqlite");
+        let mut store = EventStore::open(&path).unwrap();
+        store
+            .append_batch(
+                "ORG-1",
+                "admin",
+                &[DomainEvent::OrganizationInitialized {
+                    organization: Organization {
+                        id: "ORG-1".into(),
+                        name: "Mamba".into(),
+                        created_at: Utc::now(),
+                    },
+                }],
+            )
+            .unwrap();
+        let health = store.health().unwrap();
+        assert_eq!(health.integrity, "ok");
+        assert_eq!(health.journal_mode, "wal");
+        assert_eq!(health.event_count, 1);
+        store.backup(&backup_path).unwrap();
+        let backup = EventStore::open(&backup_path).unwrap();
+        assert_eq!(backup.load_all().unwrap().len(), 1);
+        assert!(store.backup(&backup_path).is_err());
+        store
+            .insert_credential(
+                "CRED-expired",
+                "HUM-1",
+                &[7; 32],
+                Utc::now() - chrono::Duration::days(2),
+                Some(Utc::now() - chrono::Duration::days(1)),
+            )
+            .unwrap();
+        assert!(store.authenticate_credential(&[7; 32]).unwrap().is_none());
+
+        let v2_path = directory.path().join("v2.sqlite");
+        let v2 = Connection::open(&v2_path).unwrap();
+        v2.execute_batch(
+            "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO metadata(key, value) VALUES ('schema_version', '2');
+             CREATE TABLE api_credentials(
+                id TEXT PRIMARY KEY,
+                principal_id TEXT NOT NULL,
+                token_hash BLOB NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT
+             );",
+        )
+        .unwrap();
+        drop(v2);
+        let migrated = EventStore::open(v2_path).unwrap();
+        assert_eq!(migrated.health().unwrap().schema_version, 3);
+
+        let future_path = directory.path().join("future.sqlite");
+        let future = Connection::open(&future_path).unwrap();
+        future
+            .execute_batch(
+                "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata(key, value) VALUES ('schema_version', '99');",
+            )
+            .unwrap();
+        drop(future);
+        assert!(matches!(
+            EventStore::open(future_path),
+            Err(MambaError::Validation(message)) if message.contains("schema version 99")
+        ));
     }
 
     #[test]

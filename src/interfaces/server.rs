@@ -1,16 +1,18 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Json, Router, middleware};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::time::{MissedTickBehavior, interval};
@@ -35,6 +37,7 @@ use crate::planner::PlannerKind;
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
     pub bind: SocketAddr,
+    pub allow_insecure_public_http: bool,
     pub tracker_interval_seconds: u64,
     pub stale_after_hours: u64,
     pub escalate_after_hours: u64,
@@ -46,6 +49,49 @@ struct ApiState {
     app: Arc<Mutex<MambaApp>>,
     gitlab_webhook_auth: Option<GitLabWebhookAuth>,
     interaction_auth: InteractionWebhookAuth,
+}
+
+#[derive(Clone, Default)]
+struct RateLimitState {
+    buckets: Arc<StdMutex<BTreeMap<[u8; 32], RateBucket>>>,
+}
+
+#[derive(Clone, Copy)]
+struct RateBucket {
+    window_started: Instant,
+    requests: u32,
+}
+
+impl RateLimitState {
+    const LIMIT_PER_MINUTE: u32 = 300;
+    const MAX_BUCKETS: usize = 10_000;
+
+    fn allow(&self, key: [u8; 32], now: Instant) -> bool {
+        let mut buckets = self.buckets.lock().expect("rate-limit mutex poisoned");
+        if buckets.len() >= Self::MAX_BUCKETS && !buckets.contains_key(&key) {
+            buckets.retain(|_, bucket| {
+                now.duration_since(bucket.window_started) < Duration::from_secs(60)
+            });
+            if buckets.len() >= Self::MAX_BUCKETS {
+                return false;
+            }
+        }
+        let bucket = buckets.entry(key).or_insert(RateBucket {
+            window_started: now,
+            requests: 0,
+        });
+        if now.duration_since(bucket.window_started) >= Duration::from_secs(60) {
+            *bucket = RateBucket {
+                window_started: now,
+                requests: 0,
+            };
+        }
+        if bucket.requests >= Self::LIMIT_PER_MINUTE {
+            return false;
+        }
+        bucket.requests += 1;
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -101,6 +147,14 @@ struct HealthResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct ReadinessResponse {
+    status: &'static str,
+    schema_version: Option<i64>,
+    event_count: Option<i64>,
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct InboxItem {
     flow_id: String,
     flow_title: String,
@@ -143,6 +197,8 @@ struct GrantRoleInput {
 #[derive(Clone, Debug, Deserialize)]
 struct IssueCredentialInput {
     label: String,
+    #[serde(default = "default_credential_ttl_days")]
+    ttl_days: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -329,6 +385,11 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
             "notification interval must be greater than zero".into(),
         ));
     }
+    if !options.bind.ip().is_loopback() && !options.allow_insecure_public_http {
+        return Err(MambaError::Validation(
+            "refusing non-loopback plain HTTP; terminate TLS at a trusted proxy and pass --allow-insecure-public-http to acknowledge the hop".into(),
+        ));
+    }
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
     let interaction_auth = InteractionWebhookAuth::from_env()?;
     let listener = TcpListener::bind(options.bind).await?;
@@ -359,6 +420,7 @@ fn router(
     gitlab_webhook_auth: Option<GitLabWebhookAuth>,
     interaction_auth: InteractionWebhookAuth,
 ) -> Router {
+    let rate_limit = RateLimitState::default();
     Router::new()
         .route("/console", get(crate::console::index))
         .route(
@@ -367,6 +429,9 @@ fn router(
         )
         .route("/console/assets/console.js", get(crate::console::script))
         .route("/health", get(health))
+        .route("/health/live", get(health))
+        .route("/health/ready", get(readiness))
+        .route("/metrics", get(metrics))
         .route("/api/v1/me", get(me))
         .route("/api/v1/organization", get(organization))
         .route("/api/v1/teams", get(teams).post(create_team))
@@ -447,11 +512,55 @@ fn router(
         .route("/api/v1/connectors/interactions", post(bridge_interaction))
         .route("/api/v1/connectors/slack/actions", post(slack_interaction))
         .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(middleware::from_fn_with_state(rate_limit, request_guard))
         .with_state(ApiState {
             app,
             gitlab_webhook_auth,
             interaction_auth,
         })
+}
+
+async fn request_guard(
+    State(rate_limit): State<RateLimitState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let api_response = request.uri().path().starts_with("/api/")
+        || matches!(request.uri().path(), "/metrics" | "/health/ready");
+    let request_id = format!("REQ-{}", uuid::Uuid::new_v4().simple());
+    let key = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .map(|value| Sha256::digest(value.as_bytes()).into())
+        .unwrap_or_else(|| Sha256::digest(b"anonymous").into());
+    if !rate_limit.allow(key, Instant::now()) {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "request rate limit exceeded"})),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, "60".parse().unwrap());
+        return harden_response(response, &request_id, api_response);
+    }
+    harden_response(next.run(request).await, &request_id, api_response)
+}
+
+fn harden_response(mut response: Response, request_id: &str, no_store: bool) -> Response {
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-request-id"),
+        request_id.parse().unwrap(),
+    );
+    response
+        .headers_mut()
+        .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    if no_store {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    }
+    response
 }
 
 fn spawn_tracker(app: Arc<Mutex<MambaApp>>, options: &ServerOptions) {
@@ -465,11 +574,16 @@ fn spawn_tracker(app: Arc<Mutex<MambaApp>>, options: &ServerOptions) {
             ticker.tick().await;
             let mut app = app.lock().await;
             if app.state().organization.is_some() {
-                let _ = app.scan_tracking_with_policy(
+                if let Err(error) = app.expire_remote_flights("tower://lease-reaper") {
+                    eprintln!("flight lease reaper failed: {error}");
+                }
+                if let Err(error) = app.scan_tracking_with_policy(
                     stale_after_hours,
                     escalate_after_hours,
                     "tower://server",
-                );
+                ) {
+                    eprintln!("tracker scan failed: {error}");
+                }
             }
         }
     });
@@ -482,13 +596,16 @@ fn spawn_notification_dispatcher(app: Arc<Mutex<MambaApp>>, options: &ServerOpti
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            let _ = deliver_notification_batch(
+            if let Err(error) = deliver_notification_batch(
                 &app,
                 50,
                 false,
                 "tower://server-notification-dispatcher",
             )
-            .await;
+            .await
+            {
+                eprintln!("notification dispatch failed: {error}");
+            }
         }
     });
 }
@@ -502,6 +619,86 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "mambaflow-control-plane",
     })
+}
+
+async fn readiness(State(state): State<ApiState>) -> Response {
+    let app = state.app.lock().await;
+    if app.state().organization.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadinessResponse {
+                status: "not_ready",
+                schema_version: None,
+                event_count: None,
+                message: Some("organization is not initialized".into()),
+            }),
+        )
+            .into_response();
+    }
+    match app.storage_health() {
+        Ok(health) if health.integrity == "ok" => (
+            StatusCode::OK,
+            Json(ReadinessResponse {
+                status: "ready",
+                schema_version: Some(health.schema_version),
+                event_count: Some(health.event_count),
+                message: None,
+            }),
+        )
+            .into_response(),
+        Ok(health) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadinessResponse {
+                status: "not_ready",
+                schema_version: Some(health.schema_version),
+                event_count: Some(health.event_count),
+                message: Some(format!("storage integrity: {}", health.integrity)),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadinessResponse {
+                status: "not_ready",
+                schema_version: None,
+                event_count: None,
+                message: Some(error.to_string()),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn metrics(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Response> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    let dashboard = app.admin_dashboard(&principal.id)?;
+    let storage = app.storage_health()?;
+    let metrics = dashboard.metrics;
+    let body = format!(
+        "# TYPE manbaflow_flows gauge\nmanbaflow_flows {}\n\
+         # TYPE manbaflow_active_flows gauge\nmanbaflow_active_flows {}\n\
+         # TYPE manbaflow_tasks gauge\nmanbaflow_tasks {}\n\
+         # TYPE manbaflow_blocked_tasks gauge\nmanbaflow_blocked_tasks {}\n\
+         # TYPE manbaflow_open_flights gauge\nmanbaflow_open_flights {}\n\
+         # TYPE manbaflow_pending_notifications gauge\nmanbaflow_pending_notifications {}\n\
+         # TYPE manbaflow_ledger_events counter\nmanbaflow_ledger_events {}\n",
+        metrics.total_flows,
+        metrics.active_flows,
+        metrics.total_tasks,
+        metrics.blocked_tasks,
+        metrics.open_flights,
+        metrics.pending_notifications,
+        storage.event_count,
+    );
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
 }
 
 async fn me(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Json<Principal>> {
@@ -618,7 +815,7 @@ async fn issue_principal_credential(
     Json(input): Json<IssueCredentialInput>,
 ) -> ApiResult<Json<IssuedCredential>> {
     mutate(&state, &headers, |app, actor| {
-        app.issue_api_credential(&principal_id, &input.label, actor)
+        app.issue_api_credential_with_ttl(&principal_id, &input.label, actor, input.ttl_days)
     })
     .await
 }
@@ -1375,6 +1572,10 @@ fn default_lease_ttl_seconds() -> u64 {
     3_600
 }
 
+fn default_credential_ttl_days() -> u32 {
+    30
+}
+
 fn default_capacity_percent() -> u8 {
     100
 }
@@ -1414,6 +1615,18 @@ mod tests {
 
     type TestHmacSha256 = Hmac<Sha256>;
 
+    #[test]
+    fn rate_limiter_resets_after_its_fixed_window() {
+        let limiter = RateLimitState::default();
+        let key = [9; 32];
+        let now = Instant::now();
+        for _ in 0..RateLimitState::LIMIT_PER_MINUTE {
+            assert!(limiter.allow(key, now));
+        }
+        assert!(!limiter.allow(key, now));
+        assert!(limiter.allow(key, now + Duration::from_secs(61)));
+    }
+
     #[tokio::test]
     async fn web_console_assets_are_embedded_and_security_hardened() {
         let directory = tempdir().unwrap();
@@ -1423,6 +1636,18 @@ mod tests {
             None,
             InteractionWebhookAuth::default(),
         );
+
+        let not_ready = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let page = service
             .clone()
@@ -1436,6 +1661,7 @@ mod tests {
             .unwrap();
         assert_eq!(page.status(), StatusCode::OK);
         assert!(page.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+        assert!(page.headers().contains_key("x-request-id"));
         let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("MambaFlow Tower"));
 
@@ -1453,6 +1679,86 @@ mod tests {
             script.headers()[header::CONTENT_TYPE],
             "text/javascript; charset=utf-8"
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_metrics_and_public_http_guard_enforce_operational_boundaries() {
+        let directory = tempdir().unwrap();
+        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Operations", "operations", "admin")
+            .unwrap();
+        let admin = app
+            .register_principal(
+                "Operator",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "operations",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let token = app
+            .issue_api_credential(&admin.id, "metrics", "admin")
+            .unwrap()
+            .token;
+        let service = router(
+            Arc::new(Mutex::new(app)),
+            None,
+            InteractionWebhookAuth::default(),
+        );
+
+        let ready = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+        let denied = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let metrics = service
+            .oneshot(authenticated_request("GET", "/metrics", &token))
+            .await
+            .unwrap();
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let body = to_bytes(metrics.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("manbaflow_ledger_events"));
+
+        let unopened = MambaApp::open(directory.path().join("public-http")).unwrap();
+        let error = run(
+            unopened,
+            ServerOptions {
+                bind: "0.0.0.0:0".parse().unwrap(),
+                allow_insecure_public_http: false,
+                tracker_interval_seconds: 30,
+                stale_after_hours: 24,
+                escalate_after_hours: 4,
+                notification_interval_seconds: 15,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MambaError::Validation(message) if message.contains("non-loopback plain HTTP")
+        ));
     }
 
     #[tokio::test]

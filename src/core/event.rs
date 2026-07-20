@@ -292,6 +292,12 @@ pub enum DomainEvent {
         revoked_by: String,
         revoked_at: DateTime<Utc>,
     },
+    RemoteFlightExpired {
+        flow_id: String,
+        task_id: String,
+        lease_id: String,
+        expired_at: DateTime<Utc>,
+    },
     RemoteFlightFinished {
         flow_id: String,
         task_id: String,
@@ -369,6 +375,7 @@ impl DomainEvent {
             Self::ResourceLeaseReleased { .. } => "resource_lease.released",
             Self::RemoteFlightClaimed { .. } => "remote_flight.claimed",
             Self::RemoteFlightRevoked { .. } => "remote_flight.revoked",
+            Self::RemoteFlightExpired { .. } => "remote_flight.expired",
             Self::RemoteFlightFinished { landed: true, .. } => "remote_flight.landed",
             Self::RemoteFlightFinished { landed: false, .. } => "remote_flight.crashed",
             Self::FlightRecoveryDecided { .. } => "remote_flight.recovery_decided",
@@ -404,6 +411,7 @@ impl DomainEvent {
             | Self::ExecutorFailed { flow_id, .. }
             | Self::RemoteFlightClaimed { flow_id, .. }
             | Self::RemoteFlightRevoked { flow_id, .. }
+            | Self::RemoteFlightExpired { flow_id, .. }
             | Self::RemoteFlightFinished { flow_id, .. }
             | Self::ResourceLeaseReleased { flow_id, .. }
             | Self::FlightRecoveryDecided { flow_id, .. }

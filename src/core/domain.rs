@@ -319,12 +319,18 @@ pub struct ApiCredential {
     pub principal_id: String,
     pub label: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
 impl ApiCredential {
     pub fn is_active(&self) -> bool {
-        self.revoked_at.is_none()
+        self.is_active_at(Utc::now())
+    }
+
+    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
+        self.revoked_at.is_none() && self.expires_at.is_none_or(|expires_at| expires_at > now)
     }
 }
 
@@ -774,6 +780,7 @@ pub enum FlightLeaseStatus {
     Landed,
     Crashed,
     Revoked,
+    Expired,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1063,7 +1070,10 @@ pub struct FlightRecoveryDecision {
 
 impl FlightLeaseStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Landed | Self::Crashed | Self::Revoked)
+        matches!(
+            self,
+            Self::Landed | Self::Crashed | Self::Revoked | Self::Expired
+        )
     }
 }
 

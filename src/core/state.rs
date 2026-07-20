@@ -837,6 +837,16 @@ impl OrganizationState {
                 lease.status = FlightLeaseStatus::Revoked;
                 lease.finished_at = Some(*revoked_at);
             }
+            DomainEvent::RemoteFlightExpired {
+                flow_id,
+                task_id,
+                lease_id,
+                expired_at,
+            } => {
+                let lease = self.flight_lease_mut(lease_id, flow_id, task_id)?;
+                lease.status = FlightLeaseStatus::Expired;
+                lease.finished_at = Some(*expired_at);
+            }
             DomainEvent::RemoteFlightFinished {
                 flow_id,
                 task_id,

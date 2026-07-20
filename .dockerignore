@@ -1,0 +1,6 @@
+.git
+.github
+.mambaflow
+.mambaflow-showcase
+target
+*.log
