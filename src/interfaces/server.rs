@@ -360,6 +360,12 @@ fn router(
     interaction_auth: InteractionWebhookAuth,
 ) -> Router {
     Router::new()
+        .route("/console", get(crate::console::index))
+        .route(
+            "/console/assets/console.css",
+            get(crate::console::stylesheet),
+        )
+        .route("/console/assets/console.js", get(crate::console::script))
         .route("/health", get(health))
         .route("/api/v1/me", get(me))
         .route("/api/v1/organization", get(organization))
@@ -1407,6 +1413,42 @@ mod tests {
     use crate::planner::PlannerKind;
 
     type TestHmacSha256 = Hmac<Sha256>;
+
+    #[tokio::test]
+    async fn web_console_assets_are_embedded_and_security_hardened() {
+        let directory = tempdir().unwrap();
+        let app = MambaApp::open(directory.path().join("data")).unwrap();
+        let service = router(
+            Arc::new(Mutex::new(app)),
+            None,
+            InteractionWebhookAuth::default(),
+        );
+
+        let page = service
+            .clone()
+            .oneshot(Request::builder().uri("/console").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(page.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+        let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("MambaFlow Tower"));
+
+        let script = service
+            .oneshot(
+                Request::builder()
+                    .uri("/console/assets/console.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(script.status(), StatusCode::OK);
+        assert_eq!(
+            script.headers()[header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+    }
 
     #[tokio::test]
     async fn tenant_admin_can_manage_roles_and_manager_can_create_remote_demand() {

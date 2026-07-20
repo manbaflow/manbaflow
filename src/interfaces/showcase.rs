@@ -1,11 +1,12 @@
 use std::path::Path;
 
+use chrono::Utc;
 use serde::Serialize;
 
 use crate::MambaApp;
 use crate::domain::{
-    ExecutorConfig, ExecutorKind, ExternalInteractionAction, Flow, FlowMessageKind, PrincipalKind,
-    TargetKind, Task, TaskStatus,
+    ExecutorConfig, ExecutorKind, ExternalInteractionAction, FailureClass, Flow, FlowMessageKind,
+    PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::planner::PlannerKind;
@@ -165,11 +166,29 @@ pub async fn seed_showcase(
     app.authorize_remote_flight(&gateway_core.id, &owner, &worker, executor, 3_600)?;
 
     let auth_policy = start_task(app, &gateway.id, "auth-policy")?;
-    let auth_actor = task_actor(app, &auth_policy)?;
-    app.block_task(
-        &auth_policy.id,
-        &auth_actor,
-        "等待安全负责人确认生产环境的 Provider Secret 轮换边界",
+    let (worker, owner, executor) = assigned_agent_and_owner(app, &auth_policy)?;
+    let crashed_lease =
+        app.authorize_remote_flight(&auth_policy.id, &owner, &worker, executor.clone(), 3_600)?;
+    app.claim_remote_flight(&crashed_lease.id, &worker, "WRUN-showcase-crash")?;
+    let now = Utc::now();
+    app.finish_remote_flight(
+        &crashed_lease.id,
+        &worker,
+        false,
+        RemoteFlightReport {
+            run_id: "WRUN-showcase-crash".into(),
+            executor,
+            summary: "生产 Provider Secret 权限不足，需要 Human 确认轮换边界".into(),
+            base_revision: "showcase".into(),
+            changed_files: Vec::new(),
+            patch_sha256: None,
+            log_sha256: "8".repeat(64),
+            started_at: now,
+            finished_at: now,
+            fuel: Default::default(),
+            failure_class: Some(FailureClass::Permission),
+            budget_exhaustions: Vec::new(),
+        },
     )?;
     let command_message_id = if app.state().principal("佐巴扬").is_ok() {
         Some(

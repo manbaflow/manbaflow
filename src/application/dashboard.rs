@@ -3,10 +3,13 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{FlightLeaseStatus, FlowStatus, NotificationStatus, TaskStatus};
+use crate::domain::{
+    FailureClass, FlightLeaseStatus, FlowStatus, NotificationStatus, ResourceLeaseStatus,
+    TaskStatus,
+};
 use crate::state::OrganizationState;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DashboardSnapshot {
     pub generated_at: DateTime<Utc>,
     pub metrics: DashboardMetrics,
@@ -78,7 +81,7 @@ pub struct DashboardAction {
     pub p80_finish: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DashboardFlight {
     pub id: String,
     pub flow_id: String,
@@ -88,6 +91,30 @@ pub struct DashboardFlight {
     pub status: String,
     pub summary: Option<String>,
     pub updated_at: DateTime<Utc>,
+    pub attempt: Option<u32>,
+    pub parent_flight_id: Option<String>,
+    pub root_flight_id: Option<String>,
+    pub manifest_id: Option<String>,
+    pub objective: Option<String>,
+    pub fuel: Option<DashboardFuel>,
+    pub active_resource_leases: usize,
+    pub total_resource_claims: usize,
+    pub failure_class: Option<FailureClass>,
+    pub budget_exhaustions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DashboardFuel {
+    pub duration_used_seconds: u64,
+    pub duration_budget_seconds: u64,
+    pub context_used_bytes: u64,
+    pub context_budget_bytes: u64,
+    pub tokens_used: Option<u64>,
+    pub tokens_budget: Option<u64>,
+    pub tool_calls_used: Option<u64>,
+    pub tool_calls_budget: Option<u64>,
+    pub cost_used_usd: Option<f64>,
+    pub cost_budget_usd: Option<f64>,
 }
 
 pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
@@ -229,18 +256,63 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
     let mut flights = state
         .flight_leases
         .values()
-        .map(|lease| DashboardFlight {
-            id: lease.id.clone(),
-            flow_id: lease.flow_id.clone(),
-            task_id: lease.task_id.clone(),
-            principal: lease.principal_name.clone(),
-            executor: lease.executor.to_string(),
-            status: format!("{:?}", lease.status).to_lowercase(),
-            summary: lease.report.as_ref().map(|report| report.summary.clone()),
-            updated_at: lease
-                .finished_at
-                .or(lease.claimed_at)
-                .unwrap_or(lease.issued_at),
+        .map(|lease| {
+            let usage = lease.report.as_ref().map(|report| &report.fuel);
+            let fuel = lease.manifest.as_ref().map(|manifest| DashboardFuel {
+                duration_used_seconds: usage.map_or(0, |fuel| fuel.duration_seconds),
+                duration_budget_seconds: manifest.fuel.max_duration_seconds,
+                context_used_bytes: usage.map_or(0, |fuel| fuel.context_bytes),
+                context_budget_bytes: manifest.fuel.max_context_bytes,
+                tokens_used: usage.and_then(|fuel| fuel.tokens),
+                tokens_budget: manifest.fuel.max_tokens,
+                tool_calls_used: usage.and_then(|fuel| fuel.tool_calls),
+                tool_calls_budget: manifest.fuel.max_tool_calls,
+                cost_used_usd: usage.and_then(|fuel| fuel.cost_usd),
+                cost_budget_usd: manifest.fuel.max_cost_usd,
+            });
+            DashboardFlight {
+                id: lease.id.clone(),
+                flow_id: lease.flow_id.clone(),
+                task_id: lease.task_id.clone(),
+                principal: lease.principal_name.clone(),
+                executor: lease.executor.to_string(),
+                status: format!("{:?}", lease.status).to_lowercase(),
+                summary: lease.report.as_ref().map(|report| report.summary.clone()),
+                updated_at: lease
+                    .finished_at
+                    .or(lease.claimed_at)
+                    .unwrap_or(lease.issued_at),
+                attempt: Some(lease.attempt),
+                parent_flight_id: lease.parent_lease_id.clone(),
+                root_flight_id: lease.root_lease_id.clone(),
+                manifest_id: lease.manifest.as_ref().map(|manifest| manifest.id.clone()),
+                objective: lease
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| manifest.objective.clone()),
+                fuel,
+                active_resource_leases: state
+                    .resource_leases
+                    .values()
+                    .filter(|resource| {
+                        resource.flight_lease_id == lease.id
+                            && resource.status == ResourceLeaseStatus::Active
+                    })
+                    .count(),
+                total_resource_claims: lease
+                    .manifest
+                    .as_ref()
+                    .map_or(0, |manifest| manifest.resources.len()),
+                failure_class: lease
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.failure_class),
+                budget_exhaustions: lease
+                    .report
+                    .as_ref()
+                    .map(|report| report.budget_exhaustions.clone())
+                    .unwrap_or_default(),
+            }
         })
         .chain(state.executions.values().map(|record| {
             DashboardFlight {
@@ -256,6 +328,16 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
                 status: "landed".into(),
                 summary: Some(record.summary.clone()),
                 updated_at: record.finished_at,
+                attempt: None,
+                parent_flight_id: None,
+                root_flight_id: None,
+                manifest_id: None,
+                objective: None,
+                fuel: None,
+                active_resource_leases: 0,
+                total_resource_claims: 0,
+                failure_class: None,
+                budget_exhaustions: Vec::new(),
             }
         }))
         .collect::<Vec<_>>();

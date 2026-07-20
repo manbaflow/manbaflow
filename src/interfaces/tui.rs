@@ -23,8 +23,9 @@ use tokio::sync::mpsc;
 use crate::MambaApp;
 use crate::dashboard::{ActionPriority, FlowHealth, build_dashboard};
 use crate::domain::{
-    AssignmentTarget, AttentionSeverity, ExecutorMode, FlightLeaseStatus, Flow, FlowMessageKind,
-    FlowStatus, MessageInboxItem, PrincipalKind, Task, TaskStatus, TrackingEscalation,
+    AssignmentTarget, AttentionSeverity, ExecutorMode, FlightLease, FlightLeaseStatus, Flow,
+    FlowMessageKind, FlowStatus, MessageInboxItem, PrincipalKind, RecoveryAction, Task, TaskStatus,
+    TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -162,6 +163,7 @@ enum MouseAction {
     ScanTracker,
     DispatchNotifications,
     AcknowledgeEscalation,
+    RecoverFlight(RecoveryAction),
     CycleActor,
     Quit,
     ConfirmModal,
@@ -178,6 +180,7 @@ enum HitTarget {
     Inbox(usize),
     Principal(usize),
     Timeline(usize),
+    Flight(usize),
     Action(MouseAction),
 }
 
@@ -221,6 +224,10 @@ enum InputPurpose {
     Run {
         task_id: String,
         mode: ExecutorMode,
+    },
+    RecoverFlight {
+        lease_id: String,
+        action: RecoveryAction,
     },
 }
 
@@ -285,7 +292,9 @@ struct UiState {
     inbox_index: usize,
     roster_index: usize,
     timeline_index: usize,
+    flight_index: usize,
     focus_tasks: bool,
+    focus_flights: bool,
     actor_id: Option<String>,
     workspace: PathBuf,
     timeline: Vec<EventEnvelope>,
@@ -329,7 +338,9 @@ impl UiState {
             inbox_index: 0,
             roster_index: 0,
             timeline_index: 0,
+            flight_index: 0,
             focus_tasks: false,
+            focus_flights: false,
             actor_id,
             workspace: options.workspace,
             timeline: Vec::new(),
@@ -398,7 +409,9 @@ impl UiState {
                 Some(HitTarget::Flow(index)) => {
                     self.flow_index = index;
                     self.task_index = 0;
+                    self.flight_index = 0;
                     self.focus_tasks = false;
+                    self.focus_flights = false;
                     self.refresh_timeline(app);
                 }
                 Some(HitTarget::Task(index)) => {
@@ -407,7 +420,18 @@ impl UiState {
                 }
                 Some(HitTarget::Inbox(index)) => self.inbox_index = index,
                 Some(HitTarget::Principal(index)) => self.roster_index = index,
-                Some(HitTarget::Timeline(index)) => self.timeline_index = index,
+                Some(HitTarget::Timeline(index)) => {
+                    self.timeline_index = index;
+                    self.focus_flights = false;
+                }
+                Some(HitTarget::Flight(index)) => {
+                    self.flight_index = index;
+                    self.focus_flights = true;
+                    if let Some(flight) = self.selected_flight(app) {
+                        self.message = flight_selection_summary(app, flight);
+                        self.message_is_error = false;
+                    }
+                }
                 Some(HitTarget::Action(action)) => {
                     return self.handle_mouse_action(app, action).await;
                 }
@@ -465,6 +489,7 @@ impl UiState {
             MouseAction::ScanTracker => self.scan_tracker(app, true),
             MouseAction::DispatchNotifications => self.dispatch_notification_now(app),
             MouseAction::AcknowledgeEscalation => self.acknowledge_next_inbox(app),
+            MouseAction::RecoverFlight(action) => self.open_recovery_input(app, action),
             MouseAction::CycleActor => self.cycle_actor(app),
             MouseAction::Quit => return Ok(self.request_quit()),
             MouseAction::ConfirmModal => self.submit_modal(app).await,
@@ -479,6 +504,8 @@ impl UiState {
         match target {
             Some(HitTarget::Flow(_)) => self.focus_tasks = false,
             Some(HitTarget::Task(_)) => self.focus_tasks = true,
+            Some(HitTarget::Timeline(_)) => self.focus_flights = false,
+            Some(HitTarget::Flight(_)) => self.focus_flights = true,
             _ => {}
         }
     }
@@ -653,6 +680,14 @@ impl UiState {
                 .reject_flow_change(&request_id, &actor, value)
                 .map(|change| format!("{} 已驳回，正式 Flow 保持不变", change.id)),
             InputPurpose::Run { .. } => unreachable!(),
+            InputPurpose::RecoverFlight { lease_id, action } => app
+                .recover_remote_flight(&lease_id, &actor, action, value, None, None, 3_600)
+                .map(|child| {
+                    child.map_or_else(
+                        || format!("{lease_id} 已转人工或停飞，监督决定已进入黑匣子"),
+                        |child| format!("{lease_id} 已复飞为 {} · A{}", child.id, child.attempt),
+                    )
+                }),
         };
         match result {
             Ok(message) => {
@@ -689,7 +724,9 @@ impl UiState {
                     .unwrap_or_else(|| initial_flow_index(app));
                 self.task_index = 0;
                 self.inbox_index = 0;
+                self.flight_index = 0;
                 self.focus_tasks = false;
+                self.focus_flights = false;
                 self.view = View::Overview;
                 self.refresh_timeline(app);
                 self.success("Showcase 机队已进场：3 条 Flow 就位，塔台已聚焦 LLM Gateway 风险");
@@ -721,7 +758,15 @@ impl UiState {
                 self.roster_index = shifted(self.roster_index, app.state().principals.len(), delta);
             }
             View::Timeline => {
-                self.timeline_index = shifted(self.timeline_index, self.timeline.len(), delta);
+                if self.focus_flights {
+                    self.flight_index = shifted(
+                        self.flight_index,
+                        self.remote_flights(app).len().min(5),
+                        delta,
+                    );
+                } else {
+                    self.timeline_index = shifted(self.timeline_index, self.timeline.len(), delta);
+                }
             }
         }
     }
@@ -1250,6 +1295,40 @@ impl UiState {
         });
     }
 
+    fn open_recovery_input(&mut self, app: &MambaApp, action: RecoveryAction) {
+        let Some(flight) = self.selected_flight(app) else {
+            self.failure(MambaError::Validation(
+                "请先在 Flight Deck 选择一架航班".into(),
+            ));
+            return;
+        };
+        if flight.status != FlightLeaseStatus::Crashed {
+            self.failure(MambaError::InvalidTransition(
+                "只有坠机航班可以进入这条恢复航线".into(),
+            ));
+            return;
+        }
+        let Some(actor) = self.actor_name(app) else {
+            self.failure(MambaError::Validation("请先选择 Human 操作人".into()));
+            return;
+        };
+        match app.recovery_options(&flight.id, actor) {
+            Ok(options) if options.contains(&action) => {
+                self.modal = Some(InputModal {
+                    purpose: InputPurpose::RecoverFlight {
+                        lease_id: flight.id.clone(),
+                        action,
+                    },
+                    value: String::new(),
+                });
+            }
+            Ok(_) => self.failure(MambaError::PermissionDenied(
+                "FlightManifest 不允许这项恢复动作".into(),
+            )),
+            Err(error) => self.failure(error),
+        }
+    }
+
     fn launch_flight(
         &mut self,
         app: &MambaApp,
@@ -1365,6 +1444,29 @@ impl UiState {
             .and_then(|id| app.state().flows.get(id))
     }
 
+    fn remote_flights<'a>(&self, app: &'a MambaApp) -> Vec<&'a FlightLease> {
+        let selected_flow = self.selected_flow(app).map(|flow| flow.id.as_str());
+        let mut flights = app
+            .state()
+            .flight_leases
+            .values()
+            .filter(|flight| selected_flow.is_none_or(|flow_id| flight.flow_id == flow_id))
+            .collect::<Vec<_>>();
+        flights.sort_by_key(|flight| {
+            Reverse(
+                flight
+                    .finished_at
+                    .or(flight.claimed_at)
+                    .unwrap_or(flight.issued_at),
+            )
+        });
+        flights
+    }
+
+    fn selected_flight<'a>(&self, app: &'a MambaApp) -> Option<&'a FlightLease> {
+        self.remote_flights(app).get(self.flight_index).copied()
+    }
+
     fn inbox_items<'a>(&self, app: &'a MambaApp) -> Vec<(&'a Flow, &'a Task)> {
         self.actor_name(app)
             .and_then(|actor| app.inbox(actor).ok())
@@ -1430,6 +1532,9 @@ impl UiState {
         self.inbox_index = self
             .inbox_index
             .min(self.inbox_items(app).len().saturating_sub(1));
+        self.flight_index = self
+            .flight_index
+            .min(self.remote_flights(app).len().min(5).saturating_sub(1));
     }
 
     fn success(&mut self, message: impl Into<String>) {
@@ -2616,7 +2721,7 @@ fn render_timeline(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area:
     render_flights(frame, app, state, flights_area);
 }
 
-fn render_flights(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect) {
+fn render_flights(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
     let selected_flow = state.selected_flow(app).map(|flow| flow.id.as_str());
     let mut items = Vec::new();
     if let Some(planning) = &state.active_planning {
@@ -2665,21 +2770,14 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect
             }),
     );
 
-    let mut leases = app
-        .state()
-        .flight_leases
-        .values()
-        .filter(|lease| selected_flow.is_none_or(|flow_id| lease.flow_id == flow_id))
+    let remote_item_offset = items.len();
+    let leases = state
+        .remote_flights(app)
+        .into_iter()
+        .take(5)
         .collect::<Vec<_>>();
-    leases.sort_by_key(|lease| {
-        Reverse(
-            lease
-                .finished_at
-                .or(lease.claimed_at)
-                .unwrap_or(lease.issued_at),
-        )
-    });
-    items.extend(leases.into_iter().take(5).map(|lease| {
+    let remote_count = leases.len();
+    items.extend(leases.into_iter().map(|lease| {
         let (marker, label, color) = match lease.status {
             FlightLeaseStatus::Authorized => ("○", "CLEARED", GOLD),
             FlightLeaseStatus::Active => ("●", "AIRBORNE", ORANGE),
@@ -2687,21 +2785,65 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect
             FlightLeaseStatus::Crashed => ("✕", "CRASHED", RED),
             FlightLeaseStatus::Revoked => ("−", "REVOKED", MUTED),
         };
+        let resources = lease
+            .manifest
+            .as_ref()
+            .map_or(0, |manifest| manifest.resources.len());
+        let active_resources = app
+            .state()
+            .resource_leases
+            .values()
+            .filter(|resource| {
+                resource.flight_lease_id == lease.id
+                    && resource.status == crate::domain::ResourceLeaseStatus::Active
+            })
+            .count();
+        let fuel = lease.manifest.as_ref().map_or_else(
+            || "FUEL legacy manifest".to_string(),
+            |manifest| {
+                let usage = lease.report.as_ref().map(|report| &report.fuel);
+                format!(
+                    "FUEL {}s/{}s · CTX {}/{}",
+                    usage.map_or(0, |fuel| fuel.duration_seconds),
+                    manifest.fuel.max_duration_seconds,
+                    format_bytes(usage.map_or(0, |fuel| fuel.context_bytes)),
+                    format_bytes(manifest.fuel.max_context_bytes),
+                )
+            },
+        );
+        let failure = lease.report.as_ref().and_then(|report| {
+            report
+                .budget_exhaustions
+                .first()
+                .cloned()
+                .or_else(|| report.failure_class.map(|class| format!("{class:?}")))
+        });
         ListItem::new(Text::from(vec![
             Line::from(vec![
                 Span::styled(format!("{marker} {label} "), Style::new().fg(color).bold()),
                 Span::styled(lease.executor.to_string(), Style::new().fg(CYAN)),
+                Span::styled(format!("  A{}", lease.attempt), Style::new().fg(GOLD)),
             ]),
             Line::from(vec![
                 Span::styled(format!("  {}  ", lease.task_id), Style::new().fg(TEXT)),
                 Span::styled(lease.principal_name.clone(), Style::new().fg(MUTED)),
             ]),
-            Line::styled(
-                format!("  {} · by {}", lease.id, lease.authorized_by),
-                Style::new().fg(MUTED),
-            ),
+            Line::styled(format!("  {fuel}"), Style::new().fg(MUTED)),
+            Line::from(vec![
+                Span::styled(
+                    format!("  LEASE {active_resources}/{resources} · {}", lease.id),
+                    Style::new().fg(MUTED),
+                ),
+                Span::styled(
+                    failure
+                        .map(|failure| format!(" · {}", compact_summary(&failure, 22)))
+                        .unwrap_or_default(),
+                    Style::new().fg(RED),
+                ),
+            ]),
         ]))
     }));
+    register_flight_rows(area, remote_item_offset, remote_count, state);
 
     let mut records = app
         .state()
@@ -2760,11 +2902,23 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &UiState, area: Rect
             Line::styled("需要写入时点击执行", Style::new().fg(TEXT)),
         ])));
     }
-    frame.render_widget(
+    let mut list_state = ListState::default();
+    if remote_count > 0 {
+        list_state.select(Some(
+            remote_item_offset + state.flight_index.min(remote_count - 1),
+        ));
+    }
+    frame.render_stateful_widget(
         List::new(items)
-            .block(panel_block("FLIGHT DECK / 航班", false))
+            .block(panel_block(
+                "FLIGHT DECK / MANIFEST · FUEL",
+                state.focus_flights,
+            ))
+            .highlight_style(Style::new().bg(PANEL_ALT).fg(TEXT).bold())
+            .highlight_symbol("▸ ")
             .highlight_spacing(HighlightSpacing::Always),
         area,
+        &mut list_state,
     );
 }
 
@@ -2823,7 +2977,15 @@ fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
             ("验收", MouseAction::Complete),
         ],
         View::Roster => vec![("切换球权", MouseAction::CycleActor)],
-        View::Timeline => vec![],
+        View::Timeline => state
+            .selected_flight(app)
+            .filter(|flight| flight.status == FlightLeaseStatus::Crashed)
+            .zip(state.actor_name(app))
+            .and_then(|(flight, actor)| app.recovery_options(&flight.id, actor).ok())
+            .into_iter()
+            .flatten()
+            .filter_map(recovery_button)
+            .collect(),
     };
     if state.view == View::Overview && app.state().organization.is_none() {
         actions.insert(0, ("SHOWCASE", MouseAction::LoadShowcase));
@@ -2939,6 +3101,19 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
             match mode {
                 ExecutorMode::Plan => CYAN,
                 ExecutorMode::Execute => ORANGE,
+            },
+        ),
+        InputPurpose::RecoverFlight { action, .. } => (
+            "BLACK BOX / 坠机处置",
+            format!(
+                "{}；输入本次监督决定的理由，确认后写入因果链",
+                recovery_action_label(*action)
+            ),
+            match action {
+                RecoveryAction::Retry | RecoveryAction::ReduceScope => ORANGE,
+                RecoveryAction::HumanHandoff => GOLD,
+                RecoveryAction::Ground => RED,
+                RecoveryAction::SwitchExecutor | RecoveryAction::Fork => PURPLE,
             },
         ),
     };
@@ -3159,6 +3334,28 @@ fn register_list_rows(
     }
 }
 
+fn register_flight_rows(area: Rect, preceding_items: usize, count: usize, state: &mut UiState) {
+    let first_row = area
+        .y
+        .saturating_add(1)
+        .saturating_add((preceding_items as u16).saturating_mul(3));
+    for index in 0..count {
+        let y = first_row.saturating_add((index as u16).saturating_mul(4));
+        if y >= area.bottom().saturating_sub(1) {
+            break;
+        }
+        state.register_hit(
+            Rect::new(
+                area.x.saturating_add(1),
+                y,
+                area.width.saturating_sub(2),
+                4.min(area.bottom().saturating_sub(1).saturating_sub(y)),
+            ),
+            HitTarget::Flight(index),
+        );
+    }
+}
+
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
@@ -3178,6 +3375,10 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::ScanTracker => ORANGE,
         MouseAction::DispatchNotifications => CYAN,
         MouseAction::AcknowledgeEscalation => GOLD,
+        MouseAction::RecoverFlight(RecoveryAction::Retry | RecoveryAction::ReduceScope) => ORANGE,
+        MouseAction::RecoverFlight(RecoveryAction::HumanHandoff) => GOLD,
+        MouseAction::RecoverFlight(RecoveryAction::Ground) => RED,
+        MouseAction::RecoverFlight(RecoveryAction::SwitchExecutor | RecoveryAction::Fork) => PURPLE,
         MouseAction::CycleActor => PURPLE,
         MouseAction::ConfirmModal => GREEN,
         MouseAction::CancelModal => MUTED,
@@ -3289,6 +3490,60 @@ fn compact_summary(value: &str, max_chars: usize) -> String {
         summary.push('…');
     }
     summary
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1}M", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{:.1}K", bytes as f64 / 1_024.0)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+fn flight_selection_summary(app: &MambaApp, flight: &FlightLease) -> String {
+    let objective = flight
+        .manifest
+        .as_ref()
+        .map(|manifest| compact_summary(&manifest.objective, 42))
+        .unwrap_or_else(|| "legacy flight".into());
+    let active_resources = app
+        .state()
+        .resource_leases
+        .values()
+        .filter(|resource| {
+            resource.flight_lease_id == flight.id
+                && resource.status == crate::domain::ResourceLeaseStatus::Active
+        })
+        .count();
+    format!(
+        "{} · A{} · {} · {} active resource lease(s)",
+        flight.id, flight.attempt, objective, active_resources
+    )
+}
+
+fn recovery_action_label(action: RecoveryAction) -> &'static str {
+    match action {
+        RecoveryAction::Retry => "沿原航线复飞",
+        RecoveryAction::SwitchExecutor => "更换执行终端复飞",
+        RecoveryAction::ReduceScope => "缩小目标与上下文后复飞",
+        RecoveryAction::HumanHandoff => "把球权交还 Human",
+        RecoveryAction::Ground => "永久停飞",
+        RecoveryAction::Fork => "从黑匣子分叉新航班",
+    }
+}
+
+fn recovery_button(action: RecoveryAction) -> Option<(&'static str, MouseAction)> {
+    let label = match action {
+        RecoveryAction::Retry => "原地复飞",
+        RecoveryAction::ReduceScope => "缩小航线",
+        RecoveryAction::HumanHandoff => "转人工",
+        RecoveryAction::Ground => "永久停飞",
+        RecoveryAction::Fork => "分叉复飞",
+        RecoveryAction::SwitchExecutor => return None,
+    };
+    Some((label, MouseAction::RecoverFlight(action)))
 }
 
 fn shifted(current: usize, len: usize, delta: isize) -> usize {
@@ -3698,6 +3953,59 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("FLIGHT DECK"));
         assert!(content.contains("CLEARED"));
+        assert!(content.contains("CRASHED"));
+        assert!(content.contains("FUEL"));
+
+        let crashed_flight = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Flight(0))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(crashed_flight))
+            .await
+            .unwrap();
+        assert!(state.focus_flights);
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let handoff = state
+            .hit_regions
+            .iter()
+            .find(|region| {
+                region.target
+                    == HitTarget::Action(MouseAction::RecoverFlight(RecoveryAction::HumanHandoff))
+            })
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(handoff))
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.modal.as_ref().map(|modal| &modal.purpose),
+            Some(InputPurpose::RecoverFlight {
+                action: RecoveryAction::HumanHandoff,
+                ..
+            })
+        ));
+        state.paste("交给安全负责人确认 Secret 轮换边界".into());
+        terminal
+            .draw(|frame| render(frame, &app, &mut state))
+            .unwrap();
+        let confirm = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::ConfirmModal))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(confirm))
+            .await
+            .unwrap();
+        assert!(state.modal.is_none());
+        assert_eq!(app.state().flight_recoveries.len(), 1);
 
         state.view = View::Roster;
         terminal

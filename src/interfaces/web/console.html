@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MambaFlow Tower</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/console/assets/console.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand"><span class="brand-mark">24</span><div><strong>MambaFlow</strong><small>ORGANIZATION TOWER</small></div></div>
+      <nav aria-label="控制台导航">
+        <a href="#overview" class="active">组织总览</a>
+        <a href="#actions">待办处置</a>
+        <a href="#flows">Flow 航线</a>
+        <a href="#flights">Flight Deck</a>
+      </nav>
+      <div class="rail-foot"><span class="live-dot"></span><span id="service-state">CONTROL PLANE</span></div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div><p class="eyebrow">塔台工作台</p><h1 id="org-name">MambaFlow</h1></div>
+        <div class="top-actions">
+          <span id="identity" class="identity">未连接</span>
+          <button id="refresh" type="button">刷新</button>
+          <button id="logout" type="button" class="quiet">退出身份</button>
+        </div>
+      </header>
+
+      <main>
+        <p id="status" class="status" role="status">等待连接塔台</p>
+
+        <section id="overview" class="band">
+          <div class="section-head"><div><p class="eyebrow">实时战况</p><h2>组织总览</h2></div><time id="generated-at"></time></div>
+          <div id="metrics" class="metrics" aria-live="polite"></div>
+        </section>
+
+        <section class="demand-strip" aria-labelledby="demand-title">
+          <div><p class="eyebrow">DEMAND INTAKE</p><h2 id="demand-title">发起一条新 Flow</h2></div>
+          <form id="demand-form">
+            <label><span>管理需求</span><input id="demand-summary" name="summary" required maxlength="4000" placeholder="例如：本周完成 LLM Gateway 的灰度发布"></label>
+            <label><span>PRD 规划器</span><select id="demand-planner" name="planner"><option value="local">Local</option><option value="codex">Codex</option><option value="claude_code">Claude Code</option></select></label>
+            <button type="submit" class="primary">生成 PRD</button>
+          </form>
+        </section>
+
+        <section id="actions" class="band">
+          <div class="section-head"><div><p class="eyebrow">HUMAN GATES</p><h2>待办处置</h2></div><span id="action-count" class="count"></span></div>
+          <div class="table-wrap"><table><thead><tr><th>优先级</th><th>任务</th><th>负责人</th><th>原因</th><th>P80</th><th></th></tr></thead><tbody id="action-rows"></tbody></table></div>
+        </section>
+
+        <section id="flows" class="band">
+          <div class="section-head"><div><p class="eyebrow">ONE TEAM · ONE FLOW</p><h2>Flow 航线</h2></div><span id="flow-count" class="count"></span></div>
+          <div class="table-wrap"><table><thead><tr><th>健康度</th><th>需求</th><th>发起人</th><th>进度</th><th>P80</th><th></th></tr></thead><tbody id="flow-rows"></tbody></table></div>
+        </section>
+
+        <section id="flights" class="band flight-band">
+          <div class="section-head"><div><p class="eyebrow">BLACK BOX / FUEL / LEASE</p><h2>Flight Deck</h2></div><span id="flight-count" class="count"></span></div>
+          <div id="flight-list" class="flight-list"></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="auth-dialog">
+    <form id="auth-form" method="dialog" class="dialog-form">
+      <p class="eyebrow">BEARER IDENTITY</p><h2>连接组织塔台</h2>
+      <label><span>Principal Token</span><input id="token" type="password" autocomplete="off" required placeholder="mmb_..."></label>
+      <p class="dialog-note">Token 仅保留在当前浏览器标签页。</p>
+      <button type="submit" class="primary">进入塔台</button>
+    </form>
+  </dialog>
+
+  <dialog id="recovery-dialog">
+    <form id="recovery-form" class="dialog-form">
+      <p class="eyebrow">SUPERVISION TREE</p><h2>坠机处置</h2>
+      <p id="recovery-flight" class="dialog-note"></p>
+      <label><span>恢复动作</span><select id="recovery-action" required></select></label>
+      <label id="executor-field" hidden><span>替换执行器</span><select id="recovery-executor"><option value="codex">Codex</option><option value="claude_code">Claude Code</option></select></label>
+      <label><span>新目标（可选）</span><input id="recovery-objective" maxlength="4000"></label>
+      <label><span>Human 决策理由</span><textarea id="recovery-reason" required maxlength="1000"></textarea></label>
+      <div class="dialog-actions"><button type="button" id="recovery-cancel" class="quiet">取消</button><button type="submit" class="primary">写入黑匣子</button></div>
+    </form>
+  </dialog>
+
+  <script src="/console/assets/console.js" defer></script>
+</body>
+</html>
