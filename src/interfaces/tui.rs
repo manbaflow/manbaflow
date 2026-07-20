@@ -3035,7 +3035,13 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
                     .unwrap_or_else(|| "host".into());
                 format!("BOX {} · {} · {image}", sandbox.backend, sandbox.network)
             })
-            .unwrap_or_else(|| "BOX legacy".into());
+            .unwrap_or_else(|| {
+                if lease.report.is_some() {
+                    "BOX legacy".into()
+                } else {
+                    "BOX pending".into()
+                }
+            });
         ListItem::new(Text::from(vec![
             Line::from(vec![
                 Span::styled(format!("{marker} {label} "), Style::new().fg(color).bold()),

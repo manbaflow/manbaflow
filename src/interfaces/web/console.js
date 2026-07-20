@@ -250,12 +250,12 @@ function renderFlights(flights) {
   target.replaceChildren(...flights.map((flight) => {
     const item = element("article", "flight");
     const stateBox = element("div");
-    const image = flight.sandbox_image_id
-      ? flight.sandbox_image_id.replace("sha256:", "").slice(0, 12)
-      : "host";
-    const sandbox = flight.sandbox_backend
-      ? `${flight.sandbox_backend}/${flight.sandbox_network || "unknown"}/${image}`
-      : "legacy";
+    const image = flight.sandbox_image_id?.replace("sha256:", "").slice(0, 12);
+    const sandbox = flight.sandbox_backend === "legacy"
+      ? "legacy"
+      : flight.sandbox_backend
+        ? `${flight.sandbox_backend}/${flight.sandbox_network || "unknown"}/${image || "host"}`
+        : "pending";
     stateBox.append(element("span", `badge ${flight.status}`, flight.status), element("p", "", `A${flight.attempt || "-"} · ${flight.capability_pack || "local"} · ${flight.executor} · ${sandbox}`));
     const identity = element("div");
     identity.append(element("h3", "", flight.objective || flight.task_id), element("p", "", `${flight.principal} · ${flight.id}`));

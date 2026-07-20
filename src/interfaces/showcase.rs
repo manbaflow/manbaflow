@@ -5,9 +5,10 @@ use serde::Serialize;
 
 use crate::MambaApp;
 use crate::domain::{
-    CapabilityPack, ExecutorConfig, ExecutorKind, ExternalInteractionAction, FailureClass,
-    FlightManifestDraft, Flow, FlowMessageKind, GitLabWritePayload, OfficeBodyType, OfficeProvider,
-    OfficeReleasePayload, PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskStatus,
+    CapabilityPack, ExecutionSandboxReport, ExecutorConfig, ExecutorKind,
+    ExternalInteractionAction, FailureClass, FlightManifestDraft, Flow, FlowMessageKind,
+    GitLabWritePayload, OfficeBodyType, OfficeProvider, OfficeReleasePayload, PrincipalKind,
+    RemoteFlightReport, TargetKind, Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::planner::PlannerKind;
@@ -223,7 +224,18 @@ pub async fn seed_showcase(
             budget_exhaustions: Vec::new(),
             deliverables: Vec::new(),
             contract_violations: Vec::new(),
-            sandbox: None,
+            sandbox: Some(ExecutionSandboxReport {
+                backend: "docker".into(),
+                image: Some("manbaflow-agent-runtime:0.1.0".into()),
+                image_id: Some(format!("sha256:{}", "7".repeat(64))),
+                network: "none".into(),
+                root_read_only: true,
+                user: Some("10001:10001".into()),
+                cpus_millis: Some(2_000),
+                memory_bytes: Some(4 * 1024 * 1024 * 1024),
+                pids_limit: Some(256),
+                forwarded_environment: Vec::new(),
+            }),
         },
     )?;
     let command_message_id = if app.state().principal("佐巴扬").is_ok() {
@@ -469,6 +481,14 @@ mod tests {
         assert_eq!(dashboard.metrics.pending_gitlab_writes, 1);
         assert_eq!(dashboard.gitlab_writes.len(), 1);
         assert_eq!(dashboard.metrics.open_flights, 1);
+        assert!(dashboard.flights.iter().any(|flight| {
+            flight.sandbox_backend.as_deref() == Some("docker")
+                && flight.sandbox_network.as_deref() == Some("none")
+                && flight
+                    .sandbox_image_id
+                    .as_deref()
+                    .is_some_and(|image| image.starts_with("sha256:"))
+        }));
         assert_eq!(app.state().external_interactions.len(), 1);
         assert_eq!(
             app.state()

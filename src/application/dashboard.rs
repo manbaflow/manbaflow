@@ -375,11 +375,13 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
                     .as_ref()
                     .map(|report| report.contract_violations.clone())
                     .unwrap_or_default(),
-                sandbox_backend: lease
-                    .report
-                    .as_ref()
-                    .and_then(|report| report.sandbox.as_ref())
-                    .map(|sandbox| sandbox.backend.clone()),
+                sandbox_backend: lease.report.as_ref().map(|report| {
+                    report
+                        .sandbox
+                        .as_ref()
+                        .map(|sandbox| sandbox.backend.clone())
+                        .unwrap_or_else(|| "legacy".into())
+                }),
                 sandbox_image_id: lease
                     .report
                     .as_ref()

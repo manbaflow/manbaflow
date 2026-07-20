@@ -2557,7 +2557,7 @@ fn dashboard_text(dashboard: &DashboardSnapshot) -> String {
                 "{}\t{}\t{}\t{}\t{}\t{}",
                 flight.status,
                 flight.executor,
-                flight.sandbox_backend.as_deref().unwrap_or("legacy"),
+                flight.sandbox_backend.as_deref().unwrap_or("pending"),
                 flight.principal,
                 flight.task_id,
                 flight.id
