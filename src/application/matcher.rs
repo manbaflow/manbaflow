@@ -239,6 +239,7 @@ mod tests {
             Principal {
                 id: "P-1".into(),
                 name: "Engineer".into(),
+                directory_username: None,
                 kind: PrincipalKind::Human,
                 team_id: None,
                 owner_id: None,
@@ -254,6 +255,7 @@ mod tests {
             Principal {
                 id: "A-1".into(),
                 name: "Codex".into(),
+                directory_username: None,
                 kind: PrincipalKind::Agent,
                 team_id: None,
                 owner_id: Some("P-1".into()),
@@ -290,6 +292,7 @@ mod tests {
                 Principal {
                     id: id.into(),
                     name: name.into(),
+                    directory_username: None,
                     kind: PrincipalKind::Human,
                     team_id: None,
                     owner_id: None,

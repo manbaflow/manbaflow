@@ -20,6 +20,7 @@ clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
 hmac = "0.13"
 native-tls = "0.2"
+openidconnect = "4.0.1"
 postgres = "0.19.14"
 postgres-native-tls = "0.5.3"
 ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }

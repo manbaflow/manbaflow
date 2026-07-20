@@ -1,6 +1,7 @@
 const API = "/api/v1";
 const state = {
   token: sessionStorage.getItem("mambaflow_token") || "",
+  authenticated: false,
   dashboard: null,
   recoveryFlight: null,
 };
@@ -29,7 +30,7 @@ function setStatus(message, error = false) {
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  headers.set("Authorization", `Bearer ${state.token}`);
+  if (state.token) headers.set("Authorization", `Bearer ${state.token}`);
   if (options.body) headers.set("Content-Type", "application/json");
   const response = await fetch(`${API}${path}`, { ...options, headers });
   if (!response.ok) {
@@ -51,10 +52,6 @@ function openAuth() {
 }
 
 async function loadDashboard(showMessage = true) {
-  if (!state.token) {
-    openAuth();
-    return;
-  }
   try {
     if (showMessage) setStatus("正在同步 Flow Ledger...");
     const [me, organization, dashboard] = await Promise.all([
@@ -63,6 +60,7 @@ async function loadDashboard(showMessage = true) {
       api("/dashboard"),
     ]);
     state.dashboard = dashboard;
+    state.authenticated = true;
     $("#identity").textContent = `${me.name} · ${me.kind}`;
     $("#org-name").textContent = organization.organization.name;
     $("#service-state").textContent = `${organization.tenant.name} · ONLINE`;
@@ -307,12 +305,21 @@ $("#auth-form").addEventListener("submit", async (event) => {
 });
 
 $("#auth-dialog").addEventListener("cancel", (event) => {
-  if (!state.token) event.preventDefault();
+  if (!state.authenticated) event.preventDefault();
+});
+
+$("#oidc-login").addEventListener("click", () => {
+  const tenant = $("#sso-tenant").value.trim();
+  const query = new URLSearchParams({ return_to: "/console" });
+  if (tenant) query.set("tenant", tenant);
+  window.location.assign(`/auth/oidc/login?${query}`);
 });
 
 $("#refresh").addEventListener("click", () => loadDashboard());
-$("#logout").addEventListener("click", () => {
+$("#logout").addEventListener("click", async () => {
+  await fetch("/auth/logout", { method: "POST" });
   state.token = "";
+  state.authenticated = false;
   sessionStorage.removeItem("mambaflow_token");
   $("#identity").textContent = "未连接";
   openAuth();
@@ -368,5 +375,5 @@ document.querySelectorAll(".rail nav a").forEach((link) => {
 
 loadDashboard();
 setInterval(() => {
-  if (state.token && !document.hidden) loadDashboard(false);
+  if (state.authenticated && !document.hidden) loadDashboard(false);
 }, 15000);

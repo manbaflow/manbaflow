@@ -26,13 +26,37 @@ impl MambaApp {
         actor: &str,
         ttl_days: u32,
     ) -> Result<IssuedCredential> {
-        self.state.organization()?;
-        self.ensure_permission(actor, Permission::CredentialManage)?;
         if !(1..=365).contains(&ttl_days) {
             return Err(MambaError::Validation(
                 "credential TTL must be between 1 and 365 days".into(),
             ));
         }
+        self.issue_credential_until(
+            target,
+            label,
+            actor,
+            Utc::now() + Duration::days(i64::from(ttl_days)),
+        )
+    }
+
+    pub fn issue_oidc_session(&mut self, target: &str) -> Result<IssuedCredential> {
+        self.issue_credential_until(
+            target,
+            "OIDC browser session",
+            "tower://oidc",
+            Utc::now() + Duration::hours(8),
+        )
+    }
+
+    fn issue_credential_until(
+        &mut self,
+        target: &str,
+        label: &str,
+        actor: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<IssuedCredential> {
+        self.state.organization()?;
+        self.ensure_permission(actor, Permission::CredentialManage)?;
         let principal = self.state.principal(target)?.clone();
         let label = label.trim();
         if label.is_empty() || label.chars().count() > 80 {
@@ -53,7 +77,7 @@ impl MambaApp {
             principal_id: principal.id,
             label: label.to_string(),
             created_at,
-            expires_at: Some(created_at + Duration::days(i64::from(ttl_days))),
+            expires_at: Some(expires_at),
             revoked_at: None,
         };
         self.store.insert_credential(
@@ -139,6 +163,36 @@ impl MambaApp {
             .get(&principal_id)
             .filter(|principal| principal.active)
             .cloned())
+    }
+
+    pub fn revoke_oidc_session(&mut self, token: &str) -> Result<()> {
+        if !valid_api_token(token) {
+            return Err(MambaError::PermissionDenied("invalid OIDC session".into()));
+        }
+        let token_hash = credential_hash(token);
+        let Some((credential_id, principal_id)) =
+            self.store.authenticate_credential(&token_hash)?
+        else {
+            return Ok(());
+        };
+        let Some(credential) = self.state.credentials.get(&credential_id) else {
+            return Ok(());
+        };
+        if credential.principal_id != principal_id || !credential.label.starts_with("OIDC ") {
+            return Err(MambaError::PermissionDenied(
+                "credential is not an OIDC browser session".into(),
+            ));
+        }
+        let revoked_at = Utc::now();
+        self.commit(
+            "tower://oidc",
+            vec![DomainEvent::ApiCredentialRevoked {
+                credential_id: credential_id.clone(),
+                principal_id,
+                revoked_at,
+            }],
+        )?;
+        self.store.revoke_credential(&credential_id, revoked_at)
     }
 }
 

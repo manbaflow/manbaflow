@@ -4,11 +4,12 @@ pub mod core;
 pub mod interfaces;
 
 pub use adapters::{
-    capability, executor, gitlab, interaction, migration, notification, store, tenant, worktree,
+    capability, executor, gitlab, identity, interaction, migration, notification, store, tenant,
+    worktree,
 };
 pub use application::{app, dashboard, matcher, planner, scheduler};
 pub use core::{calendar, domain, error, event, ids, state};
-pub use interfaces::{console, server, showcase, tui, worker};
+pub use interfaces::{console, scim, server, showcase, tui, worker};
 
 pub use app::MambaApp;
 pub use error::{MambaError, Result};

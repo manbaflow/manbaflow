@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use chrono::{DateTime, Utc};
@@ -29,6 +29,7 @@ use crate::domain::{
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
+use crate::identity::{OidcProvider, ScimAuthenticator};
 use crate::interaction::{
     ExternalInteractionInput, InteractionWebhookAuth, parse_slack_interaction, slack_delivery_id,
 };
@@ -49,8 +50,11 @@ pub struct ServerOptions {
 #[derive(Clone)]
 struct ApiState {
     app: Arc<Mutex<MambaApp>>,
+    tenant_id: String,
     gitlab_webhook_auth: Option<GitLabWebhookAuth>,
     interaction_auth: InteractionWebhookAuth,
+    oidc: Option<OidcProvider>,
+    scim_auth: ScimAuthenticator,
 }
 
 #[derive(Clone)]
@@ -143,6 +147,58 @@ impl From<MambaError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(json!({ "error": self.message }))).into_response()
+    }
+}
+
+#[derive(Debug)]
+struct ScimApiError {
+    status: StatusCode,
+    detail: String,
+    scim_type: Option<&'static str>,
+}
+
+impl From<MambaError> for ScimApiError {
+    fn from(error: MambaError) -> Self {
+        let (status, scim_type) = match &error {
+            MambaError::NotFound { .. } => (StatusCode::NOT_FOUND, None),
+            MambaError::PermissionDenied(_) => (StatusCode::FORBIDDEN, None),
+            MambaError::Validation(message)
+                if message.contains("already") || message.contains("provisioned") =>
+            {
+                (StatusCode::CONFLICT, Some("uniqueness"))
+            }
+            MambaError::Validation(_) => (StatusCode::BAD_REQUEST, Some("invalidValue")),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, None),
+        };
+        let detail = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            "internal directory provisioning error".into()
+        } else {
+            error.to_string()
+        };
+        Self {
+            status,
+            detail,
+            scim_type,
+        }
+    }
+}
+
+impl IntoResponse for ScimApiError {
+    fn into_response(self) -> Response {
+        let body = crate::scim::error(self.status.as_u16(), self.detail, self.scim_type);
+        let mut response = (
+            self.status,
+            [(header::CONTENT_TYPE, "application/scim+json")],
+            Json(body),
+        )
+            .into_response();
+        if self.status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                "Bearer realm=\"MambaFlow SCIM\"".parse().unwrap(),
+            );
+        }
+        response
     }
 }
 
@@ -382,18 +438,37 @@ struct GitLabWebhookResponse {
     changed_tasks: usize,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct OidcLoginQuery {
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default = "default_oidc_return_to")]
+    return_to: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OidcCallbackQuery {
+    code: String,
+    state: String,
+}
+
 pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
     validate_server_options(&options)?;
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
     let interaction_auth = InteractionWebhookAuth::from_env()?;
+    let oidc = OidcProvider::from_env().await?;
+    let scim_auth = ScimAuthenticator::from_env()?;
     let listener = TcpListener::bind(options.bind).await?;
     announce_server(&options, &gitlab_webhook_auth, &interaction_auth, 1);
     let app = Arc::new(Mutex::new(app));
     spawn_tracker(app.clone(), &options);
     spawn_notification_dispatcher(app.clone(), &options);
-    axum::serve(listener, router(app, gitlab_webhook_auth, interaction_auth))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        router_with_identity(app, gitlab_webhook_auth, interaction_auth, oidc, scim_auth),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -419,6 +494,8 @@ pub async fn run_fleet(
     };
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
     let interaction_auth = InteractionWebhookAuth::from_env()?;
+    let oidc = OidcProvider::from_env().await?;
+    let scim_auth = ScimAuthenticator::from_env()?;
     let mut routers = BTreeMap::new();
 
     for record in catalog.active()? {
@@ -448,7 +525,13 @@ pub async fn run_fleet(
         spawn_notification_dispatcher(app.clone(), &options);
         routers.insert(
             record.id,
-            router(app, gitlab_webhook_auth.clone(), interaction_auth.clone()),
+            router_with_identity(
+                app,
+                gitlab_webhook_auth.clone(),
+                interaction_auth.clone(),
+                oidc.clone(),
+                scim_auth.clone(),
+            ),
         );
     }
 
@@ -477,7 +560,20 @@ async fn fleet_dispatch(State(state): State<FleetState>, request: Request) -> Re
         .headers()
         .get("x-mamba-tenant")
         .and_then(|value| value.to_str().ok());
-    let token_tenant = bearer_token(request.headers()).and_then(crate::app::tenant_token_hint);
+    let token_tenant = bearer_token(request.headers())
+        .or_else(|| cookie_value(request.headers(), "mamba_session"))
+        .and_then(crate::app::tenant_token_hint);
+    let login_tenant = if request.uri().path() == "/auth/oidc/login" {
+        request.uri().query().and_then(|query| {
+            serde_urlencoded::from_str::<BTreeMap<String, String>>(query)
+                .ok()
+                .and_then(|values| values.get("tenant").cloned())
+        })
+    } else if request.uri().path() == "/auth/oidc/callback" {
+        cookie_value(request.headers(), "mamba_login_tenant").map(str::to_string)
+    } else {
+        None
+    };
     if token_tenant.is_some() && header_tenant.is_some() && token_tenant != header_tenant {
         return (
             StatusCode::BAD_REQUEST,
@@ -487,6 +583,7 @@ async fn fleet_dispatch(State(state): State<FleetState>, request: Request) -> Re
     }
     let tenant_id = token_tenant
         .or(header_tenant)
+        .or(login_tenant.as_deref())
         .unwrap_or(&state.default_tenant_id);
     let Some(router) = state.routers.get(tenant_id) else {
         return ApiError::unauthorized().into_response();
@@ -538,16 +635,44 @@ fn announce_server(
     }
 }
 
+#[cfg(test)]
 fn router(
     app: Arc<Mutex<MambaApp>>,
     gitlab_webhook_auth: Option<GitLabWebhookAuth>,
     interaction_auth: InteractionWebhookAuth,
 ) -> Router {
-    let rate_limit = RateLimitState::default();
-    let state = ApiState {
+    router_with_identity(
         app,
         gitlab_webhook_auth,
         interaction_auth,
+        None,
+        ScimAuthenticator::default(),
+    )
+}
+
+fn router_with_identity(
+    app: Arc<Mutex<MambaApp>>,
+    gitlab_webhook_auth: Option<GitLabWebhookAuth>,
+    interaction_auth: InteractionWebhookAuth,
+    oidc: Option<OidcProvider>,
+    scim_auth: ScimAuthenticator,
+) -> Router {
+    let rate_limit = RateLimitState::default();
+    let tenant_id = app
+        .try_lock()
+        .expect("new API router must not hold the application lock")
+        .state()
+        .tenant
+        .as_ref()
+        .map(|tenant| tenant.id.clone())
+        .unwrap_or_default();
+    let state = ApiState {
+        app,
+        tenant_id,
+        gitlab_webhook_auth,
+        interaction_auth,
+        oidc,
+        scim_auth,
     };
     Router::new()
         .route("/console", get(crate::console::index))
@@ -559,6 +684,31 @@ fn router(
         .route("/health", get(health))
         .route("/health/live", get(health))
         .route("/health/ready", get(readiness))
+        .route("/auth/oidc/login", get(oidc_login))
+        .route("/auth/oidc/callback", get(oidc_callback))
+        .route("/auth/logout", post(oidc_logout))
+        .route("/scim/v2/Users", get(scim_users).post(scim_create_user))
+        .route(
+            "/scim/v2/Users/{id}",
+            get(scim_user)
+                .put(scim_replace_user)
+                .patch(scim_patch_user)
+                .delete(scim_delete_user),
+        )
+        .route("/scim/v2/Groups", get(scim_groups).post(scim_create_group))
+        .route(
+            "/scim/v2/Groups/{id}",
+            get(scim_group)
+                .put(scim_replace_group)
+                .patch(scim_patch_group)
+                .delete(scim_delete_group),
+        )
+        .route(
+            "/scim/v2/ServiceProviderConfig",
+            get(scim_service_provider_config),
+        )
+        .route("/scim/v2/ResourceTypes", get(scim_resource_types))
+        .route("/scim/v2/Schemas", get(scim_schemas))
         .route("/metrics", get(metrics))
         .route("/api/v1/me", get(me))
         .route("/api/v1/organization", get(organization))
@@ -654,6 +804,7 @@ async fn refresh_shared_ledger(
     next: middleware::Next,
 ) -> Response {
     let needs_state = request.uri().path().starts_with("/api/")
+        || request.uri().path().starts_with("/scim/")
         || matches!(request.uri().path(), "/metrics" | "/health/ready");
     if needs_state {
         let mut app = state.app.lock().await;
@@ -681,6 +832,10 @@ async fn request_guard(
         .headers()
         .get(header::AUTHORIZATION)
         .map(|value| Sha256::digest(value.as_bytes()).into())
+        .or_else(|| {
+            cookie_value(request.headers(), "mamba_session")
+                .map(|value| Sha256::digest(value.as_bytes()).into())
+        })
         .unwrap_or_else(|| Sha256::digest(b"anonymous").into());
     if !rate_limit.allow(key, Instant::now()) {
         let mut response = (
@@ -768,6 +923,400 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "mambaflow-control-plane",
     })
+}
+
+async fn oidc_login(
+    State(state): State<ApiState>,
+    Query(query): Query<OidcLoginQuery>,
+) -> ApiResult<Response> {
+    let provider = state.oidc.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "OIDC login is not configured".into(),
+    })?;
+    let app = state.app.lock().await;
+    let tenant_id = &app.state().tenant()?.id;
+    if query
+        .tenant
+        .as_deref()
+        .is_some_and(|value| value != tenant_id)
+    {
+        return Err(ApiError::unauthorized());
+    }
+    let login = provider.begin_login(tenant_id, &query.return_to).await?;
+    let mut response = Redirect::temporary(&login.authorization_url).into_response();
+    let secure = if provider.secure_cookie() {
+        "; Secure"
+    } else {
+        ""
+    };
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "mamba_login_tenant={}; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
+            login.tenant_id
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not establish OIDC login state".into(),
+        })?,
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "mamba_oidc_state={}; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
+            login.state_cookie
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not establish OIDC state cookie".into(),
+        })?,
+    );
+    Ok(response)
+}
+
+async fn oidc_callback(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<OidcCallbackQuery>,
+) -> ApiResult<Response> {
+    let provider = state.oidc.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "OIDC login is not configured".into(),
+    })?;
+    let state_cookie =
+        cookie_value(&headers, "mamba_oidc_state").ok_or_else(ApiError::unauthorized)?;
+    let identity = provider
+        .complete_login(&query.code, &query.state, state_cookie)
+        .await?;
+    let mut app = state.app.lock().await;
+    if app.state().tenant()?.id != identity.tenant_id {
+        return Err(ApiError::unauthorized());
+    }
+    let principal = app.oidc_principal(&identity.subject)?;
+    let session = app.issue_oidc_session(&principal.id)?;
+    let mut response = Redirect::to(&identity.return_to).into_response();
+    let secure = if provider.secure_cookie() {
+        "; Secure"
+    } else {
+        ""
+    };
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "mamba_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800{secure}",
+            session.token
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not establish OIDC session".into(),
+        })?,
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "mamba_oidc_state=; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not clear OIDC state cookie".into(),
+        })?,
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "mamba_login_tenant=; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not clear OIDC login state".into(),
+        })?,
+    );
+    Ok(response)
+}
+
+async fn oidc_logout(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Response> {
+    if let Some(token) = cookie_value(&headers, "mamba_session") {
+        state.app.lock().await.revoke_oidc_session(token)?;
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        "mamba_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+            .parse()
+            .unwrap(),
+    );
+    Ok(response)
+}
+
+async fn scim_users(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<crate::scim::ListQuery>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let app = state.app.lock().await;
+    scim_json(StatusCode::OK, crate::scim::list_users(&app, &query)?)
+}
+
+async fn scim_user(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let app = state.app.lock().await;
+    scim_json(StatusCode::OK, crate::scim::get_user(&app, &id)?)
+}
+
+async fn scim_create_user(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::scim::UserInput>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let mut app = state.app.lock().await;
+    scim_json(
+        StatusCode::CREATED,
+        crate::scim::create_user(&mut app, input)?,
+    )
+}
+
+async fn scim_replace_user(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<crate::scim::UserInput>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let mut app = state.app.lock().await;
+    scim_json(
+        StatusCode::OK,
+        crate::scim::replace_user(&mut app, &id, input)?,
+    )
+}
+
+async fn scim_patch_user(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<crate::scim::PatchRequest>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let mut app = state.app.lock().await;
+    scim_json(
+        StatusCode::OK,
+        crate::scim::patch_user(&mut app, &id, input)?,
+    )
+}
+
+async fn scim_delete_user(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let mut app = state.app.lock().await;
+    crate::scim::delete_user(&mut app, &id)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn scim_groups(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<crate::scim::ListQuery>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let app = state.app.lock().await;
+    scim_json(StatusCode::OK, crate::scim::list_groups(&app, &query)?)
+}
+
+async fn scim_group(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let app = state.app.lock().await;
+    scim_json(StatusCode::OK, crate::scim::get_group(&app, &id)?)
+}
+
+async fn scim_create_group(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::scim::GroupInput>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let mut app = state.app.lock().await;
+    scim_json(
+        StatusCode::CREATED,
+        crate::scim::create_group(&mut app, input)?,
+    )
+}
+
+async fn scim_replace_group(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<crate::scim::GroupInput>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let mut app = state.app.lock().await;
+    scim_json(
+        StatusCode::OK,
+        crate::scim::replace_group(&mut app, &id, input)?,
+    )
+}
+
+async fn scim_patch_group(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<crate::scim::PatchRequest>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let mut app = state.app.lock().await;
+    scim_json(
+        StatusCode::OK,
+        crate::scim::patch_group(&mut app, &id, input)?,
+    )
+}
+
+async fn scim_delete_group(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    let mut app = state.app.lock().await;
+    crate::scim::delete_group(&mut app, &id)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn scim_service_provider_config(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    scim_json(
+        StatusCode::OK,
+        json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
+            "patch": {"supported": true},
+            "bulk": {"supported": false, "maxOperations": 0, "maxPayloadSize": 0},
+            "filter": {"supported": true, "maxResults": 200},
+            "changePassword": {"supported": false},
+            "sort": {"supported": false},
+            "etag": {"supported": false},
+            "authenticationSchemes": [{
+                "type": "oauthbearertoken",
+                "name": "Bearer Token",
+                "description": "Tenant-scoped SCIM provisioning token",
+                "primary": true
+            }]
+        }),
+    )
+}
+
+async fn scim_resource_types(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    scim_json(
+        StatusCode::OK,
+        json!({
+            "schemas": [crate::scim::LIST_SCHEMA],
+            "totalResults": 2,
+            "startIndex": 1,
+            "itemsPerPage": 2,
+            "Resources": [
+                {
+                    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ResourceType"],
+                    "id": "User",
+                    "name": "User",
+                    "endpoint": "/Users",
+                    "schema": crate::scim::USER_SCHEMA
+                },
+                {
+                    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ResourceType"],
+                    "id": "Group",
+                    "name": "Group",
+                    "endpoint": "/Groups",
+                    "schema": crate::scim::GROUP_SCHEMA
+                }
+            ]
+        }),
+    )
+}
+
+async fn scim_schemas(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ScimApiError> {
+    authorize_scim(&state, &headers)?;
+    scim_json(
+        StatusCode::OK,
+        json!({
+            "schemas": [crate::scim::LIST_SCHEMA],
+            "totalResults": 2,
+            "startIndex": 1,
+            "itemsPerPage": 2,
+            "Resources": [
+                {
+                    "id": crate::scim::USER_SCHEMA,
+                    "name": "User",
+                    "description": "MambaFlow Human Principal",
+                    "attributes": [
+                        {"name": "userName", "type": "string", "multiValued": false, "required": true, "uniqueness": "server"},
+                        {"name": "displayName", "type": "string", "multiValued": false, "required": false},
+                        {"name": "active", "type": "boolean", "multiValued": false, "required": false}
+                    ]
+                },
+                {
+                    "id": crate::scim::GROUP_SCHEMA,
+                    "name": "Group",
+                    "description": "MambaFlow Team",
+                    "attributes": [
+                        {"name": "displayName", "type": "string", "multiValued": false, "required": true},
+                        {"name": "members", "type": "complex", "multiValued": true, "required": false}
+                    ]
+                }
+            ]
+        }),
+    )
+}
+
+fn authorize_scim(state: &ApiState, headers: &HeaderMap) -> std::result::Result<(), ScimApiError> {
+    let token = bearer_token(headers).ok_or_else(scim_unauthorized)?;
+    if !state.scim_auth.enabled() || !state.scim_auth.verify(&state.tenant_id, token) {
+        return Err(scim_unauthorized());
+    }
+    Ok(())
+}
+
+fn scim_unauthorized() -> ScimApiError {
+    ScimApiError {
+        status: StatusCode::UNAUTHORIZED,
+        detail: "missing or invalid SCIM bearer token".into(),
+        scim_type: None,
+    }
+}
+
+fn scim_json<T: Serialize>(
+    status: StatusCode,
+    value: T,
+) -> std::result::Result<Response, ScimApiError> {
+    Ok((
+        status,
+        [(header::CONTENT_TYPE, "application/scim+json")],
+        Json(value),
+    )
+        .into_response())
 }
 
 async fn readiness(State(state): State<ApiState>) -> Response {
@@ -1694,9 +2243,24 @@ async fn deliver_notification_batch(
 }
 
 fn authenticate(app: &MambaApp, headers: &HeaderMap) -> ApiResult<Principal> {
-    let token = bearer_token(headers).ok_or_else(ApiError::unauthorized)?;
+    let token = bearer_token(headers)
+        .or_else(|| cookie_value(headers, "mamba_session"))
+        .ok_or_else(ApiError::unauthorized)?;
     app.authenticate_api_token(token)?
         .ok_or_else(ApiError::unauthorized)
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(str::trim)
+        .find_map(|value| {
+            let (key, value) = value.split_once('=')?;
+            (key == name && !value.is_empty()).then_some(value)
+        })
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1722,6 +2286,10 @@ fn default_lease_ttl_seconds() -> u64 {
 
 fn default_credential_ttl_days() -> u32 {
     30
+}
+
+fn default_oidc_return_to() -> String {
+    "/console".into()
 }
 
 fn default_capacity_percent() -> u8 {
@@ -1848,6 +2416,113 @@ mod tests {
             fleet.oneshot(conflict).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn scim_provisioning_is_authenticated_and_deactivation_revokes_sessions() {
+        let directory = tempdir().unwrap();
+        let mut app = MambaApp::open(directory.path()).unwrap();
+        app.init_organization("Mamba", "admin").unwrap();
+        let shared = Arc::new(Mutex::new(app));
+        let scim_token = "scim-test-token-with-more-than-thirty-two-characters";
+        let service = router_with_identity(
+            shared.clone(),
+            None,
+            InteractionWebhookAuth::default(),
+            None,
+            ScimAuthenticator::new(scim_token).unwrap(),
+        );
+        let user_body = json!({
+            "schemas": [crate::scim::USER_SCHEMA],
+            "userName": "pilot@example.com",
+            "displayName": "Pilot",
+            "externalId": "subject-42",
+            "active": true
+        });
+        let unauthorized = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/scim/v2/Users")
+                    .header(header::CONTENT_TYPE, "application/scim+json")
+                    .body(Body::from(serde_json::to_vec(&user_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let created = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/scim/v2/Users")
+                    .header(header::AUTHORIZATION, format!("Bearer {scim_token}"))
+                    .header(header::CONTENT_TYPE, "application/scim+json")
+                    .body(Body::from(serde_json::to_vec(&user_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(
+            created.headers()[header::CONTENT_TYPE],
+            "application/scim+json"
+        );
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let user = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        let user_id = user["id"].as_str().unwrap();
+        let session = {
+            let mut app = shared.lock().await;
+            let principal = app.oidc_principal("subject-42").unwrap();
+            app.issue_oidc_session(&principal.id).unwrap()
+        };
+        let me = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/me")
+                    .header(header::COOKIE, format!("mamba_session={}", session.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(me.status(), StatusCode::OK);
+
+        let disabled = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/scim/v2/Users/{user_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {scim_token}"))
+                    .header(header::CONTENT_TYPE, "application/scim+json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "schemas": [crate::scim::PATCH_SCHEMA],
+                            "Operations": [{"op": "replace", "path": "active", "value": false}]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+        let denied = service
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/me")
+                    .header(header::COOKIE, format!("mamba_session={}", session.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
     }
 
     fn tenant_app(data_dir: std::path::PathBuf, name: &str) -> (MambaApp, String, String) {

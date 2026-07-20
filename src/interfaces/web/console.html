@@ -68,6 +68,8 @@
   <dialog id="auth-dialog">
     <form id="auth-form" method="dialog" class="dialog-form">
       <p class="eyebrow">BEARER IDENTITY</p><h2>连接组织塔台</h2>
+      <label><span>Tenant ID（SSO 可选）</span><input id="sso-tenant" autocomplete="organization" placeholder="TEN-xxxxxxxx"></label>
+      <button id="oidc-login" type="button">企业 SSO</button>
       <label><span>Principal Token</span><input id="token" type="password" autocomplete="off" required placeholder="mmb_..."></label>
       <p class="dialog-note">Token 仅保留在当前浏览器标签页。</p>
       <button type="submit" class="primary">进入塔台</button>

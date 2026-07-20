@@ -76,6 +76,43 @@ impl OrganizationState {
             DomainEvent::TeamCreated { team } => {
                 self.teams.insert(team.id.clone(), team.clone());
             }
+            DomainEvent::TeamDirectoryUpdated {
+                team_id,
+                name,
+                external_id,
+                active,
+                ..
+            } => {
+                if self
+                    .teams
+                    .values()
+                    .any(|team| team.id != *team_id && team.name.eq_ignore_ascii_case(name))
+                {
+                    return Err(MambaError::Validation(format!(
+                        "team already exists: {name}"
+                    )));
+                }
+                if external_id.as_ref().is_some_and(|external_id| {
+                    self.teams.values().any(|team| {
+                        team.id != *team_id
+                            && team.directory_external_id.as_ref() == Some(external_id)
+                    })
+                }) {
+                    return Err(MambaError::Validation(
+                        "directory Group externalId already exists".into(),
+                    ));
+                }
+                let team = self
+                    .teams
+                    .get_mut(team_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "team",
+                        id: team_id.clone(),
+                    })?;
+                team.name = name.clone();
+                team.directory_external_id = external_id.clone();
+                team.active = *active;
+            }
             DomainEvent::PrincipalRegistered { principal } => {
                 self.principals
                     .insert(principal.id.clone(), principal.clone());
@@ -84,6 +121,47 @@ impl OrganizationState {
                     .or_insert_with(|| {
                         WorkCalendar::always_available(principal.id.clone(), principal.created_at)
                     });
+            }
+            DomainEvent::PrincipalDirectoryUpdated {
+                principal_id,
+                name,
+                user_name,
+                team_id,
+                active,
+                ..
+            } => {
+                if let Some(team_id) = team_id {
+                    self.team(team_id)?;
+                }
+                if self.principals.values().any(|principal| {
+                    principal.id != *principal_id && principal.name.eq_ignore_ascii_case(name)
+                }) {
+                    return Err(MambaError::Validation(format!(
+                        "principal already exists: {name}"
+                    )));
+                }
+                if self.principals.values().any(|principal| {
+                    principal.id != *principal_id
+                        && principal
+                            .directory_username
+                            .as_deref()
+                            .is_some_and(|current| current.eq_ignore_ascii_case(user_name))
+                }) {
+                    return Err(MambaError::Validation(format!(
+                        "directory userName already exists: {user_name}"
+                    )));
+                }
+                let principal =
+                    self.principals
+                        .get_mut(principal_id)
+                        .ok_or_else(|| MambaError::NotFound {
+                            entity: "principal",
+                            id: principal_id.clone(),
+                        })?;
+                principal.name = name.clone();
+                principal.directory_username = Some(user_name.clone());
+                principal.team_id = team_id.clone();
+                principal.active = *active;
             }
             DomainEvent::RoleGranted { binding } => {
                 let tenant = self.tenant()?;

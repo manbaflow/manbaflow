@@ -24,6 +24,8 @@ pub struct Team {
     pub id: String,
     pub name: String,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub directory_external_id: Option<String>,
     pub active: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -106,6 +108,8 @@ pub struct ExecutorConfig {
 pub struct Principal {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub directory_username: Option<String>,
     pub kind: PrincipalKind,
     pub team_id: Option<String>,
     pub owner_id: Option<String>,

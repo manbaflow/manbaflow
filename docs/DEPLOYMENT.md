@@ -2,7 +2,7 @@
 
 这份手册覆盖两种数据面：单节点使用一个 `mamba serve` 进程、一个 Tenant Catalog、每个 Tenant 一个
 SQLite Ledger；多副本使用共享 PostgreSQL。远程 Worker 分布在员工工作站。它不是多地域数据库方案，
-也不替代 OIDC/SCIM、容器沙箱或集中 Secret Manager。
+也不替代企业 IdP、TLS 入口、容器沙箱或集中 Secret Manager。
 
 ## 1. 数据目录
 
@@ -58,8 +58,9 @@ mamba --data-dir /var/lib/manbaflow serve \
   --allow-insecure-public-http
 ```
 
-不要把这个端口直接暴露到互联网。MambaFlow 本身尚未终止 TLS，也没有 OIDC 登录。进程内固定窗口
-限流只提供每个 Token/匿名键每分钟 300 次的基础保护，入口仍需配置更严格的按 IP、租户与路由限流。
+不要把这个端口直接暴露到互联网。MambaFlow 本身不终止 TLS；OIDC 和 SCIM 都要求由可信 TLS 入口
+保护。进程内固定窗口限流只提供每个 Token/匿名键每分钟 300 次的基础保护，入口仍需配置更严格的按
+IP、租户与路由限流。
 
 仓库根目录的 `Dockerfile` 使用多阶段构建，最终进程以 UID `10001` 的非 root 用户运行，并把
 `/var/lib/manbaflow` 声明为持久卷。默认容器命令已经包含非 loopback HTTP 的显式确认，只能部署在
@@ -78,6 +79,10 @@ mamba --data-dir /var/lib/manbaflow principal token issue \
 路由 ID 不授予权限，完整 Token 仍必须在目标 Ledger 通过摘要校验。到期或撤销后，数据库查询和事件状态
 都会拒绝鉴权。Connector URL、签名 Secret、GitLab Token 仍只通过环境变量注入。环境文件应
 由服务用户独占，不要写进 Git、命令参数或 Flow 消息。
+
+浏览器 SSO 使用 OIDC Authorization Code Flow、S256 PKCE、state 和 nonce。SCIM 负责在登录前创建
+Human、分配 Team 和 `member` 角色，并在离职时停用账号；OIDC 不会因为看到一个新 `sub` 就自动创建
+组织成员。完整配置和 IdP 字段映射见 [企业身份接入](IDENTITY.md)。
 
 ## 4. 健康检查与指标
 
@@ -140,7 +145,7 @@ Secret 不在数据库内，灾备环境必须从 Secret Manager 单独恢复。
 ## 7. 当前限制
 
 - SQLite 模式仍只支持单个写进程；PostgreSQL 模式支持多个 Control Plane 副本；
-- 没有 OIDC、SCIM、集中策略引擎和分布式限流；
+- 没有集中策略引擎和分布式限流；
 - Remote Worker 使用 Git worktree 隔离，不是容器或虚拟机安全边界；
 - Office Pack 只生成待 Human 发布的本地草稿，不直接写 Microsoft 365 或 Google Workspace；
 - GitLab 连接器不创建、评论、合并 MR。

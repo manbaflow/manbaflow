@@ -28,8 +28,25 @@ pub enum DomainEvent {
     TeamCreated {
         team: Team,
     },
+    TeamDirectoryUpdated {
+        team_id: String,
+        name: String,
+        external_id: Option<String>,
+        active: bool,
+        updated_by: String,
+        updated_at: DateTime<Utc>,
+    },
     PrincipalRegistered {
         principal: Principal,
+    },
+    PrincipalDirectoryUpdated {
+        principal_id: String,
+        name: String,
+        user_name: String,
+        team_id: Option<String>,
+        active: bool,
+        updated_by: String,
+        updated_at: DateTime<Utc>,
     },
     RoleGranted {
         binding: RoleBinding,
@@ -324,7 +341,9 @@ impl DomainEvent {
             Self::TenantInitialized { .. } => "tenant.initialized",
             Self::OrganizationInitialized { .. } => "organization.initialized",
             Self::TeamCreated { .. } => "team.created",
+            Self::TeamDirectoryUpdated { .. } => "team.directory_updated",
             Self::PrincipalRegistered { .. } => "principal.registered",
+            Self::PrincipalDirectoryUpdated { .. } => "principal.directory_updated",
             Self::RoleGranted { .. } => "authority.role_granted",
             Self::RoleRevoked { .. } => "authority.role_revoked",
             Self::ExternalIdentityBound { .. } => "external_identity.bound",
@@ -430,7 +449,9 @@ impl DomainEvent {
             Self::TenantInitialized { .. }
             | Self::OrganizationInitialized { .. }
             | Self::TeamCreated { .. }
+            | Self::TeamDirectoryUpdated { .. }
             | Self::PrincipalRegistered { .. }
+            | Self::PrincipalDirectoryUpdated { .. }
             | Self::RoleGranted { .. }
             | Self::RoleRevoked { .. }
             | Self::ExternalIdentityBound { .. }

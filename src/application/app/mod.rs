@@ -28,6 +28,7 @@ mod authority;
 mod calendars;
 mod commit;
 mod credentials;
+mod directory;
 mod flights;
 mod interactions;
 mod messages;
@@ -208,6 +209,7 @@ impl MambaApp {
             id: new_id("TEAM"),
             name: name.trim().to_string(),
             capabilities: parse_capabilities([capabilities.to_string()]),
+            directory_external_id: None,
             active: true,
             created_at: Utc::now(),
         };
@@ -293,6 +295,7 @@ impl MambaApp {
                 PrincipalKind::Agent => "AGT",
             }),
             name: name.trim().to_string(),
+            directory_username: None,
             kind,
             team_id,
             owner_id,

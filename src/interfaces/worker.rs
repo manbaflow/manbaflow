@@ -1239,6 +1239,7 @@ printf '%s\n' '{"thread_id":"execute-thread"}'
         Principal {
             id: "AGT-1".into(),
             name: "Remote Codex".into(),
+            directory_username: None,
             kind: PrincipalKind::Agent,
             team_id: Some("TEAM-1".into()),
             owner_id: Some("HUM-1".into()),
