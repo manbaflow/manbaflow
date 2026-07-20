@@ -22,14 +22,15 @@ use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
     AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, FlightManifestDraft,
-    Flow, FlowChangeRequest, FlowMessage, FlowMessageKind, IssuedCredential, MessageInboxItem,
-    NotificationConnector, NotificationDelivery, NotificationEndpoint, OfficeProvider,
-    OfficeReleasePayload, OfficeReleaseRequest, Organization, OrganizationRole, Principal,
-    PrincipalKind, RecoveryAction, RemoteFlightReport, RoleBinding, Task, Team, Tenant,
-    TrackingEscalation, WorkCalendar, Workday,
+    Flow, FlowChangeRequest, FlowMessage, FlowMessageKind, GitLabWritePayload, GitLabWriteRequest,
+    IssuedCredential, MessageInboxItem, NotificationConnector, NotificationDelivery,
+    NotificationEndpoint, OfficeProvider, OfficeReleasePayload, OfficeReleaseRequest, Organization,
+    OrganizationRole, Principal, PrincipalKind, RecoveryAction, RemoteFlightReport, RoleBinding,
+    Task, Team, Tenant, TrackingEscalation, WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
+use crate::gitlab_write::GitLabWriteBridge;
 use crate::identity::{OidcProvider, ScimAuthenticator};
 use crate::interaction::{
     ExternalInteractionInput, InteractionWebhookAuth, parse_slack_interaction, slack_delivery_id,
@@ -58,6 +59,7 @@ struct ApiState {
     oidc: Option<OidcProvider>,
     scim_auth: ScimAuthenticator,
     office_bridge: OfficeBridge,
+    gitlab_write_bridge: GitLabWriteBridge,
 }
 
 #[derive(Clone)]
@@ -478,6 +480,23 @@ struct RejectOfficeReleaseInput {
     reason: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct GitLabWritesQuery {
+    #[serde(default)]
+    flow_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RequestGitLabWriteInput {
+    task_id: String,
+    payload: GitLabWritePayload,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RejectGitLabWriteInput {
+    reason: String,
+}
+
 pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
     validate_server_options(&options)?;
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
@@ -485,13 +504,25 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
     let oidc = OidcProvider::from_env().await?;
     let scim_auth = ScimAuthenticator::from_env()?;
     let office_bridge = OfficeBridge::from_env()?;
+    let gitlab_write_bridge = GitLabWriteBridge::from_env()?;
     let listener = TcpListener::bind(options.bind).await?;
     announce_server(&options, &gitlab_webhook_auth, &interaction_auth, 1);
     let tenant_id = app.state().tenant()?.id.clone();
     let app = Arc::new(Mutex::new(app));
     spawn_tracker(app.clone(), &options);
     spawn_notification_dispatcher(app.clone(), &options);
-    spawn_office_dispatcher(app.clone(), office_bridge.clone(), tenant_id, &options);
+    spawn_office_dispatcher(
+        app.clone(),
+        office_bridge.clone(),
+        tenant_id.clone(),
+        &options,
+    );
+    spawn_gitlab_write_dispatcher(
+        app.clone(),
+        gitlab_write_bridge.clone(),
+        tenant_id,
+        &options,
+    );
     axum::serve(
         listener,
         router_with_identity(
@@ -501,6 +532,7 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
             oidc,
             scim_auth,
             office_bridge,
+            gitlab_write_bridge,
         ),
     )
     .with_graceful_shutdown(shutdown_signal())
@@ -533,6 +565,7 @@ pub async fn run_fleet(
     let oidc = OidcProvider::from_env().await?;
     let scim_auth = ScimAuthenticator::from_env()?;
     let office_bridge = OfficeBridge::from_env()?;
+    let gitlab_write_bridge = GitLabWriteBridge::from_env()?;
     let mut routers = BTreeMap::new();
 
     for record in catalog.active()? {
@@ -566,6 +599,12 @@ pub async fn run_fleet(
             record.id.clone(),
             &options,
         );
+        spawn_gitlab_write_dispatcher(
+            app.clone(),
+            gitlab_write_bridge.clone(),
+            record.id.clone(),
+            &options,
+        );
         routers.insert(
             record.id,
             router_with_identity(
@@ -575,6 +614,7 @@ pub async fn run_fleet(
                 oidc.clone(),
                 scim_auth.clone(),
                 office_bridge.clone(),
+                gitlab_write_bridge.clone(),
             ),
         );
     }
@@ -692,6 +732,7 @@ fn router(
         None,
         ScimAuthenticator::default(),
         OfficeBridge::disabled(),
+        GitLabWriteBridge::disabled(),
     )
 }
 
@@ -702,6 +743,7 @@ fn router_with_identity(
     oidc: Option<OidcProvider>,
     scim_auth: ScimAuthenticator,
     office_bridge: OfficeBridge,
+    gitlab_write_bridge: GitLabWriteBridge,
 ) -> Router {
     let rate_limit = RateLimitState::default();
     let tenant_id = app
@@ -720,6 +762,7 @@ fn router_with_identity(
         oidc,
         scim_auth,
         office_bridge,
+        gitlab_write_bridge,
     };
     Router::new()
         .route("/console", get(crate::console::index))
@@ -854,6 +897,23 @@ fn router_with_identity(
         .route(
             "/api/v1/office/releases/dispatch",
             post(dispatch_office_release),
+        )
+        .route(
+            "/api/v1/gitlab/writes",
+            get(gitlab_writes).post(request_gitlab_write),
+        )
+        .route(
+            "/api/v1/gitlab/writes/{id}/approve",
+            post(approve_gitlab_write),
+        )
+        .route(
+            "/api/v1/gitlab/writes/{id}/reject",
+            post(reject_gitlab_write),
+        )
+        .route("/api/v1/gitlab/writes/{id}/retry", post(retry_gitlab_write))
+        .route(
+            "/api/v1/gitlab/writes/dispatch",
+            post(dispatch_gitlab_write),
         )
         .route(
             "/api/v1/flight-leases/{id}/recovery-options",
@@ -1008,6 +1068,32 @@ fn spawn_office_dispatcher(
                     Ok(None) => break,
                     Err(error) => {
                         eprintln!("Office release dispatch failed: {error}");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_gitlab_write_dispatcher(
+    app: Arc<Mutex<MambaApp>>,
+    bridge: GitLabWriteBridge,
+    tenant_id: String,
+    options: &ServerOptions,
+) {
+    let interval_seconds = options.notification_interval_seconds;
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(interval_seconds));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            loop {
+                match dispatch_gitlab_write_once(&app, &bridge, &tenant_id).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(error) => {
+                        eprintln!("GitLab write dispatch failed: {error}");
                         break;
                     }
                 }
@@ -1484,6 +1570,8 @@ async fn metrics(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult
          # TYPE manbaflow_pending_notifications gauge\nmanbaflow_pending_notifications {}\n\
          # TYPE manbaflow_pending_office_releases gauge\nmanbaflow_pending_office_releases {}\n\
          # TYPE manbaflow_indeterminate_office_releases gauge\nmanbaflow_indeterminate_office_releases {}\n\
+         # TYPE manbaflow_pending_gitlab_writes gauge\nmanbaflow_pending_gitlab_writes {}\n\
+         # TYPE manbaflow_indeterminate_gitlab_writes gauge\nmanbaflow_indeterminate_gitlab_writes {}\n\
          # TYPE manbaflow_ledger_events counter\nmanbaflow_ledger_events {}\n",
         metrics.total_flows,
         metrics.active_flows,
@@ -1493,6 +1581,8 @@ async fn metrics(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult
         metrics.pending_notifications,
         metrics.pending_office_releases,
         metrics.indeterminate_office_releases,
+        metrics.pending_gitlab_writes,
+        metrics.indeterminate_gitlab_writes,
         storage.event_count,
     );
     Ok((
@@ -2304,6 +2394,119 @@ async fn finish_office_dispatch(
     }
 }
 
+async fn gitlab_writes(
+    State(state): State<ApiState>,
+    Query(query): Query<GitLabWritesQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<GitLabWriteRequest>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(
+        app.gitlab_writes(&principal.id, query.flow_id.as_deref())?,
+    ))
+}
+
+async fn request_gitlab_write(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<RequestGitLabWriteInput>,
+) -> ApiResult<Json<GitLabWriteRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.request_gitlab_write(&input.task_id, input.payload, actor)
+    })
+    .await
+}
+
+async fn approve_gitlab_write(
+    State(state): State<ApiState>,
+    Path(write_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<GitLabWriteRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.approve_gitlab_write(&write_id, actor)
+    })
+    .await
+}
+
+async fn reject_gitlab_write(
+    State(state): State<ApiState>,
+    Path(write_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<RejectGitLabWriteInput>,
+) -> ApiResult<Json<GitLabWriteRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.reject_gitlab_write(&write_id, &input.reason, actor)
+    })
+    .await
+}
+
+async fn retry_gitlab_write(
+    State(state): State<ApiState>,
+    Path(write_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<GitLabWriteRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.retry_gitlab_write(&write_id, actor)
+    })
+    .await
+}
+
+async fn dispatch_gitlab_write(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Option<GitLabWriteRequest>>> {
+    {
+        let app = state.app.lock().await;
+        let principal = authenticate(&app, &headers)?;
+        app.authorize_notification_admin(&principal.id)?;
+    }
+    Ok(Json(
+        dispatch_gitlab_write_once(&state.app, &state.gitlab_write_bridge, &state.tenant_id)
+            .await?,
+    ))
+}
+
+async fn dispatch_gitlab_write_once(
+    app: &Arc<Mutex<MambaApp>>,
+    bridge: &GitLabWriteBridge,
+    tenant_id: &str,
+) -> Result<Option<GitLabWriteRequest>> {
+    let request = {
+        let mut app = app.lock().await;
+        app.claim_gitlab_write()?
+    };
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let dispatch_id = request
+        .dispatch_id
+        .as_deref()
+        .ok_or_else(|| MambaError::Validation("claimed GitLab write has no dispatch ID".into()))?
+        .to_string();
+    let outcome = bridge
+        .dispatch(tenant_id, &request)
+        .await
+        .map_err(|error| (error.message, error.indeterminate));
+    finish_gitlab_dispatch(app, &request.id, &dispatch_id, outcome)
+        .await
+        .map(Some)
+}
+
+async fn finish_gitlab_dispatch(
+    app: &Arc<Mutex<MambaApp>>,
+    write_id: &str,
+    dispatch_id: &str,
+    outcome: std::result::Result<crate::domain::GitLabWriteResult, (String, bool)>,
+) -> Result<GitLabWriteRequest> {
+    let mut app = app.lock().await;
+    match app.finish_gitlab_write(write_id, dispatch_id, outcome.clone()) {
+        Err(MambaError::ConcurrentModification { .. }) => {
+            app.finish_gitlab_write(write_id, dispatch_id, outcome)
+        }
+        result => result,
+    }
+}
+
 async fn revoke_flight(
     State(state): State<ApiState>,
     Path(lease_id): Path<String>,
@@ -2740,6 +2943,7 @@ mod tests {
             None,
             ScimAuthenticator::new(scim_token).unwrap(),
             OfficeBridge::disabled(),
+            GitLabWriteBridge::disabled(),
         );
         let user_body = json!({
             "schemas": [crate::scim::USER_SCHEMA],
@@ -3613,6 +3817,65 @@ mod tests {
         assert_eq!(
             dispatched.unwrap().status,
             crate::domain::OfficeReleaseStatus::Failed
+        );
+
+        let requested = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/api/v1/gitlab/writes",
+                &observer_token.token,
+                json!({
+                    "task_id": task_id,
+                    "payload": {
+                        "kind": "create_issue",
+                        "project": "platform/gateway",
+                        "title": "Launch checklist",
+                        "description": "Track rollout evidence.",
+                        "labels": ["delivery"]
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(requested.status(), StatusCode::OK);
+        let body = to_bytes(requested.into_body(), usize::MAX).await.unwrap();
+        let write: GitLabWriteRequest = serde_json::from_slice(&body).unwrap();
+        let denied = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/gitlab/writes/{}/approve", write.id),
+                &observer_token.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let approved = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                &format!("/api/v1/gitlab/writes/{}/approve", write.id),
+                &issued.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+        let dispatched = service
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/api/v1/gitlab/writes/dispatch",
+                &issued.token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dispatched.status(), StatusCode::OK);
+        let body = to_bytes(dispatched.into_body(), usize::MAX).await.unwrap();
+        let dispatched: Option<GitLabWriteRequest> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            dispatched.unwrap().status,
+            crate::domain::GitLabWriteStatus::Failed
         );
 
         let proposed = service

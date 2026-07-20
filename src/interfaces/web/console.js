@@ -74,7 +74,11 @@ async function loadDashboard(showMessage = true) {
 function renderDashboard(dashboard) {
   $("#generated-at").textContent = formatDate(dashboard.generated_at);
   renderMetrics(dashboard.metrics);
-  renderActions(dashboard.action_items, dashboard.office_releases || []);
+  renderActions(
+    dashboard.action_items,
+    dashboard.office_releases || [],
+    dashboard.gitlab_writes || [],
+  );
   renderFlows(dashboard.flows);
   renderFlights(dashboard.flights);
 }
@@ -96,9 +100,10 @@ function renderMetrics(metrics) {
   }));
 }
 
-function renderActions(actions, releases) {
+function renderActions(actions, releases, gitlabWrites) {
   const releaseActions = releases.filter((release) => ["requested", "failed", "indeterminate"].includes(release.status));
-  $("#action-count").textContent = `${actions.length + releaseActions.length} 项`;
+  const gitlabActions = gitlabWrites.filter((request) => ["requested", "failed", "indeterminate"].includes(request.status));
+  $("#action-count").textContent = `${actions.length + releaseActions.length + gitlabActions.length} 项`;
   const rows = actions.map((action) => {
     const row = document.createElement("tr");
     row.append(
@@ -140,6 +145,33 @@ function renderActions(actions, releases) {
     row.append(command);
     return row;
   }));
+  rows.push(...gitlabActions.map((request) => {
+    const row = document.createElement("tr");
+    const reason = request.status === "requested"
+      ? `等待 Human 放行 · ${request.project} · SHA ${request.payload_sha256.slice(0, 12)}`
+      : (request.last_error || "需要先在 GitLab 核对写入结果");
+    row.append(
+      cellBadge(request.status === "requested" ? "high" : "critical"),
+      taskCell(request.summary, request.id),
+      textCell(request.requested_by),
+      textCell(reason),
+      textCell(shortDate(request.requested_at)),
+    );
+    const command = document.createElement("td");
+    if (request.status === "requested") {
+      command.append(
+        button("放行", () => mutateGitLabWrite(request.id, "approve"), "primary"),
+        button("驳回", () => rejectGitLabWrite(request.id), "danger"),
+      );
+    } else {
+      command.append(button(
+        request.status === "indeterminate" ? "已核对，复飞" : "再次放行",
+        () => mutateGitLabWrite(request.id, "retry"),
+      ));
+    }
+    row.append(command);
+    return row;
+  }));
   replaceRows("#action-rows", rows, "当前没有需要 Human 处置的任务", 6);
 }
 
@@ -160,6 +192,27 @@ async function mutateRelease(releaseId, action, body) {
 function rejectRelease(releaseId) {
   const reason = window.prompt("驳回原因");
   if (reason && reason.trim()) mutateRelease(releaseId, "reject", { reason: reason.trim() });
+}
+
+async function mutateGitLabWrite(writeId, action, body) {
+  try {
+    setStatus(`正在处理 GitLab Write ${writeId}...`);
+    await api(`/gitlab/writes/${writeId}/${action}`, {
+      method: "POST",
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    await loadDashboard(false);
+    setStatus(`GitLab Write ${writeId} 已写入 Flow Ledger`);
+  } catch (error) {
+    setStatus(error.message, true);
+  }
+}
+
+function rejectGitLabWrite(writeId) {
+  const reason = window.prompt("驳回原因");
+  if (reason && reason.trim()) {
+    mutateGitLabWrite(writeId, "reject", { reason: reason.trim() });
+  }
 }
 
 function renderFlows(flows) {

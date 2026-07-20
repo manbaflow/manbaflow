@@ -5,11 +5,11 @@ use chrono::{DateTime, Utc};
 use crate::domain::{
     ApiCredential, ExecutionRecord, ExternalIdentityBinding, ExternalInteractionReceipt,
     FlightLease, FlightLeaseStatus, FlightRecoveryDecision, Flow, FlowChangeRequest,
-    FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, NotificationDelivery,
-    NotificationEndpoint, NotificationStatus, OfficeReleaseRequest, OfficeReleaseStatus,
-    Organization, OrganizationRole, Principal, PrincipalKind, ResourceLease, ResourceLeaseStatus,
-    RoleBinding, StagedArtifact, TargetKind, TaskStatus, Team, Tenant, TrackingAttention,
-    TrackingEscalation, WorkCalendar,
+    FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, GitLabWriteRequest,
+    GitLabWriteStatus, NotificationDelivery, NotificationEndpoint, NotificationStatus,
+    OfficeReleaseRequest, OfficeReleaseStatus, Organization, OrganizationRole, Principal,
+    PrincipalKind, ResourceLease, ResourceLeaseStatus, RoleBinding, StagedArtifact, TargetKind,
+    TaskStatus, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -36,6 +36,7 @@ pub struct OrganizationState {
     pub flight_leases: BTreeMap<String, FlightLease>,
     pub staged_artifacts: BTreeMap<String, StagedArtifact>,
     pub office_releases: BTreeMap<String, OfficeReleaseRequest>,
+    pub gitlab_writes: BTreeMap<String, GitLabWriteRequest>,
     pub resource_leases: BTreeMap<String, ResourceLease>,
     pub flight_recoveries: BTreeMap<String, FlightRecoveryDecision>,
     pub attentions: BTreeMap<String, TrackingAttention>,
@@ -1102,6 +1103,160 @@ impl OrganizationState {
                     release.dispatch_started_at = None;
                 }
             }
+            DomainEvent::GitLabWriteRequested { request } => {
+                self.task_mut(&request.flow_id, &request.task_id)?;
+                if request.status != GitLabWriteStatus::Requested
+                    || request.payload_sha256.len() != 64
+                    || !request
+                        .payload_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    || request.reviewed_by.is_some()
+                    || request.dispatch_id.is_some()
+                    || request.result.is_some()
+                {
+                    return Err(MambaError::Validation(format!(
+                        "GitLab write {} has invalid initial state",
+                        request.id
+                    )));
+                }
+                if self.gitlab_writes.contains_key(&request.id) {
+                    return Err(MambaError::Validation(format!(
+                        "GitLab write already exists: {}",
+                        request.id
+                    )));
+                }
+                self.gitlab_writes
+                    .insert(request.id.clone(), request.clone());
+            }
+            DomainEvent::GitLabWriteApproved {
+                flow_id,
+                task_id,
+                write_id,
+                approved_by,
+                approved_at,
+            } => {
+                let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
+                if request.status != GitLabWriteStatus::Requested {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "GitLab write {write_id} is {:?}, expected requested",
+                        request.status
+                    )));
+                }
+                request.status = GitLabWriteStatus::Approved;
+                request.reviewed_by = Some(approved_by.clone());
+                request.reviewed_at = Some(*approved_at);
+                request.review_reason = None;
+            }
+            DomainEvent::GitLabWriteRejected {
+                flow_id,
+                task_id,
+                write_id,
+                rejected_by,
+                reason,
+                rejected_at,
+            } => {
+                let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
+                if request.status != GitLabWriteStatus::Requested {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "GitLab write {write_id} is {:?}, expected requested",
+                        request.status
+                    )));
+                }
+                request.status = GitLabWriteStatus::Rejected;
+                request.reviewed_by = Some(rejected_by.clone());
+                request.reviewed_at = Some(*rejected_at);
+                request.review_reason = Some(reason.clone());
+            }
+            DomainEvent::GitLabWriteDispatchClaimed {
+                flow_id,
+                task_id,
+                write_id,
+                dispatch_id,
+                claimed_at,
+            } => {
+                let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
+                if request.status != GitLabWriteStatus::Approved {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "GitLab write {write_id} is {:?}, expected approved",
+                        request.status
+                    )));
+                }
+                request.status = GitLabWriteStatus::Dispatching;
+                request.dispatch_id = Some(dispatch_id.clone());
+                request.dispatch_started_at = Some(*claimed_at);
+                request.last_error = None;
+            }
+            DomainEvent::GitLabWriteSucceeded {
+                flow_id,
+                task_id,
+                write_id,
+                dispatch_id,
+                result,
+            } => {
+                let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
+                ensure_gitlab_dispatch(request, dispatch_id)?;
+                request.status = GitLabWriteStatus::Written;
+                request.result = Some(result.clone());
+                request.last_error = None;
+            }
+            DomainEvent::GitLabWriteFailed {
+                flow_id,
+                task_id,
+                write_id,
+                dispatch_id,
+                error,
+                indeterminate,
+                ..
+            } => {
+                let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
+                ensure_gitlab_dispatch(request, dispatch_id)?;
+                request.status = if *indeterminate {
+                    GitLabWriteStatus::Indeterminate
+                } else {
+                    GitLabWriteStatus::Failed
+                };
+                request.last_error = Some(error.clone());
+            }
+            DomainEvent::GitLabWriteRetryApproved {
+                flow_id,
+                task_id,
+                write_id,
+                approved_by,
+                approved_at,
+            } => {
+                let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
+                if !matches!(
+                    request.status,
+                    GitLabWriteStatus::Failed | GitLabWriteStatus::Indeterminate
+                ) {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "GitLab write {write_id} is {:?}, expected failed or indeterminate",
+                        request.status
+                    )));
+                }
+                request.status = GitLabWriteStatus::Approved;
+                request.reviewed_by = Some(approved_by.clone());
+                request.reviewed_at = Some(*approved_at);
+                request.dispatch_id = None;
+                request.dispatch_started_at = None;
+                request.last_error = None;
+            }
+            DomainEvent::GitLabWriteDispatchExpired {
+                flow_id,
+                task_id,
+                write_id,
+                dispatch_id,
+                ..
+            } => {
+                let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
+                ensure_gitlab_dispatch(request, dispatch_id)?;
+                request.status = GitLabWriteStatus::Indeterminate;
+                request.last_error = Some(
+                    "Tower restarted during a GitLab write; reconcile with GitLab before approving a retry"
+                        .into(),
+                );
+            }
             DomainEvent::RemoteFlightRevoked {
                 flow_id,
                 task_id,
@@ -1332,6 +1487,27 @@ impl OrganizationState {
         Ok(release)
     }
 
+    fn gitlab_write_mut(
+        &mut self,
+        write_id: &str,
+        flow_id: &str,
+        task_id: &str,
+    ) -> Result<&mut GitLabWriteRequest> {
+        let request = self
+            .gitlab_writes
+            .get_mut(write_id)
+            .ok_or_else(|| MambaError::NotFound {
+                entity: "GitLab write",
+                id: write_id.to_string(),
+            })?;
+        if request.flow_id != flow_id || request.task_id != task_id {
+            return Err(MambaError::Validation(format!(
+                "GitLab write {write_id} does not match flow/task scope"
+            )));
+        }
+        Ok(request)
+    }
+
     fn escalation_mut(
         &mut self,
         escalation_id: &str,
@@ -1408,6 +1584,18 @@ fn ensure_office_dispatch(release: &OfficeReleaseRequest, dispatch_id: &str) -> 
         return Err(MambaError::InvalidTransition(format!(
             "Office release {} is not owned by dispatch {dispatch_id}",
             release.id
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_gitlab_dispatch(request: &GitLabWriteRequest, dispatch_id: &str) -> Result<()> {
+    if request.status != GitLabWriteStatus::Dispatching
+        || request.dispatch_id.as_deref() != Some(dispatch_id)
+    {
+        return Err(MambaError::InvalidTransition(format!(
+            "GitLab write {} is not owned by dispatch {dispatch_id}",
+            request.id
         )));
     }
     Ok(())

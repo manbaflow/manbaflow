@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::MambaApp;
 use crate::domain::{
     CapabilityPack, ExecutorConfig, ExecutorKind, ExternalInteractionAction, FailureClass,
-    FlightManifestDraft, Flow, FlowMessageKind, OfficeBodyType, OfficeProvider,
+    FlightManifestDraft, Flow, FlowMessageKind, GitLabWritePayload, OfficeBodyType, OfficeProvider,
     OfficeReleasePayload, PrincipalKind, RemoteFlightReport, TargetKind, Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
@@ -21,6 +21,7 @@ pub struct ShowcaseSummary {
     pub completed_flow_id: String,
     pub command_message_id: Option<String>,
     pub office_release_id: String,
+    pub gitlab_write_id: String,
     pub flows: Vec<Flow>,
 }
 
@@ -176,6 +177,17 @@ pub async fn seed_showcase(
             ..Default::default()
         },
     )?;
+    let gitlab_write = app.request_gitlab_write(
+        &gateway_core.id,
+        GitLabWritePayload::CreateIssue {
+            project: "platform/llm-gateway".into(),
+            title: "LLM Gateway v0 rollout checklist".into(),
+            description:
+                "Track contract tests, observability, staged rollout and rollback evidence.".into(),
+            labels: vec!["delivery".into(), "mambaflow".into()],
+        },
+        &gateway_actor,
+    )?;
 
     let auth_policy = start_task(app, &gateway.id, "auth-policy")?;
     let (worker, owner, executor) = assigned_agent_and_owner(app, &auth_policy)?;
@@ -289,6 +301,7 @@ pub async fn seed_showcase(
         completed_flow_id: completed.id.clone(),
         command_message_id,
         office_release_id: office_release.id,
+        gitlab_write_id: gitlab_write.id,
         flows: [gateway.id, review.id, completed.id]
             .iter()
             .map(|id| app.state().flow(id).cloned())
@@ -449,9 +462,11 @@ mod tests {
         assert_eq!(showcase.flows.len(), 3);
         assert_eq!(dashboard.metrics.total_flows, 3);
         assert_eq!(dashboard.metrics.blocked_tasks, 1);
-        assert_eq!(dashboard.metrics.awaiting_human, 2);
+        assert_eq!(dashboard.metrics.awaiting_human, 3);
         assert_eq!(dashboard.metrics.pending_office_releases, 1);
         assert_eq!(dashboard.office_releases.len(), 1);
+        assert_eq!(dashboard.metrics.pending_gitlab_writes, 1);
+        assert_eq!(dashboard.gitlab_writes.len(), 1);
         assert_eq!(dashboard.metrics.open_flights, 1);
         assert_eq!(app.state().external_interactions.len(), 1);
         assert_eq!(

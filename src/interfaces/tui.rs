@@ -24,8 +24,8 @@ use crate::MambaApp;
 use crate::dashboard::{ActionPriority, FlowHealth, build_dashboard};
 use crate::domain::{
     AssignmentTarget, AttentionSeverity, ExecutorMode, FlightLease, FlightLeaseStatus, Flow,
-    FlowMessageKind, FlowStatus, MessageInboxItem, OfficeReleaseStatus, PrincipalKind,
-    RecoveryAction, Task, TaskStatus, TrackingEscalation,
+    FlowMessageKind, FlowStatus, GitLabWriteStatus, MessageInboxItem, OfficeReleaseStatus,
+    PrincipalKind, RecoveryAction, Task, TaskStatus, TrackingEscalation,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -163,6 +163,8 @@ enum MouseAction {
     ScanTracker,
     DispatchNotifications,
     ApproveOfficeRelease,
+    ApproveGitLabWrite,
+    RetryGitLabWrite,
     AcknowledgeEscalation,
     RecoverFlight(RecoveryAction),
     CycleActor,
@@ -490,6 +492,8 @@ impl UiState {
             MouseAction::ScanTracker => self.scan_tracker(app, true),
             MouseAction::DispatchNotifications => self.dispatch_notification_now(app),
             MouseAction::ApproveOfficeRelease => self.approve_next_office_release(app),
+            MouseAction::ApproveGitLabWrite => self.approve_next_gitlab_write(app),
+            MouseAction::RetryGitLabWrite => self.retry_next_gitlab_write(app),
             MouseAction::AcknowledgeEscalation => self.acknowledge_next_inbox(app),
             MouseAction::RecoverFlight(action) => self.open_recovery_input(app, action),
             MouseAction::CycleActor => self.cycle_actor(app),
@@ -854,6 +858,67 @@ impl UiState {
             .ok_or_else(|| MambaError::Validation("当前没有待你放行的 Office 发布".into()))
             .and_then(|release_id| app.approve_office_release(&release_id, &actor))
             .map(|release| format!("{} 已由 Human 放行，等待 Tower 发布", release.id));
+        self.finish_action(app, result);
+    }
+
+    fn approve_next_gitlab_write(&mut self, app: &mut MambaApp) {
+        let Some(actor) = self.actor_name(app).map(str::to_string) else {
+            self.failure(MambaError::Validation(
+                "没有可用的 Human 操作人".to_string(),
+            ));
+            return;
+        };
+        let principal = app.state().principal(&actor).ok();
+        let write_id = principal.and_then(|principal| {
+            app.state()
+                .gitlab_writes
+                .values()
+                .filter(|request| request.status == GitLabWriteStatus::Requested)
+                .find(|request| {
+                    app.state().flows.get(&request.flow_id).is_some_and(|flow| {
+                        flow.demand.requester == principal.id
+                            || flow.demand.requester == principal.name
+                    })
+                })
+                .map(|request| request.id.clone())
+        });
+        let result = write_id
+            .ok_or_else(|| MambaError::Validation("当前没有待你放行的 GitLab 写入".into()))
+            .and_then(|write_id| app.approve_gitlab_write(&write_id, &actor))
+            .map(|request| format!("{} 已由 Human 放行，等待 Tower 写入 GitLab", request.id));
+        self.finish_action(app, result);
+    }
+
+    fn retry_next_gitlab_write(&mut self, app: &mut MambaApp) {
+        let Some(actor) = self.actor_name(app).map(str::to_string) else {
+            self.failure(MambaError::Validation(
+                "没有可用的 Human 操作人".to_string(),
+            ));
+            return;
+        };
+        let principal = app.state().principal(&actor).ok();
+        let write_id = principal.and_then(|principal| {
+            app.state()
+                .gitlab_writes
+                .values()
+                .filter(|request| {
+                    matches!(
+                        request.status,
+                        GitLabWriteStatus::Failed | GitLabWriteStatus::Indeterminate
+                    )
+                })
+                .find(|request| {
+                    app.state().flows.get(&request.flow_id).is_some_and(|flow| {
+                        flow.demand.requester == principal.id
+                            || flow.demand.requester == principal.name
+                    })
+                })
+                .map(|request| request.id.clone())
+        });
+        let result = write_id
+            .ok_or_else(|| MambaError::Validation("当前没有可人工复飞的 GitLab 写入".into()))
+            .and_then(|write_id| app.retry_gitlab_write(&write_id, &actor))
+            .map(|request| format!("{} 已确认复飞，等待 Tower 再次写入", request.id));
         self.finish_action(app, result);
     }
 
@@ -2119,6 +2184,59 @@ fn render_action_queue(frame: &mut Frame, app: &MambaApp, area: Rect) {
     let remaining = max_items.saturating_sub(items.len());
     items.extend(
         dashboard
+            .gitlab_writes
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request.status,
+                    GitLabWriteStatus::Requested
+                        | GitLabWriteStatus::Failed
+                        | GitLabWriteStatus::Indeterminate
+                )
+            })
+            .take(remaining)
+            .map(|request| {
+                let (marker, color, reason) = match request.status {
+                    GitLabWriteStatus::Requested => (
+                        "! ",
+                        GOLD,
+                        format!(
+                            "等待 Human 放行 · SHA {}",
+                            request.payload_sha256.chars().take(12).collect::<String>()
+                        ),
+                    ),
+                    GitLabWriteStatus::Failed => (
+                        "!!",
+                        RED,
+                        request
+                            .last_error
+                            .clone()
+                            .unwrap_or_else(|| "GitLab 写入失败".into()),
+                    ),
+                    GitLabWriteStatus::Indeterminate => {
+                        ("??", ORANGE, "GitLab 结果不确定，需核对后人工复飞".into())
+                    }
+                    _ => unreachable!(),
+                };
+                ListItem::new(Text::from(vec![
+                    Line::from(vec![
+                        Span::styled(format!("{marker} "), Style::new().fg(color).bold()),
+                        Span::styled(
+                            compact_summary(&request.summary, 26),
+                            Style::new().fg(TEXT).bold(),
+                        ),
+                        Span::styled(format!("  {}", request.project), Style::new().fg(MUTED)),
+                    ]),
+                    Line::styled(
+                        format!("   {}", compact_summary(&reason, 42)),
+                        Style::new().fg(color),
+                    ),
+                ]))
+            }),
+    );
+    let remaining = max_items.saturating_sub(items.len());
+    items.extend(
+        dashboard
             .action_items
             .iter()
             .take(remaining)
@@ -3112,6 +3230,33 @@ fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
     }) {
         actions.insert(0, ("放行发布", MouseAction::ApproveOfficeRelease));
     }
+    if state.actor_name(app).is_some_and(|actor| {
+        app.state().principal(actor).is_ok_and(|principal| {
+            app.state().gitlab_writes.values().any(|request| {
+                request.status == GitLabWriteStatus::Requested
+                    && app.state().flows.get(&request.flow_id).is_some_and(|flow| {
+                        flow.demand.requester == principal.id
+                            || flow.demand.requester == principal.name
+                    })
+            })
+        })
+    }) {
+        actions.insert(0, ("放行 GitLab", MouseAction::ApproveGitLabWrite));
+    }
+    if state.actor_name(app).is_some_and(|actor| {
+        app.state().principal(actor).is_ok_and(|principal| {
+            app.state().gitlab_writes.values().any(|request| {
+                matches!(
+                    request.status,
+                    GitLabWriteStatus::Failed | GitLabWriteStatus::Indeterminate
+                ) && app.state().flows.get(&request.flow_id).is_some_and(|flow| {
+                    flow.demand.requester == principal.id || flow.demand.requester == principal.name
+                })
+            })
+        })
+    }) {
+        actions.insert(0, ("核对后复飞", MouseAction::RetryGitLabWrite));
+    }
     frame.render_widget(Block::default().style(Style::new().bg(PANEL)), area);
     let mut x = area.x;
     let mut y = area.y;
@@ -3486,6 +3631,8 @@ fn action_color(action: MouseAction) -> Color {
         MouseAction::ScanTracker => ORANGE,
         MouseAction::DispatchNotifications => CYAN,
         MouseAction::ApproveOfficeRelease => GOLD,
+        MouseAction::ApproveGitLabWrite => GOLD,
+        MouseAction::RetryGitLabWrite => ORANGE,
         MouseAction::AcknowledgeEscalation => GOLD,
         MouseAction::RecoverFlight(RecoveryAction::Retry | RecoveryAction::ReduceScope) => ORANGE,
         MouseAction::RecoverFlight(RecoveryAction::HumanHandoff) => GOLD,
@@ -4044,6 +4191,20 @@ mod tests {
         assert_eq!(
             app.state().office_releases[&showcase.office_release_id].status,
             OfficeReleaseStatus::Approved
+        );
+        let gitlab_button = state
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Action(MouseAction::ApproveGitLabWrite))
+            .unwrap()
+            .area;
+        state
+            .handle_mouse(&mut app, mouse_down(gitlab_button))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.state().gitlab_writes[&showcase.gitlab_write_id].status,
+            GitLabWriteStatus::Approved
         );
 
         let compact_backend = TestBackend::new(80, 24);

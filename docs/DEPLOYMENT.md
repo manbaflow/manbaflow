@@ -162,7 +162,7 @@ Artifact 内容。第二次运行必须报告全部 Tenant 为“幂等复核”
 - 没有集中策略引擎和分布式限流；
 - Remote Worker 使用 Git worktree 隔离，不是容器或虚拟机安全边界；
 - Office Bridge 不负责 OAuth Token 获取和刷新；企业必须提供 Credential Broker 和最小 Scope；
-- GitLab 连接器不创建、评论、合并 MR。
+- GitLab Writer 可在 Human Gate 后创建/评论 Issue 和创建/评论 MR；它不提交代码，也不提供 merge 动作。
 
 这些限制需要在上线评审中显式接受。涉及敏感源码、个人数据、受监管数据或不可信 Agent 时，继续使用
 测试环境，直到对应的身份、数据面与执行隔离完成。

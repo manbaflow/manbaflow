@@ -4,8 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    CapabilityPack, FailureClass, FlightLeaseStatus, FlowStatus, NotificationStatus,
-    OfficeReleasePayload, OfficeReleaseStatus, ResourceLeaseStatus, TaskStatus,
+    CapabilityPack, FailureClass, FlightLeaseStatus, FlowStatus, GitLabWritePayload,
+    GitLabWriteStatus, NotificationStatus, OfficeReleasePayload, OfficeReleaseStatus,
+    ResourceLeaseStatus, TaskStatus,
 };
 use crate::state::OrganizationState;
 
@@ -17,6 +18,7 @@ pub struct DashboardSnapshot {
     pub action_items: Vec<DashboardAction>,
     pub flights: Vec<DashboardFlight>,
     pub office_releases: Vec<DashboardOfficeRelease>,
+    pub gitlab_writes: Vec<DashboardGitLabWrite>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +36,8 @@ pub struct DashboardMetrics {
     pub failed_notifications: usize,
     pub pending_office_releases: usize,
     pub indeterminate_office_releases: usize,
+    pub pending_gitlab_writes: usize,
+    pub indeterminate_gitlab_writes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -118,6 +122,22 @@ pub struct DashboardOfficeRelease {
     pub provider: String,
     pub kind: String,
     pub status: OfficeReleaseStatus,
+    pub summary: String,
+    pub payload_sha256: String,
+    pub requested_by: String,
+    pub requested_at: DateTime<Utc>,
+    pub reviewed_by: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DashboardGitLabWrite {
+    pub id: String,
+    pub flow_id: String,
+    pub task_id: String,
+    pub project: String,
+    pub kind: String,
+    pub status: GitLabWriteStatus,
     pub summary: String,
     pub payload_sha256: String,
     pub requested_by: String,
@@ -434,6 +454,57 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
         .collect::<Vec<_>>();
     office_releases.sort_by_key(|release| std::cmp::Reverse(release.requested_at));
 
+    let mut gitlab_writes = state
+        .gitlab_writes
+        .values()
+        .map(|request| {
+            let summary = match &request.payload {
+                GitLabWritePayload::CreateIssue { title, .. } => {
+                    format!("创建 Issue《{title}》")
+                }
+                GitLabWritePayload::CommentIssue {
+                    issue_iid, body, ..
+                } => format!("评论 Issue #{issue_iid}: {body}"),
+                GitLabWritePayload::CreateMergeRequest {
+                    source_branch,
+                    target_branch,
+                    title,
+                    ..
+                } => format!("创建 MR《{title}》 {source_branch} -> {target_branch}"),
+                GitLabWritePayload::CommentMergeRequest {
+                    merge_request_iid,
+                    body,
+                    ..
+                } => format!("评论 MR !{merge_request_iid}: {body}"),
+            };
+            DashboardGitLabWrite {
+                id: request.id.clone(),
+                flow_id: request.flow_id.clone(),
+                task_id: request.task_id.clone(),
+                project: request.payload.project().to_string(),
+                kind: request.payload.action_name().into(),
+                status: request.status,
+                summary,
+                payload_sha256: request.payload_sha256.clone(),
+                requested_by: state
+                    .principals
+                    .get(&request.requested_by)
+                    .map(|principal| principal.name.clone())
+                    .unwrap_or_else(|| request.requested_by.clone()),
+                requested_at: request.requested_at,
+                reviewed_by: request.reviewed_by.as_ref().map(|reviewer| {
+                    state
+                        .principals
+                        .get(reviewer)
+                        .map(|principal| principal.name.clone())
+                        .unwrap_or_else(|| reviewer.clone())
+                }),
+                last_error: request.last_error.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    gitlab_writes.sort_by_key(|request| std::cmp::Reverse(request.requested_at));
+
     let total_tasks = state.flows.values().map(|flow| flow.tasks.len()).sum();
     let completed_tasks = state
         .flows
@@ -458,6 +529,11 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
             .office_releases
             .values()
             .filter(|release| release.status == OfficeReleaseStatus::Requested)
+            .count()
+        + state
+            .gitlab_writes
+            .values()
+            .filter(|request| request.status == GitLabWriteStatus::Requested)
             .count();
     let open_flights = state
         .flight_leases
@@ -500,11 +576,22 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
                 .values()
                 .filter(|release| release.status == OfficeReleaseStatus::Indeterminate)
                 .count(),
+            pending_gitlab_writes: state
+                .gitlab_writes
+                .values()
+                .filter(|request| request.status == GitLabWriteStatus::Requested)
+                .count(),
+            indeterminate_gitlab_writes: state
+                .gitlab_writes
+                .values()
+                .filter(|request| request.status == GitLabWriteStatus::Indeterminate)
+                .count(),
         },
         flows,
         action_items,
         flights,
         office_releases,
+        gitlab_writes,
     }
 }
 

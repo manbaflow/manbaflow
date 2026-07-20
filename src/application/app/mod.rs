@@ -31,6 +31,7 @@ mod commit;
 mod credentials;
 mod directory;
 mod flights;
+mod gitlab_writes;
 mod interactions;
 mod messages;
 mod notifications;
@@ -2682,6 +2683,149 @@ mod tests {
         assert_eq!(
             replayed.state().office_releases[&uncertain.id].status,
             OfficeReleaseStatus::Indeterminate
+        );
+    }
+
+    #[tokio::test]
+    async fn gitlab_write_requires_human_review_recovers_and_replays_artifact() {
+        use crate::domain::{GitLabWritePayload, GitLabWriteResult, GitLabWriteStatus};
+
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("gitlab-write");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Mamba GitLab", "admin").unwrap();
+        let team = app
+            .create_team(
+                "Delivery",
+                "product,planning,documentation,analysis,coordination,review,delivery",
+                "admin",
+            )
+            .unwrap();
+        let requester = app
+            .register_principal(
+                "Delivery Owner",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,planning,documentation,analysis,coordination,review,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let outsider = app
+            .register_principal(
+                "Other Human",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "review",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let flow = app
+            .create_demand(
+                "Ship the gateway release through GitLab",
+                &requester.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        app.approve_flow(&flow.id, &requester.name).unwrap();
+        let task = flow
+            .tasks
+            .iter()
+            .find(|task| {
+                task.assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.owner.id == requester.id)
+            })
+            .unwrap()
+            .clone();
+        app.accept_task(&task.id, &requester.name).unwrap();
+        app.start_task(&task.id, &requester.name).unwrap();
+
+        let payload = GitLabWritePayload::CreateIssue {
+            project: "platform/llm-gateway".into(),
+            title: "Release checklist".into(),
+            description: "Track staged rollout and rollback evidence.".into(),
+            labels: vec!["delivery".into()],
+        };
+        let request = app
+            .request_gitlab_write(&task.id, payload.clone(), &requester.name)
+            .unwrap();
+        assert_eq!(
+            app.request_gitlab_write(&task.id, payload, &requester.name)
+                .unwrap()
+                .id,
+            request.id
+        );
+        assert!(
+            app.approve_gitlab_write(&request.id, &outsider.name)
+                .is_err()
+        );
+        app.approve_gitlab_write(&request.id, &requester.name)
+            .unwrap();
+        let claimed = app.claim_gitlab_write().unwrap().unwrap();
+        assert_eq!(
+            app.recover_stale_gitlab_writes(
+                claimed.dispatch_started_at.unwrap() + Duration::minutes(6),
+                Duration::minutes(5),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            app.state().gitlab_writes[&request.id].status,
+            GitLabWriteStatus::Indeterminate
+        );
+        app.retry_gitlab_write(&request.id, &requester.name)
+            .unwrap();
+        let retry = app.claim_gitlab_write().unwrap().unwrap();
+        let written_at = Utc::now();
+        let written = app
+            .finish_gitlab_write(
+                &request.id,
+                retry.dispatch_id.as_deref().unwrap(),
+                Ok(GitLabWriteResult {
+                    kind: "issue".into(),
+                    external_id: "42".into(),
+                    title: "Release checklist".into(),
+                    url: "https://gitlab.example/platform/llm-gateway/-/issues/42".into(),
+                    status: "opened".into(),
+                    response_status: 201,
+                    written_at,
+                }),
+            )
+            .unwrap();
+        assert_eq!(written.status, GitLabWriteStatus::Written);
+        let task = app.state().find_task(&task.id).unwrap().1;
+        assert!(task.external_artifacts.iter().any(|artifact| {
+            artifact.provider == "gitlab"
+                && artifact.kind == "issue"
+                && artifact.external_id == "42"
+                && artifact.synced_at == written_at
+        }));
+
+        drop(app);
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        assert_eq!(
+            replayed.state().gitlab_writes[&request.id].status,
+            GitLabWriteStatus::Written
+        );
+        assert_eq!(
+            replayed
+                .state()
+                .find_task(&request.task_id)
+                .unwrap()
+                .1
+                .external_artifacts
+                .len(),
+            1
         );
     }
 

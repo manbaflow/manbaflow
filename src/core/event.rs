@@ -5,10 +5,10 @@ use crate::domain::{
     ApiCredential, Assignment, AttentionKind, AvailabilityBlock, Demand, Estimate, Evidence,
     ExecutionRecord, ExternalArtifact, ExternalIdentityBinding, ExternalInteractionReceipt,
     FlightLease, FlightRecoveryDecision, Flow, FlowChangeRequest, FlowMessage,
-    FlowScheduleRevision, MessageAcknowledgement, NotificationDelivery, NotificationEndpoint,
-    OfficeReleaseRequest, OfficeReleaseResult, Organization, PrdDraft, Principal,
-    RemoteFlightReport, ResourceLease, RoleBinding, StagedArtifact, Task, Team, Tenant,
-    TrackingAttention, TrackingEscalation, WorkCalendar,
+    FlowScheduleRevision, GitLabWriteRequest, GitLabWriteResult, MessageAcknowledgement,
+    NotificationDelivery, NotificationEndpoint, OfficeReleaseRequest, OfficeReleaseResult,
+    Organization, PrdDraft, Principal, RemoteFlightReport, ResourceLease, RoleBinding,
+    StagedArtifact, Task, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 
 pub const CURRENT_EVENT_VERSION: u16 = 2;
@@ -362,6 +362,61 @@ pub enum DomainEvent {
         retry_safe: bool,
         expired_at: DateTime<Utc>,
     },
+    GitLabWriteRequested {
+        request: GitLabWriteRequest,
+    },
+    GitLabWriteApproved {
+        flow_id: String,
+        task_id: String,
+        write_id: String,
+        approved_by: String,
+        approved_at: DateTime<Utc>,
+    },
+    GitLabWriteRejected {
+        flow_id: String,
+        task_id: String,
+        write_id: String,
+        rejected_by: String,
+        reason: String,
+        rejected_at: DateTime<Utc>,
+    },
+    GitLabWriteDispatchClaimed {
+        flow_id: String,
+        task_id: String,
+        write_id: String,
+        dispatch_id: String,
+        claimed_at: DateTime<Utc>,
+    },
+    GitLabWriteSucceeded {
+        flow_id: String,
+        task_id: String,
+        write_id: String,
+        dispatch_id: String,
+        result: GitLabWriteResult,
+    },
+    GitLabWriteFailed {
+        flow_id: String,
+        task_id: String,
+        write_id: String,
+        dispatch_id: String,
+        error: String,
+        indeterminate: bool,
+        failed_at: DateTime<Utc>,
+    },
+    GitLabWriteRetryApproved {
+        flow_id: String,
+        task_id: String,
+        write_id: String,
+        approved_by: String,
+        approved_at: DateTime<Utc>,
+    },
+    GitLabWriteDispatchExpired {
+        flow_id: String,
+        task_id: String,
+        write_id: String,
+        dispatch_id: String,
+        expired_at: DateTime<Utc>,
+    },
     RemoteFlightRevoked {
         flow_id: String,
         task_id: String,
@@ -474,6 +529,21 @@ impl DomainEvent {
             Self::OfficeReleaseDispatchExpired {
                 retry_safe: false, ..
             } => "office_release.dispatch_indeterminate",
+            Self::GitLabWriteRequested { .. } => "gitlab_write.requested",
+            Self::GitLabWriteApproved { .. } => "gitlab_write.approved",
+            Self::GitLabWriteRejected { .. } => "gitlab_write.rejected",
+            Self::GitLabWriteDispatchClaimed { .. } => "gitlab_write.dispatch_claimed",
+            Self::GitLabWriteSucceeded { .. } => "gitlab_write.succeeded",
+            Self::GitLabWriteFailed {
+                indeterminate: true,
+                ..
+            }
+            | Self::GitLabWriteDispatchExpired { .. } => "gitlab_write.indeterminate",
+            Self::GitLabWriteFailed {
+                indeterminate: false,
+                ..
+            } => "gitlab_write.failed",
+            Self::GitLabWriteRetryApproved { .. } => "gitlab_write.retry_approved",
             Self::RemoteFlightRevoked { .. } => "remote_flight.revoked",
             Self::RemoteFlightExpired { .. } => "remote_flight.expired",
             Self::RemoteFlightFinished { landed: true, .. } => "remote_flight.landed",
@@ -522,6 +592,13 @@ impl DomainEvent {
             | Self::OfficeReleaseFailed { flow_id, .. }
             | Self::OfficeReleaseRetryApproved { flow_id, .. }
             | Self::OfficeReleaseDispatchExpired { flow_id, .. }
+            | Self::GitLabWriteApproved { flow_id, .. }
+            | Self::GitLabWriteRejected { flow_id, .. }
+            | Self::GitLabWriteDispatchClaimed { flow_id, .. }
+            | Self::GitLabWriteSucceeded { flow_id, .. }
+            | Self::GitLabWriteFailed { flow_id, .. }
+            | Self::GitLabWriteRetryApproved { flow_id, .. }
+            | Self::GitLabWriteDispatchExpired { flow_id, .. }
             | Self::FlowCompleted { flow_id, .. } => Some(flow_id),
             Self::NotificationQueued { delivery } => delivery.flow_id.as_deref(),
             Self::NotificationDelivered { flow_id, .. }
@@ -534,6 +611,7 @@ impl DomainEvent {
             Self::RemoteFlightAuthorized { lease } => Some(&lease.flow_id),
             Self::FlightArtifactStaged { artifact } => Some(&artifact.flow_id),
             Self::OfficeReleaseRequested { request } => Some(&request.flow_id),
+            Self::GitLabWriteRequested { request } => Some(&request.flow_id),
             Self::ResourceLeaseAcquired { lease } => Some(&lease.flow_id),
             Self::ExternalInteractionProcessed { receipt } => receipt.flow_id.as_deref(),
             Self::TenantInitialized { .. }

@@ -1,6 +1,7 @@
 pub mod capability;
 pub mod executor;
 pub mod gitlab;
+pub mod gitlab_write;
 pub mod identity;
 pub mod interaction;
 pub mod migration;

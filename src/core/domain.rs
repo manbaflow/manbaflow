@@ -1122,6 +1122,103 @@ pub struct OfficeReleaseRequest {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitLabWritePayload {
+    CreateIssue {
+        project: String,
+        title: String,
+        description: String,
+        #[serde(default)]
+        labels: Vec<String>,
+    },
+    CommentIssue {
+        project: String,
+        issue_iid: u64,
+        body: String,
+    },
+    CreateMergeRequest {
+        project: String,
+        source_branch: String,
+        target_branch: String,
+        title: String,
+        description: String,
+        #[serde(default)]
+        labels: Vec<String>,
+        #[serde(default)]
+        remove_source_branch: bool,
+        #[serde(default)]
+        draft: bool,
+    },
+    CommentMergeRequest {
+        project: String,
+        merge_request_iid: u64,
+        body: String,
+    },
+}
+
+impl GitLabWritePayload {
+    pub fn project(&self) -> &str {
+        match self {
+            Self::CreateIssue { project, .. }
+            | Self::CommentIssue { project, .. }
+            | Self::CreateMergeRequest { project, .. }
+            | Self::CommentMergeRequest { project, .. } => project,
+        }
+    }
+
+    pub fn action_name(&self) -> &'static str {
+        match self {
+            Self::CreateIssue { .. } => "create_issue",
+            Self::CommentIssue { .. } => "comment_issue",
+            Self::CreateMergeRequest { .. } => "create_merge_request",
+            Self::CommentMergeRequest { .. } => "comment_merge_request",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitLabWriteStatus {
+    Requested,
+    Approved,
+    Dispatching,
+    Written,
+    Failed,
+    Indeterminate,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitLabWriteResult {
+    pub kind: String,
+    pub external_id: String,
+    pub title: String,
+    pub url: String,
+    pub status: String,
+    pub response_status: u16,
+    pub written_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitLabWriteRequest {
+    pub id: String,
+    pub flow_id: String,
+    pub task_id: String,
+    pub payload: GitLabWritePayload,
+    pub payload_sha256: String,
+    pub requested_by: String,
+    pub requested_at: DateTime<Utc>,
+    pub status: GitLabWriteStatus,
+    pub reviewed_by: Option<String>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    pub review_reason: Option<String>,
+    pub dispatch_id: Option<String>,
+    pub dispatch_started_at: Option<DateTime<Utc>>,
+    pub result: Option<GitLabWriteResult>,
+    pub last_error: Option<String>,
+}
+
 impl FlightDeliverable {
     pub fn from_path(path: String, requires_human_release: bool) -> Self {
         let extension = std::path::Path::new(&path)
