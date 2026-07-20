@@ -4,10 +4,11 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     ApiCredential, ExecutionRecord, ExternalIdentityBinding, ExternalInteractionReceipt,
-    FlightLease, FlightLeaseStatus, Flow, FlowChangeRequest, FlowChangeStatus, FlowMessage,
-    FlowScheduleRevision, FlowStatus, NotificationDelivery, NotificationEndpoint,
-    NotificationStatus, Organization, OrganizationRole, Principal, PrincipalKind, RoleBinding,
-    TargetKind, TaskStatus, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
+    FlightLease, FlightLeaseStatus, FlightRecoveryDecision, Flow, FlowChangeRequest,
+    FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, NotificationDelivery,
+    NotificationEndpoint, NotificationStatus, Organization, OrganizationRole, Principal,
+    PrincipalKind, ResourceLease, ResourceLeaseStatus, RoleBinding, TargetKind, TaskStatus, Team,
+    Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -32,6 +33,8 @@ pub struct OrganizationState {
     pub flow_changes: BTreeMap<String, FlowChangeRequest>,
     pub executions: BTreeMap<String, ExecutionRecord>,
     pub flight_leases: BTreeMap<String, FlightLease>,
+    pub resource_leases: BTreeMap<String, ResourceLease>,
+    pub flight_recoveries: BTreeMap<String, FlightRecoveryDecision>,
     pub attentions: BTreeMap<String, TrackingAttention>,
     pub escalations: BTreeMap<String, TrackingEscalation>,
     pub last_sequence: i64,
@@ -754,7 +757,62 @@ impl OrganizationState {
                         id: lease.task_id.clone(),
                     })?;
                 self.principal(&lease.principal_id)?;
-                self.flight_leases.insert(lease.id.clone(), lease.clone());
+                self.flight_leases
+                    .insert(lease.id.clone(), lease.as_ref().clone());
+            }
+            DomainEvent::ResourceLeaseAcquired { lease } => {
+                let flight = self
+                    .flight_leases
+                    .get(&lease.flight_lease_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "flight lease",
+                        id: lease.flight_lease_id.clone(),
+                    })?;
+                if flight.flow_id != lease.flow_id
+                    || flight.task_id != lease.task_id
+                    || flight.principal_id != lease.principal_id
+                {
+                    return Err(MambaError::Validation(
+                        "resource lease does not match its flight".into(),
+                    ));
+                }
+                if self.resource_leases.values().any(|active| {
+                    active.id != lease.id && active.conflicts_with(&lease.claim, lease.issued_at)
+                }) {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "resource {:?}:{} is already leased",
+                        lease.claim.kind, lease.claim.key
+                    )));
+                }
+                self.resource_leases.insert(lease.id.clone(), lease.clone());
+            }
+            DomainEvent::ResourceLeaseReleased {
+                flow_id,
+                task_id,
+                resource_lease_id,
+                released_at,
+                reason,
+            } => {
+                let lease = self
+                    .resource_leases
+                    .get_mut(resource_lease_id)
+                    .ok_or_else(|| MambaError::NotFound {
+                        entity: "resource lease",
+                        id: resource_lease_id.clone(),
+                    })?;
+                if lease.flow_id != *flow_id || lease.task_id != *task_id {
+                    return Err(MambaError::Validation(
+                        "resource release does not match its flight scope".into(),
+                    ));
+                }
+                if lease.status != ResourceLeaseStatus::Active {
+                    return Err(MambaError::InvalidTransition(format!(
+                        "resource lease {resource_lease_id} is already released"
+                    )));
+                }
+                lease.status = ResourceLeaseStatus::Released;
+                lease.released_at = Some(*released_at);
+                lease.release_reason = Some(reason.clone());
             }
             DomainEvent::RemoteFlightClaimed {
                 flow_id,
@@ -795,6 +853,16 @@ impl OrganizationState {
                 };
                 lease.finished_at = Some(*finished_at);
                 lease.report = Some(report.clone());
+            }
+            DomainEvent::FlightRecoveryDecided { decision, .. } => {
+                if !self.flight_leases.contains_key(&decision.parent_lease_id) {
+                    return Err(MambaError::NotFound {
+                        entity: "parent flight lease",
+                        id: decision.parent_lease_id.clone(),
+                    });
+                }
+                self.flight_recoveries
+                    .insert(decision.id.clone(), decision.clone());
             }
             DomainEvent::FlowCompleted { flow_id, at, .. } => {
                 let flow = self.flow_mut(flow_id)?;

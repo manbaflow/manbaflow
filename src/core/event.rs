@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     ApiCredential, Assignment, AttentionKind, AvailabilityBlock, Demand, Estimate, Evidence,
     ExecutionRecord, ExternalArtifact, ExternalIdentityBinding, ExternalInteractionReceipt,
-    FlightLease, Flow, FlowChangeRequest, FlowMessage, FlowScheduleRevision,
-    MessageAcknowledgement, NotificationDelivery, NotificationEndpoint, Organization, PrdDraft,
-    Principal, RemoteFlightReport, RoleBinding, Task, Team, Tenant, TrackingAttention,
-    TrackingEscalation, WorkCalendar,
+    FlightLease, FlightRecoveryDecision, Flow, FlowChangeRequest, FlowMessage,
+    FlowScheduleRevision, MessageAcknowledgement, NotificationDelivery, NotificationEndpoint,
+    Organization, PrdDraft, Principal, RemoteFlightReport, ResourceLease, RoleBinding, Task, Team,
+    Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 
 pub const CURRENT_EVENT_VERSION: u16 = 2;
@@ -266,7 +266,17 @@ pub enum DomainEvent {
         at: DateTime<Utc>,
     },
     RemoteFlightAuthorized {
-        lease: FlightLease,
+        lease: Box<FlightLease>,
+    },
+    ResourceLeaseAcquired {
+        lease: ResourceLease,
+    },
+    ResourceLeaseReleased {
+        flow_id: String,
+        task_id: String,
+        resource_lease_id: String,
+        released_at: DateTime<Utc>,
+        reason: String,
     },
     RemoteFlightClaimed {
         flow_id: String,
@@ -289,6 +299,11 @@ pub enum DomainEvent {
         landed: bool,
         report: RemoteFlightReport,
         finished_at: DateTime<Utc>,
+    },
+    FlightRecoveryDecided {
+        flow_id: String,
+        task_id: String,
+        decision: FlightRecoveryDecision,
     },
     FlowCompleted {
         flow_id: String,
@@ -350,10 +365,13 @@ impl DomainEvent {
             Self::ExecutorFinished { .. } => "executor.finished",
             Self::ExecutorFailed { .. } => "executor.failed",
             Self::RemoteFlightAuthorized { .. } => "remote_flight.authorized",
+            Self::ResourceLeaseAcquired { .. } => "resource_lease.acquired",
+            Self::ResourceLeaseReleased { .. } => "resource_lease.released",
             Self::RemoteFlightClaimed { .. } => "remote_flight.claimed",
             Self::RemoteFlightRevoked { .. } => "remote_flight.revoked",
             Self::RemoteFlightFinished { landed: true, .. } => "remote_flight.landed",
             Self::RemoteFlightFinished { landed: false, .. } => "remote_flight.crashed",
+            Self::FlightRecoveryDecided { .. } => "remote_flight.recovery_decided",
             Self::FlowCompleted { .. } => "flow.completed",
         }
     }
@@ -387,6 +405,8 @@ impl DomainEvent {
             | Self::RemoteFlightClaimed { flow_id, .. }
             | Self::RemoteFlightRevoked { flow_id, .. }
             | Self::RemoteFlightFinished { flow_id, .. }
+            | Self::ResourceLeaseReleased { flow_id, .. }
+            | Self::FlightRecoveryDecided { flow_id, .. }
             | Self::FlowCompleted { flow_id, .. } => Some(flow_id),
             Self::NotificationQueued { delivery } => delivery.flow_id.as_deref(),
             Self::NotificationDelivered { flow_id, .. }
@@ -397,6 +417,7 @@ impl DomainEvent {
             Self::FlowChangeProposed { request } => Some(&request.flow_id),
             Self::ExecutorFinished { record } => Some(&record.flow_id),
             Self::RemoteFlightAuthorized { lease } => Some(&lease.flow_id),
+            Self::ResourceLeaseAcquired { lease } => Some(&lease.flow_id),
             Self::ExternalInteractionProcessed { receipt } => receipt.flow_id.as_deref(),
             Self::TenantInitialized { .. }
             | Self::OrganizationInitialized { .. }

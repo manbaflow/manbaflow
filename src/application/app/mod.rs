@@ -7,10 +7,10 @@ use chrono::{DateTime, Duration, Utc};
 use crate::dashboard::{DashboardSnapshot, build_dashboard};
 use crate::domain::{
     Assignment, AssignmentTarget, Demand, Estimate, Evidence, ExecutionRecord, ExecutorConfig,
-    ExecutorKind, ExecutorMode, ExternalArtifact, FlightLease, FlightLeaseStatus, Flow,
-    FlowChangeImpact, FlowChangeRequest, FlowChangeStatus, FlowScheduleRevision, FlowStatus,
-    Organization, OrganizationRole, Principal, PrincipalKind, RemoteFlightReport, RoleBinding,
-    TargetKind, Task, TaskDraft, TaskStatus, Team, Tenant,
+    ExecutorKind, ExecutorMode, ExternalArtifact, FailureClass, FlightLease, FlightLeaseStatus,
+    FlightManifestDraft, Flow, FlowChangeImpact, FlowChangeRequest, FlowChangeStatus,
+    FlowScheduleRevision, FlowStatus, Organization, OrganizationRole, Principal, PrincipalKind,
+    RemoteFlightReport, RoleBinding, TargetKind, Task, TaskDraft, TaskStatus, Team, Tenant,
 };
 use crate::error::{MambaError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -27,6 +27,7 @@ mod authority;
 mod calendars;
 mod commit;
 mod credentials;
+mod flights;
 mod interactions;
 mod messages;
 mod notifications;
@@ -1291,6 +1292,25 @@ impl MambaApp {
         executor: ExecutorKind,
         ttl_seconds: u64,
     ) -> Result<FlightLease> {
+        self.authorize_remote_flight_with_manifest(
+            task_id,
+            authorized_by,
+            worker,
+            executor,
+            ttl_seconds,
+            FlightManifestDraft::default(),
+        )
+    }
+
+    pub fn authorize_remote_flight_with_manifest(
+        &mut self,
+        task_id: &str,
+        authorized_by: &str,
+        worker: &str,
+        executor: ExecutorKind,
+        ttl_seconds: u64,
+        manifest: FlightManifestDraft,
+    ) -> Result<FlightLease> {
         if !(60..=86_400).contains(&ttl_seconds) {
             return Err(MambaError::Validation(
                 "flight lease TTL must be between 60 and 86400 seconds".into(),
@@ -1337,8 +1357,11 @@ impl MambaApp {
                 task.id, worker.name
             )));
         }
+        let manifest = self.build_flight_manifest(&flow, &task, &human, ttl_seconds, manifest)?;
+        self.ensure_resource_claims_available(&manifest.resources, now)?;
+        let lease_id = new_id("LEASE");
         let lease = FlightLease {
-            id: new_id("LEASE"),
+            id: lease_id.clone(),
             flow_id: flow.id,
             task_id: task.id,
             principal_id: worker.id,
@@ -1352,13 +1375,16 @@ impl MambaApp {
             finished_at: None,
             run_id: None,
             report: None,
+            manifest: Some(manifest.clone()),
+            parent_lease_id: None,
+            root_lease_id: Some(lease_id),
+            attempt: 1,
         };
-        self.commit(
-            &human.name,
-            vec![DomainEvent::RemoteFlightAuthorized {
-                lease: lease.clone(),
-            }],
-        )?;
+        let mut events = vec![DomainEvent::RemoteFlightAuthorized {
+            lease: Box::new(lease.clone()),
+        }];
+        events.extend(self.resource_acquisition_events(&lease, &manifest.resources));
+        self.commit(&human.name, events)?;
         Ok(lease)
     }
 
@@ -1429,16 +1455,15 @@ impl MambaApp {
             )));
         }
         let revoked_at = Utc::now();
-        self.commit(
-            &principal.name,
-            vec![DomainEvent::RemoteFlightRevoked {
-                flow_id: lease.flow_id,
-                task_id: lease.task_id,
-                lease_id: lease.id.clone(),
-                revoked_by: principal.name.clone(),
-                revoked_at,
-            }],
-        )?;
+        let mut events = vec![DomainEvent::RemoteFlightRevoked {
+            flow_id: lease.flow_id.clone(),
+            task_id: lease.task_id.clone(),
+            lease_id: lease.id.clone(),
+            revoked_by: principal.name.clone(),
+            revoked_at,
+        }];
+        events.extend(self.resource_release_events(&lease, revoked_at, "flight revoked"));
+        self.commit(&principal.name, events)?;
         Ok(self.state.flight_leases[lease_id].clone())
     }
 
@@ -1514,7 +1539,7 @@ impl MambaApp {
         lease_id: &str,
         actor: &str,
         landed: bool,
-        report: RemoteFlightReport,
+        mut report: RemoteFlightReport,
     ) -> Result<FlightLease> {
         let principal = self.state.principal(actor)?.clone();
         let lease = self
@@ -1532,11 +1557,21 @@ impl MambaApp {
                 lease.id
             )));
         }
+        validate_remote_flight_report(&lease, &report)?;
+        report.budget_exhaustions = self.fuel_exhaustions(&lease, &report);
+        let effective_landed = landed && report.budget_exhaustions.is_empty();
+        if !effective_landed && report.failure_class.is_none() {
+            report.failure_class = Some(if report.budget_exhaustions.is_empty() {
+                FailureClass::Unknown
+            } else {
+                FailureClass::Budget
+            });
+        }
         if matches!(
             lease.status,
             FlightLeaseStatus::Landed | FlightLeaseStatus::Crashed
         ) && lease.report.as_ref() == Some(&report)
-            && landed == (lease.status == FlightLeaseStatus::Landed)
+            && effective_landed == (lease.status == FlightLeaseStatus::Landed)
         {
             return Ok(lease);
         }
@@ -1546,13 +1581,12 @@ impl MambaApp {
                 lease.id, lease.status
             )));
         }
-        validate_remote_flight_report(&lease, &report)?;
         let finished_at = Utc::now();
         let evidence = Evidence {
             id: new_id("EVD"),
-            kind: if landed && report.patch_sha256.is_some() {
+            kind: if effective_landed && report.patch_sha256.is_some() {
                 "remote_patch"
-            } else if landed {
+            } else if effective_landed {
                 "remote_flight"
             } else {
                 "worker_blackbox"
@@ -1568,7 +1602,7 @@ impl MambaApp {
                 flow_id: lease.flow_id.clone(),
                 task_id: lease.task_id.clone(),
                 lease_id: lease.id.clone(),
-                landed,
+                landed: effective_landed,
                 report: report.clone(),
                 finished_at,
             },
@@ -1578,10 +1612,10 @@ impl MambaApp {
                 evidence,
             },
         ];
-        if landed {
+        if effective_landed {
             events.push(DomainEvent::TaskHeartbeat {
-                flow_id: lease.flow_id,
-                task_id: lease.task_id,
+                flow_id: lease.flow_id.clone(),
+                task_id: lease.task_id.clone(),
                 actor: principal.name.clone(),
                 note: Some(format!(
                     "remote flight {} landed for Human review",
@@ -1590,14 +1624,29 @@ impl MambaApp {
                 at: finished_at,
             });
         } else {
+            let budget_reason = (!report.budget_exhaustions.is_empty())
+                .then(|| format!("; fuel exhausted: {}", report.budget_exhaustions.join(", ")));
             events.push(DomainEvent::TaskBlocked {
-                flow_id: lease.flow_id,
-                task_id: lease.task_id,
+                flow_id: lease.flow_id.clone(),
+                task_id: lease.task_id.clone(),
                 actor: principal.name.clone(),
-                reason: format!("remote execution flight crashed: {}", report.summary),
+                reason: format!(
+                    "remote execution flight crashed: {}{}",
+                    report.summary,
+                    budget_reason.as_deref().unwrap_or_default()
+                ),
                 at: finished_at,
             });
         }
+        events.extend(self.resource_release_events(
+            &lease,
+            finished_at,
+            if effective_landed {
+                "flight landed"
+            } else {
+                "flight crashed"
+            },
+        ));
         self.commit(&principal.name, events)?;
         Ok(self.state.flight_leases[lease_id].clone())
     }
@@ -2048,6 +2097,30 @@ fn validate_remote_flight_report(lease: &FlightLease, report: &RemoteFlightRepor
             "remote flight report finishes before it starts".into(),
         ));
     }
+    if report
+        .fuel
+        .cost_usd
+        .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+    {
+        return Err(MambaError::Validation(
+            "remote flight report contains invalid fuel cost".into(),
+        ));
+    }
+    if report.fuel.duration_seconds > 604_800
+        || report.fuel.context_bytes > 67_108_864
+        || report
+            .fuel
+            .tokens
+            .is_some_and(|tokens| tokens > 1_000_000_000)
+        || report
+            .fuel
+            .tool_calls
+            .is_some_and(|tool_calls| tool_calls > 1_000_000)
+    {
+        return Err(MambaError::Validation(
+            "remote flight report contains implausible fuel usage".into(),
+        ));
+    }
     if !is_sha256(&report.log_sha256)
         || report
             .patch_sha256
@@ -2141,8 +2214,9 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        AttentionSeverity, ExternalInteractionAction, FlowMessageKind, NotificationConnector,
-        NotificationStatus,
+        AttentionSeverity, ExternalInteractionAction, FlowMessageKind, FuelBudget, FuelUsage,
+        NotificationConnector, NotificationStatus, RecoveryAction, ResourceClaim, ResourceKind,
+        ResourceLeaseStatus,
     };
     use crate::notification::NotificationAttempt;
 
@@ -2641,6 +2715,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lease.status, FlightLeaseStatus::Authorized);
+        assert!(lease.manifest.is_some());
+        assert!(app.state().resource_leases.values().any(|resource| {
+            resource.flight_lease_id == lease.id && resource.status == ResourceLeaseStatus::Active
+        }));
         let backup = app
             .register_principal(
                 "Backup Engineer",
@@ -2694,12 +2772,18 @@ mod tests {
             log_sha256: "b".repeat(64),
             started_at: now,
             finished_at: now,
+            fuel: Default::default(),
+            failure_class: None,
+            budget_exhaustions: Vec::new(),
         };
         let landed = app
             .finish_remote_flight(&lease.id, &agent.name, true, report.clone())
             .unwrap();
         assert_eq!(landed.status, FlightLeaseStatus::Landed);
         assert_eq!(landed.report, Some(report));
+        assert!(app.state().resource_leases.values().any(|resource| {
+            resource.flight_lease_id == lease.id && resource.status == ResourceLeaseStatus::Released
+        }));
         assert!(
             app.state()
                 .find_task(&task_id)
@@ -2725,6 +2809,10 @@ mod tests {
             .and_then(|lease| app.revoke_remote_flight(&lease.id, &human.name))
             .unwrap();
         assert_eq!(revoked.status, FlightLeaseStatus::Revoked);
+        assert!(app.state().resource_leases.values().any(|resource| {
+            resource.flight_lease_id == revoked.id
+                && resource.status == ResourceLeaseStatus::Released
+        }));
         assert!(
             app.claim_remote_flight(&revoked.id, &agent.name, "WRUN-revoked")
                 .is_err()
@@ -2746,6 +2834,184 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "remote_flight.landed")
         );
+    }
+
+    #[tokio::test]
+    async fn flight_fuel_resources_and_supervision_tree_are_enforced_and_replayed() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let mut app = MambaApp::open(&data_dir).unwrap();
+        app.init_organization("Test Org", "admin").unwrap();
+        let team = app
+            .create_team("Platform", "product,delivery", "admin")
+            .unwrap();
+        let human = app
+            .register_principal(
+                "Engineer",
+                PrincipalKind::Human,
+                Some(&team.id),
+                None,
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let agent = app
+            .register_principal(
+                "Engineer Agent",
+                PrincipalKind::Agent,
+                Some(&team.id),
+                Some(&human.id),
+                "product,delivery",
+                100,
+                None,
+                "admin",
+            )
+            .unwrap();
+        let first_flow = app
+            .create_demand(
+                "Prepare the gateway release",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let first_task = first_flow.tasks[0].id.clone();
+        app.approve_flow(&first_flow.id, &human.name).unwrap();
+        app.accept_task(&first_task, &human.name).unwrap();
+
+        let shared_file = ResourceClaim {
+            kind: ResourceKind::File,
+            key: "src/gateway.rs".into(),
+            exclusive: true,
+        };
+        let lease = app
+            .authorize_remote_flight_with_manifest(
+                &first_task,
+                &human.name,
+                &agent.name,
+                ExecutorKind::Codex,
+                3_600,
+                FlightManifestDraft {
+                    fuel: Some(FuelBudget {
+                        max_duration_seconds: 60,
+                        max_context_bytes: 8,
+                        max_tokens: Some(100),
+                        max_tool_calls: Some(10),
+                        max_cost_usd: Some(1.0),
+                    }),
+                    resources: vec![shared_file.clone()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let second_flow = app
+            .create_demand(
+                "Audit the gateway release",
+                &human.name,
+                PlannerKind::Local,
+                directory.path(),
+                10,
+            )
+            .await
+            .unwrap();
+        let second_task = second_flow.tasks[0].id.clone();
+        app.approve_flow(&second_flow.id, &human.name).unwrap();
+        app.accept_task(&second_task, &human.name).unwrap();
+        let conflict = app.authorize_remote_flight_with_manifest(
+            &second_task,
+            &human.name,
+            &agent.name,
+            ExecutorKind::ClaudeCode,
+            3_600,
+            FlightManifestDraft {
+                resources: vec![shared_file],
+                ..Default::default()
+            },
+        );
+        assert!(matches!(conflict, Err(MambaError::InvalidTransition(_))));
+
+        app.claim_remote_flight(&lease.id, &agent.name, "WRUN-fuel")
+            .unwrap();
+        let finished_at = Utc::now();
+        let crashed = app
+            .finish_remote_flight(
+                &lease.id,
+                &agent.name,
+                true,
+                RemoteFlightReport {
+                    run_id: "WRUN-fuel".into(),
+                    executor: ExecutorKind::Codex,
+                    summary: "executor reported success".into(),
+                    base_revision: "abc123".into(),
+                    changed_files: Vec::new(),
+                    patch_sha256: None,
+                    log_sha256: "a".repeat(64),
+                    started_at: finished_at - Duration::seconds(1),
+                    finished_at,
+                    fuel: FuelUsage {
+                        duration_seconds: 1,
+                        context_bytes: 9,
+                        tokens: Some(90),
+                        tool_calls: Some(3),
+                        cost_usd: Some(0.5),
+                    },
+                    failure_class: None,
+                    budget_exhaustions: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(crashed.status, FlightLeaseStatus::Crashed);
+        let report = crashed.report.as_ref().unwrap();
+        assert_eq!(report.failure_class, Some(FailureClass::Budget));
+        assert_eq!(report.budget_exhaustions.len(), 1);
+        assert!(report.budget_exhaustions[0].contains("context"));
+        assert!(app.state().resource_leases.values().any(|resource| {
+            resource.flight_lease_id == lease.id && resource.status == ResourceLeaseStatus::Released
+        }));
+        assert_eq!(
+            app.recovery_options(&lease.id, &human.name).unwrap(),
+            vec![RecoveryAction::ReduceScope, RecoveryAction::HumanHandoff]
+        );
+
+        let child = app
+            .recover_remote_flight(
+                &lease.id,
+                &human.name,
+                RecoveryAction::ReduceScope,
+                "retry with a smaller context payload",
+                None,
+                Some("implement only the gateway routing change".into()),
+                3_600,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.parent_lease_id.as_deref(), Some(lease.id.as_str()));
+        assert_eq!(child.root_lease_id.as_deref(), Some(lease.id.as_str()));
+        assert_eq!(child.attempt, 2);
+        assert_eq!(child.status, FlightLeaseStatus::Authorized);
+        assert!(app.state().resource_leases.values().any(|resource| {
+            resource.flight_lease_id == child.id && resource.status == ResourceLeaseStatus::Active
+        }));
+        let decision = app.state().flight_recoveries.values().next().unwrap();
+        assert_eq!(decision.parent_lease_id, lease.id);
+        assert_eq!(decision.child_lease_id.as_deref(), Some(child.id.as_str()));
+
+        drop(app);
+        let replayed = MambaApp::open(&data_dir).unwrap();
+        assert_eq!(
+            replayed.state().flight_leases[&lease.id].status,
+            FlightLeaseStatus::Crashed
+        );
+        assert_eq!(replayed.state().flight_leases[&child.id].attempt, 2);
+        assert!(replayed.state().flight_recoveries.values().any(|decision| {
+            decision.parent_lease_id == lease.id
+                && decision.child_lease_id.as_deref() == Some(child.id.as_str())
+        }));
     }
 
     #[test]

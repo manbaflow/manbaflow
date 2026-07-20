@@ -18,11 +18,11 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::MambaApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
-    AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, Flow,
-    FlowChangeRequest, FlowMessage, FlowMessageKind, IssuedCredential, MessageInboxItem,
+    AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, FlightManifestDraft,
+    Flow, FlowChangeRequest, FlowMessage, FlowMessageKind, IssuedCredential, MessageInboxItem,
     NotificationConnector, NotificationDelivery, NotificationEndpoint, Organization,
-    OrganizationRole, Principal, PrincipalKind, RemoteFlightReport, RoleBinding, Task, Team,
-    Tenant, TrackingEscalation, WorkCalendar, Workday,
+    OrganizationRole, Principal, PrincipalKind, RecoveryAction, RemoteFlightReport, RoleBinding,
+    Task, Team, Tenant, TrackingEscalation, WorkCalendar, Workday,
 };
 use crate::error::{MambaError, Result};
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
@@ -283,6 +283,8 @@ struct AuthorizeFlightInput {
     executor: ExecutorKind,
     #[serde(default = "default_lease_ttl_seconds")]
     ttl_seconds: u64,
+    #[serde(default)]
+    manifest: FlightManifestDraft,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -294,6 +296,18 @@ struct ClaimFlightInput {
 struct FinishFlightInput {
     landed: bool,
     report: RemoteFlightReport,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RecoverFlightInput {
+    action: RecoveryAction,
+    reason: String,
+    #[serde(default)]
+    executor: Option<ExecutorKind>,
+    #[serde(default)]
+    objective: Option<String>,
+    #[serde(default = "default_lease_ttl_seconds")]
+    ttl_seconds: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -416,6 +430,11 @@ fn router(
         .route("/api/v1/flight-leases/{id}/claim", post(claim_flight))
         .route("/api/v1/flight-leases/{id}/revoke", post(revoke_flight))
         .route("/api/v1/flight-leases/{id}/finish", post(finish_flight))
+        .route(
+            "/api/v1/flight-leases/{id}/recovery-options",
+            get(flight_recovery_options),
+        )
+        .route("/api/v1/flight-leases/{id}/recover", post(recover_flight))
         .route("/api/v1/tasks/{id}/submit", post(submit_task))
         .route("/api/v1/tasks/{id}/complete", post(complete_task))
         .route("/api/v1/connectors/gitlab/webhook", post(gitlab_webhook))
@@ -1028,12 +1047,13 @@ async fn authorize_flight(
     Json(input): Json<AuthorizeFlightInput>,
 ) -> ApiResult<Json<FlightLease>> {
     mutate(&state, &headers, |app, actor| {
-        app.authorize_remote_flight(
+        app.authorize_remote_flight_with_manifest(
             &task_id,
             actor,
             &input.agent,
             input.executor,
             input.ttl_seconds,
+            input.manifest,
         )
     })
     .await
@@ -1082,6 +1102,36 @@ async fn revoke_flight(
 ) -> ApiResult<Json<FlightLease>> {
     mutate(&state, &headers, |app, actor| {
         app.revoke_remote_flight(&lease_id, actor)
+    })
+    .await
+}
+
+async fn flight_recovery_options(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<RecoveryAction>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    Ok(Json(app.recovery_options(&lease_id, &principal.name)?))
+}
+
+async fn recover_flight(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<RecoverFlightInput>,
+) -> ApiResult<Json<Option<FlightLease>>> {
+    mutate(&state, &headers, |app, actor| {
+        app.recover_remote_flight(
+            &lease_id,
+            actor,
+            input.action,
+            &input.reason,
+            input.executor,
+            input.objective,
+            input.ttl_seconds,
+        )
     })
     .await
 }
@@ -2057,13 +2107,29 @@ mod tests {
                 "POST",
                 &format!("/api/v1/tasks/{task_id}/flight-leases"),
                 &human_token,
-                json!({"agent": agent.id, "executor": "codex", "ttl_seconds": 3600}),
+                json!({
+                    "agent": agent.id,
+                    "executor": "codex",
+                    "ttl_seconds": 3600,
+                    "manifest": {
+                        "objective": "implement the release brief",
+                        "resources": [{
+                            "kind": "file",
+                            "key": "docs/release.md",
+                            "exclusive": true
+                        }]
+                    }
+                }),
             ))
             .await
             .unwrap();
         assert_eq!(authorized.status(), StatusCode::OK);
         let body = to_bytes(authorized.into_body(), usize::MAX).await.unwrap();
         let lease: FlightLease = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            lease.manifest.as_ref().unwrap().objective,
+            "implement the release brief"
+        );
 
         let claimed = service
             .clone()
@@ -2102,6 +2168,38 @@ mod tests {
             .unwrap();
         assert_eq!(finished.status(), StatusCode::OK);
 
+        let options = service
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                &format!("/api/v1/flight-leases/{}/recovery-options", lease.id),
+                &human_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(options.status(), StatusCode::OK);
+        let forked = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                &format!("/api/v1/flight-leases/{}/recover", lease.id),
+                &human_token,
+                json!({
+                    "action": "fork",
+                    "reason": "verify an alternate route",
+                    "ttl_seconds": 3600
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forked.status(), StatusCode::OK);
+        let body = to_bytes(forked.into_body(), usize::MAX).await.unwrap();
+        let forked: Option<FlightLease> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            forked.unwrap().parent_lease_id.as_deref(),
+            Some(lease.id.as_str())
+        );
+
         let visible_to_requester = service
             .clone()
             .oneshot(authenticated_request(
@@ -2115,8 +2213,8 @@ mod tests {
             .await
             .unwrap();
         let leases: Vec<FlightLease> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(leases.len(), 1);
-        assert!(leases[0].report.is_some());
+        assert_eq!(leases.len(), 2);
+        assert!(leases.iter().any(|lease| lease.report.is_some()));
 
         let dashboard = service
             .clone()
@@ -2131,7 +2229,7 @@ mod tests {
         let body = to_bytes(dashboard.into_body(), usize::MAX).await.unwrap();
         let dashboard: DashboardSnapshot = serde_json::from_slice(&body).unwrap();
         assert_eq!(dashboard.metrics.total_flows, 1);
-        assert_eq!(dashboard.flights.len(), 1);
+        assert_eq!(dashboard.flights.len(), 2);
 
         let agent_dashboard = service
             .oneshot(authenticated_request(

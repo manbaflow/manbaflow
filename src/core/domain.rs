@@ -776,13 +776,195 @@ pub enum FlightLeaseStatus {
     Revoked,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAccess {
+    Read,
+    Write,
+    Execute,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolPermission {
+    pub tool: String,
+    pub access: ToolAccess,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    Workspace,
+    File,
+    Port,
+    Browser,
+    Gpu,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceClaim {
+    pub kind: ResourceKind,
+    pub key: String,
+    pub exclusive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceLeaseStatus {
+    Active,
+    Released,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResourceLease {
+    pub id: String,
+    pub flight_lease_id: String,
+    pub flow_id: String,
+    pub task_id: String,
+    pub principal_id: String,
+    pub claim: ResourceClaim,
+    pub status: ResourceLeaseStatus,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+    pub release_reason: Option<String>,
+}
+
+impl ResourceLease {
+    pub fn conflicts_with(&self, claim: &ResourceClaim, now: DateTime<Utc>) -> bool {
+        self.status == ResourceLeaseStatus::Active
+            && self.expires_at > now
+            && self.claim.kind == claim.kind
+            && self.claim.key == claim.key
+            && (self.claim.exclusive || claim.exclusive)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FuelBudget {
+    pub max_duration_seconds: u64,
+    pub max_context_bytes: u64,
+    pub max_tokens: Option<u64>,
+    pub max_tool_calls: Option<u64>,
+    pub max_cost_usd: Option<f64>,
+}
+
+impl Default for FuelBudget {
+    fn default() -> Self {
+        Self {
+            max_duration_seconds: 3_600,
+            max_context_bytes: 1_048_576,
+            max_tokens: Some(200_000),
+            max_tool_calls: Some(100),
+            max_cost_usd: Some(20.0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FuelUsage {
+    pub duration_seconds: u64,
+    pub context_bytes: u64,
+    pub tokens: Option<u64>,
+    pub tool_calls: Option<u64>,
+    pub cost_usd: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAction {
+    Retry,
+    SwitchExecutor,
+    ReduceScope,
+    HumanHandoff,
+    Ground,
+    Fork,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryPolicy {
+    pub max_attempts: u32,
+    pub allowed_actions: Vec<RecoveryAction>,
+}
+
+impl Default for RecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            allowed_actions: vec![
+                RecoveryAction::Retry,
+                RecoveryAction::SwitchExecutor,
+                RecoveryAction::ReduceScope,
+                RecoveryAction::HumanHandoff,
+                RecoveryAction::Ground,
+                RecoveryAction::Fork,
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    Timeout,
+    Permission,
+    Tool,
+    Resource,
+    Validation,
+    Budget,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FlightManifestDraft {
+    #[serde(default)]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub landing_conditions: Vec<String>,
+    #[serde(default)]
+    pub context_refs: Vec<String>,
+    #[serde(default)]
+    pub tool_permissions: Vec<ToolPermission>,
+    #[serde(default)]
+    pub fuel: Option<FuelBudget>,
+    #[serde(default)]
+    pub recovery: Option<RecoveryPolicy>,
+    #[serde(default)]
+    pub resources: Vec<ResourceClaim>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FlightManifest {
+    pub id: String,
+    pub objective: String,
+    pub landing_conditions: Vec<String>,
+    pub context_refs: Vec<String>,
+    pub tool_permissions: Vec<ToolPermission>,
+    pub fuel: FuelBudget,
+    pub recovery: RecoveryPolicy,
+    pub resources: Vec<ResourceClaim>,
+    pub declared_by: String,
+    pub declared_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FlightRecoveryDecision {
+    pub id: String,
+    pub parent_lease_id: String,
+    pub child_lease_id: Option<String>,
+    pub action: RecoveryAction,
+    pub reason: String,
+    pub decided_by: String,
+    pub decided_at: DateTime<Utc>,
+}
+
 impl FlightLeaseStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Landed | Self::Crashed | Self::Revoked)
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RemoteFlightReport {
     pub run_id: String,
     pub executor: ExecutorKind,
@@ -793,6 +975,12 @@ pub struct RemoteFlightReport {
     pub log_sha256: String,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    #[serde(default)]
+    pub fuel: FuelUsage,
+    #[serde(default)]
+    pub failure_class: Option<FailureClass>,
+    #[serde(default)]
+    pub budget_exhaustions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -811,6 +999,18 @@ pub struct FlightLease {
     pub finished_at: Option<DateTime<Utc>>,
     pub run_id: Option<String>,
     pub report: Option<RemoteFlightReport>,
+    #[serde(default)]
+    pub manifest: Option<FlightManifest>,
+    #[serde(default)]
+    pub parent_lease_id: Option<String>,
+    #[serde(default)]
+    pub root_lease_id: Option<String>,
+    #[serde(default = "default_flight_attempt")]
+    pub attempt: u32,
+}
+
+fn default_flight_attempt() -> u32 {
+    1
 }
 
 impl FlightLease {

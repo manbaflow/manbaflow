@@ -6,10 +6,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use manbaflow::calendar::{parse_workdays, summary as calendar_summary};
 use manbaflow::dashboard::DashboardSnapshot;
 use manbaflow::domain::{
-    ExecutorConfig, ExecutorKind, ExecutorMode, Flow, FlowChangeRequest, FlowMessage,
-    FlowMessageKind, NotificationConnector, NotificationDelivery, NotificationEndpoint,
-    NotificationStatus, OrganizationRole, PrincipalKind, Task, TrackingAttention,
-    TrackingEscalation, WorkCalendar,
+    ExecutorConfig, ExecutorKind, ExecutorMode, FlightManifestDraft, Flow, FlowChangeRequest,
+    FlowMessage, FlowMessageKind, NotificationConnector, NotificationDelivery,
+    NotificationEndpoint, NotificationStatus, OrganizationRole, PrincipalKind, RecoveryAction,
+    Task, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use manbaflow::gitlab::GitLabClient;
 use manbaflow::planner::PlannerKind;
@@ -649,12 +649,37 @@ enum TaskCommand {
         executor: ExecutorKindArg,
         #[arg(long, default_value_t = 3_600)]
         ttl_seconds: u64,
+        /// JSON 格式 FlightManifestDraft；省略时由塔台按任务生成
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     /// Human 在远程 Agent 起飞前撤销写入租约
     RevokeLease {
         lease: String,
         #[arg(long)]
         by: String,
+    },
+    /// 查看塔台按坠机类型与 FlightManifest 给出的恢复动作
+    RecoveryOptions {
+        lease: String,
+        #[arg(long)]
+        by: String,
+    },
+    /// Human 选择监督树恢复动作；可复飞、换执行器、缩小范围、转人工或停飞
+    Recover {
+        lease: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long, value_enum)]
+        action: RecoveryActionArg,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, value_enum)]
+        executor: Option<ExecutorKindArg>,
+        #[arg(long)]
+        objective: Option<String>,
+        #[arg(long, default_value_t = 3_600)]
+        ttl_seconds: u64,
     },
     /// 带 Evidence 提交人工验收
     Submit {
@@ -776,6 +801,16 @@ enum PlannerKindArg {
 enum ExecutorModeArg {
     Plan,
     Execute,
+}
+
+#[derive(Clone, ValueEnum)]
+enum RecoveryActionArg {
+    Retry,
+    SwitchExecutor,
+    ReduceScope,
+    HumanHandoff,
+    Ground,
+    Fork,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -1380,9 +1415,23 @@ async fn run(cli: Cli) -> Result<()> {
                 agent,
                 executor,
                 ttl_seconds,
+                manifest,
             } => {
-                let lease =
-                    app.authorize_remote_flight(&task, &by, &agent, executor.into(), ttl_seconds)?;
+                let manifest = manifest
+                    .map(|path| {
+                        let bytes = std::fs::read(path)?;
+                        Ok::<_, MambaError>(serde_json::from_slice::<FlightManifestDraft>(&bytes)?)
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let lease = app.authorize_remote_flight_with_manifest(
+                    &task,
+                    &by,
+                    &agent,
+                    executor.into(),
+                    ttl_seconds,
+                    manifest,
+                )?;
                 output(
                     &lease,
                     cli.json,
@@ -1398,6 +1447,38 @@ async fn run(cli: Cli) -> Result<()> {
             TaskCommand::RevokeLease { lease, by } => {
                 let lease = app.revoke_remote_flight(&lease, &by)?;
                 output(&lease, cli.json, format!("{} 已撤销租约 {}", by, lease.id));
+            }
+            TaskCommand::RecoveryOptions { lease, by } => {
+                let options = app.recovery_options(&lease, &by)?;
+                output(
+                    &options,
+                    cli.json,
+                    format!("租约 {lease} 可选恢复动作：{options:?}"),
+                );
+            }
+            TaskCommand::Recover {
+                lease,
+                by,
+                action,
+                reason,
+                executor,
+                objective,
+                ttl_seconds,
+            } => {
+                let recovered = app.recover_remote_flight(
+                    &lease,
+                    &by,
+                    action.into(),
+                    &reason,
+                    executor.map(Into::into),
+                    objective,
+                    ttl_seconds,
+                )?;
+                let message = recovered.as_ref().map_or_else(
+                    || format!("租约 {lease} 已转人工或永久停飞"),
+                    |child| format!("租约 {lease} 已分叉复飞，新航班 {}", child.id),
+                );
+                output(&recovered, cli.json, message);
             }
             TaskCommand::Submit { task, by } => {
                 let task = app.submit_task(&task, &by)?;
@@ -2333,6 +2414,19 @@ impl From<ExecutorModeArg> for ExecutorMode {
         match value {
             ExecutorModeArg::Plan => Self::Plan,
             ExecutorModeArg::Execute => Self::Execute,
+        }
+    }
+}
+
+impl From<RecoveryActionArg> for RecoveryAction {
+    fn from(value: RecoveryActionArg) -> Self {
+        match value {
+            RecoveryActionArg::Retry => Self::Retry,
+            RecoveryActionArg::SwitchExecutor => Self::SwitchExecutor,
+            RecoveryActionArg::ReduceScope => Self::ReduceScope,
+            RecoveryActionArg::HumanHandoff => Self::HumanHandoff,
+            RecoveryActionArg::Ground => Self::Ground,
+            RecoveryActionArg::Fork => Self::Fork,
         }
     }
 }

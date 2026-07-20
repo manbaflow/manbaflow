@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::domain::{
-    Evidence, ExecutorKind, ExecutorMode, FlightLease, FlightLeaseStatus, FlowMessage,
-    MessageInboxItem, Principal, RemoteFlightReport, Task, TaskStatus,
+    Evidence, ExecutorKind, ExecutorMode, FailureClass, FlightLease, FlightLeaseStatus,
+    FlowMessage, FuelUsage, MessageInboxItem, Principal, RemoteFlightReport, Task, TaskStatus,
 };
 use crate::error::{MambaError, Result};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
@@ -279,11 +279,12 @@ impl RemoteWorker {
         let pending_path = run_dir.join("flight-report.json");
         if pending_path.is_file() {
             let pending: PendingFlightResult = serde_json::from_slice(&fs::read(&pending_path)?)?;
-            self.control_plane
+            let finished = self
+                .control_plane
                 .finish_flight(&lease.id, pending.landed, &pending.report)
                 .await?;
             return Ok(WorkerOutcome {
-                status: if pending.landed {
+                status: if finished.status == FlightLeaseStatus::Landed {
                     WorkerOutcomeStatus::Executed
                 } else {
                     WorkerOutcomeStatus::Crashed
@@ -301,6 +302,8 @@ impl RemoteWorker {
             .join("worker-worktrees")
             .join(format!("{}-{run_id}", lease.id));
         let started_at = Utc::now();
+        let prompt = execute_prompt(&principal, item, &lease, &instructions);
+        let context_bytes = prompt.len() as u64;
 
         let (result, artifact) = {
             let worktree = if worktree_root.exists() {
@@ -310,7 +313,6 @@ impl RemoteWorker {
             };
             match worktree {
                 Ok(mut worktree) => {
-                    let prompt = execute_prompt(&principal, item, &lease, &instructions);
                     let execution = TerminalExecutor::run(ExecutionRequest {
                         kind: self.options.executor.clone(),
                         command: self.options.command.clone(),
@@ -343,7 +345,7 @@ impl RemoteWorker {
             }
         };
 
-        let (landed, summary, artifact) = match (result, artifact) {
+        let (landed, summary, artifact, cost_usd, failure_class) = match (result, artifact) {
             (Ok(output), Ok(artifact)) => {
                 let suffix = match artifact.changed_files.len() {
                     0 => "no file changes".to_string(),
@@ -354,26 +356,48 @@ impl RemoteWorker {
                     true,
                     truncate(&format!("{}; {suffix}", output.summary), 4_000),
                     artifact,
+                    output.cost_usd,
+                    None,
                 )
             }
-            (Err(error), Ok(artifact)) => (false, truncate(&error.to_string(), 4_000), artifact),
-            (Ok(_), Err(error)) => (
-                false,
-                truncate(&format!("artifact collection failed: {error}"), 4_000),
-                empty_artifact(),
-            ),
-            (Err(execution), Err(collection)) => (
-                false,
-                truncate(
-                    &format!("{execution}; artifact collection failed: {collection}"),
-                    4_000,
-                ),
-                empty_artifact(),
-            ),
+            (Err(error), Ok(artifact)) => {
+                let failure = classify_worker_error(&error);
+                (
+                    false,
+                    truncate(&error.to_string(), 4_000),
+                    artifact,
+                    None,
+                    Some(failure),
+                )
+            }
+            (Ok(output), Err(error)) => {
+                let failure = classify_worker_error(&error);
+                (
+                    false,
+                    truncate(&format!("artifact collection failed: {error}"), 4_000),
+                    empty_artifact(),
+                    output.cost_usd,
+                    Some(failure),
+                )
+            }
+            (Err(execution), Err(collection)) => {
+                let failure = classify_worker_error(&execution);
+                (
+                    false,
+                    truncate(
+                        &format!("{execution}; artifact collection failed: {collection}"),
+                        4_000,
+                    ),
+                    empty_artifact(),
+                    None,
+                    Some(failure),
+                )
+            }
         };
         if !log_path.is_file() {
             write_setup_blackbox(&log_path, &run_id, &MambaError::Validation(summary.clone()))?;
         }
+        let finished_at = Utc::now();
         let report = RemoteFlightReport {
             run_id: run_id.clone(),
             executor: self.options.executor.clone(),
@@ -383,7 +407,19 @@ impl RemoteWorker {
             patch_sha256: artifact.patch_sha256,
             log_sha256: sha256_file(&log_path)?,
             started_at,
-            finished_at: Utc::now(),
+            finished_at,
+            fuel: FuelUsage {
+                duration_seconds: finished_at
+                    .signed_duration_since(started_at)
+                    .num_seconds()
+                    .max(0) as u64,
+                context_bytes,
+                tokens: None,
+                tool_calls: None,
+                cost_usd,
+            },
+            failure_class,
+            budget_exhaustions: Vec::new(),
         };
         fs::write(
             &pending_path,
@@ -392,11 +428,12 @@ impl RemoteWorker {
                 report: report.clone(),
             })?,
         )?;
-        self.control_plane
+        let finished = self
+            .control_plane
             .finish_flight(&lease.id, landed, &report)
             .await?;
         Ok(WorkerOutcome {
-            status: if landed {
+            status: if finished.status == FlightLeaseStatus::Landed {
                 WorkerOutcomeStatus::Executed
             } else {
                 WorkerOutcomeStatus::Crashed
@@ -794,6 +831,21 @@ fn empty_artifact() -> WorktreeArtifact {
     }
 }
 
+fn classify_worker_error(error: &MambaError) -> FailureClass {
+    match error {
+        MambaError::ExecutorTimeout(_) => FailureClass::Timeout,
+        MambaError::PermissionDenied(_) => FailureClass::Permission,
+        MambaError::InvalidWorkspace(_) | MambaError::Io(_) => FailureClass::Resource,
+        MambaError::Validation(_) | MambaError::InvalidExecutorOutput(_) | MambaError::Json(_) => {
+            FailureClass::Validation
+        }
+        MambaError::ExecutorUnavailable(_)
+        | MambaError::ExecutorFailed { .. }
+        | MambaError::ExternalConnector(_) => FailureClass::Tool,
+        _ => FailureClass::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -947,6 +999,10 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
             finished_at: None,
             run_id: None,
             report: None,
+            manifest: None,
+            parent_lease_id: None,
+            root_lease_id: Some("LEASE-1".into()),
+            attempt: 1,
         };
         let state = MockState {
             principal: principal.clone(),
