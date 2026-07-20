@@ -622,18 +622,23 @@ async fn propose_flow_change(
     Json(input): Json<ProposeFlowChangeInput>,
 ) -> ApiResult<Json<FlowChangeRequest>> {
     let workspace = std::env::current_dir().map_err(MambaError::from)?;
-    let mut app = state.app.lock().await;
-    let principal = authenticate(&app, &headers)?;
-    let change = app
+    let (data_dir, principal_id) = {
+        let app = state.app.lock().await;
+        let principal = authenticate(&app, &headers)?;
+        (app.data_dir().to_path_buf(), principal.id)
+    };
+    let mut planning_app = MambaApp::open(data_dir)?;
+    let change = planning_app
         .propose_flow_change(
             &flow_id,
-            &principal.id,
+            &principal_id,
             &input.summary,
             PlannerKind::Local,
             &workspace,
             30,
         )
         .await?;
+    state.app.lock().await.reload()?;
     Ok(Json(change))
 }
 
