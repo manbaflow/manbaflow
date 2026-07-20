@@ -66,7 +66,9 @@ impl From<MambaError> for ApiError {
     fn from(error: MambaError) -> Self {
         let status = match &error {
             MambaError::NotFound { .. } => StatusCode::NOT_FOUND,
-            MambaError::InvalidTransition(_) => StatusCode::CONFLICT,
+            MambaError::InvalidTransition(_) | MambaError::ConcurrentModification { .. } => {
+                StatusCode::CONFLICT
+            }
             MambaError::PermissionDenied(_) => StatusCode::FORBIDDEN,
             MambaError::Validation(_) | MambaError::InvalidWorkspace(_) => StatusCode::BAD_REQUEST,
             MambaError::OrganizationNotInitialized => StatusCode::PRECONDITION_REQUIRED,

@@ -45,10 +45,13 @@ impl OrganizationState {
     }
 
     pub fn apply(&mut self, envelope: &EventEnvelope) -> Result<()> {
-        if envelope.sequence <= self.last_sequence {
+        let expected_sequence = self.last_sequence.checked_add(1).ok_or_else(|| {
+            MambaError::Validation("event sequence exceeded the supported range".into())
+        })?;
+        if envelope.sequence != expected_sequence {
             return Err(MambaError::Validation(format!(
-                "event sequence {} is not after {}",
-                envelope.sequence, self.last_sequence
+                "event sequence {} is not the expected next sequence {}",
+                envelope.sequence, expected_sequence
             )));
         }
 
@@ -947,5 +950,38 @@ impl OrganizationState {
         flow.p80_finish = revision.p80_finish;
         flow.critical_path = revision.critical_path.clone();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+    use crate::event::CURRENT_EVENT_VERSION;
+
+    #[test]
+    fn replay_rejects_event_stream_gaps() {
+        let organization = Organization {
+            id: "ORG-1".into(),
+            name: "Mamba".into(),
+            created_at: Utc::now(),
+        };
+        let envelope = EventEnvelope {
+            event_version: CURRENT_EVENT_VERSION,
+            sequence: 2,
+            id: "EVT-2".into(),
+            organization_id: organization.id.clone(),
+            flow_id: None,
+            actor: "admin".into(),
+            kind: "organization.initialized".into(),
+            event: DomainEvent::OrganizationInitialized { organization },
+            occurred_at: Utc::now(),
+        };
+
+        let error = OrganizationState::replay(&[envelope]).unwrap_err();
+        assert!(
+            matches!(error, MambaError::Validation(message) if message.contains("expected next sequence 1"))
+        );
     }
 }

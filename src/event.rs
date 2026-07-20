@@ -9,6 +9,12 @@ use crate::domain::{
     Principal, RemoteFlightReport, Task, Team, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 
+pub const CURRENT_EVENT_VERSION: u16 = 1;
+
+fn default_event_version() -> u16 {
+    CURRENT_EVENT_VERSION
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum DomainEvent {
@@ -396,6 +402,8 @@ impl DomainEvent {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EventEnvelope {
+    #[serde(default = "default_event_version")]
+    pub event_version: u16,
     pub sequence: i64,
     pub id: String,
     pub organization_id: String,

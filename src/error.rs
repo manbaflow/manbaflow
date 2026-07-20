@@ -25,6 +25,11 @@ pub enum MambaError {
     #[error("invalid state transition: {0}")]
     InvalidTransition(String),
 
+    #[error(
+        "event stream changed concurrently (expected sequence {expected}, actual {actual}); reload and retry"
+    )]
+    ConcurrentModification { expected: i64, actual: i64 },
+
     #[error("validation failed: {0}")]
     Validation(String),
 
