@@ -1426,7 +1426,12 @@ mod tests {
 
         let page = service
             .clone()
-            .oneshot(Request::builder().uri("/console").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/console")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(page.status(), StatusCode::OK);
