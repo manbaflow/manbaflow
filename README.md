@@ -516,14 +516,35 @@ Requester 能批准或驳回，Tower 才会从 Secret 调用 Microsoft Graph 或
 
 ## 快速开始
 
-需要 Rust stable。构建后会得到一个 `mamba` 二进制：
+### 团队直接部署
+
+不需要安装 Rust。准备 Docker 和 Docker Compose v2，在仓库目录运行：
+
+```bash
+./deploy/install.sh
+```
+
+安装器会启动 PostgreSQL 和 MambaFlow，询问真实组织、管理员与团队信息，输出一次性登录 Token；不会
+写入任何 Showcase 数据。默认 Console 是 `http://127.0.0.1:7777/console`。部署到已有域名并由 Caddy
+自动管理 HTTPS：
+
+```bash
+./deploy/install.sh --hosted flow.example.com
+```
+
+完整的无交互安装、成员接入、升级、备份和多 Tenant 托管方式见
+[团队安装手册](docs/INSTALLATION.md)。
+
+### 本地开发与可选演示
+
+源码开发需要 Rust stable。构建后会得到一个 `mamba` 二进制：
 
 ```bash
 cargo build --release
 ./target/release/mamba --help
 ```
 
-最快的体验方式是直接打开一座空塔台：
+需要演示数据时，可以直接打开一座空塔台：
 
 ```bash
 rm -rf .mambaflow-showcase

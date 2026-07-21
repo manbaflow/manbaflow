@@ -2,3 +2,5 @@
 .mambaflow/
 .mambaflow-showcase/
 *.log
+.env
+/backups/

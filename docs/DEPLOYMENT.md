@@ -1,5 +1,8 @@
 # MambaFlow 生产部署
 
+小团队和单机部署优先使用 [`deploy/install.sh`](INSTALLATION.md)，它会生成 Secret、启动 PostgreSQL、
+执行幂等 `mamba setup` 并等待服务 ready。本手册继续说明高可用、迁移和恢复边界。
+
 这份手册覆盖两种数据面：单节点使用一个 `mamba serve` 进程、一个 Tenant Catalog、每个 Tenant 一个
 SQLite Ledger；多副本使用共享 PostgreSQL。远程 Worker 分布在员工工作站并默认使用 Docker 沙箱。
 它不是多地域数据库方案，也不替代企业 IdP、TLS 入口、专用 Worker VM、网络策略或集中 Secret Manager。
@@ -66,6 +69,10 @@ IP、租户与路由限流。
 仓库根目录的 `Dockerfile` 使用多阶段构建，最终进程以 UID `10001` 的非 root 用户运行，并把
 `/var/lib/manbaflow` 声明为持久卷。默认容器命令已经包含非 loopback HTTP 的显式确认，只能部署在
 TLS Ingress 或可信 Service 网络之后。挂载卷必须允许 UID `10001` 写入。
+
+仓库 `compose.yaml` 使用 PostgreSQL 18；该官方镜像从 18 开始把持久卷改为 `/var/lib/postgresql`，不能
+沿用 17 及更早版本的 `/var/lib/postgresql/data`。修改镜像主版本前必须执行 PostgreSQL 官方升级流程，
+不能只替换 tag。
 
 ## 3. 身份与 Secret
 

@@ -1,0 +1,15 @@
+{
+	admin off
+}
+
+{$MAMBA_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy mamba:7777
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}

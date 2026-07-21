@@ -2,5 +2,7 @@
 .github
 .mambaflow
 .mambaflow-showcase
+.env
+backups
 target
 *.log

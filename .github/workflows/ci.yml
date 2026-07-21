@@ -46,9 +46,47 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate deployment assets
+        run: |
+          sh -n deploy/install.sh
+          sh -n deploy/manage.sh
+          cp .env.example .env
+          docker compose --profile hosted config --quiet
       - name: Build Remote Worker runtime
         run: >-
           docker build
           --file docker/agent-runtime/Dockerfile
           --tag manbaflow-agent-runtime:ci
           .
+
+  deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install a clean team stack
+        run: >-
+          ./deploy/install.sh
+          --local
+          --non-interactive
+          --organization "CI Team"
+          --administrator "CI Admin"
+          --team "Engineering"
+          --capabilities "product,delivery,rust"
+          --utc-offset +00:00
+          --token-ttl-days 1
+          --port 7780
+      - name: Verify clean production state
+        run: |
+          curl --fail --silent http://127.0.0.1:7780/health/ready
+          docker compose run --rm mamba --json dashboard --as "CI Admin" > /tmp/dashboard.json
+          test "$(jq -r '.metrics.total_flows' /tmp/dashboard.json)" = "0"
+          test "$(jq -r '.metrics.total_tasks' /tmp/dashboard.json)" = "0"
+          ./deploy/manage.sh backup /tmp/manbaflow-ci.dump
+          test -s /tmp/manbaflow-ci.dump
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose --profile hosted logs --tail 200
+      - name: Stop stack
+        if: always()
+        run: docker compose --profile hosted down --volumes

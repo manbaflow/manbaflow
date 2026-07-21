@@ -37,12 +37,14 @@ mod messages;
 mod notifications;
 mod office;
 mod policy;
+mod setup;
 mod tracking;
 
 use self::authority::Permission;
 use self::policy::ensure_status;
 
 pub use self::credentials::tenant_token_hint;
+pub use self::setup::{InstallationSetup, InstallationSetupOptions, SetupCreated};
 
 pub struct MambaApp {
     data_dir: PathBuf,

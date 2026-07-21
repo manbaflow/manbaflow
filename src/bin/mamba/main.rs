@@ -45,6 +45,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 幂等初始化生产组织、首个团队、管理员和登录 Token
+    Setup(SetupArgs),
     /// 打开全屏组织塔台
     Tui {
         #[arg(long = "as")]
@@ -158,6 +160,37 @@ enum Command {
         #[arg(long)]
         showcase: bool,
     },
+}
+
+#[derive(Args)]
+struct SetupArgs {
+    /// 企业或组织名称
+    #[arg(long)]
+    organization: String,
+    /// 首位 Tenant 管理员
+    #[arg(long)]
+    administrator: String,
+    /// 管理员所属的首个团队
+    #[arg(long, default_value = "Core Team")]
+    team: String,
+    /// 首个团队和管理员具备的业务能力
+    #[arg(long, default_value = "product,delivery,operations,backend,quality")]
+    capabilities: String,
+    /// 首次浏览器 Token 有效天数
+    #[arg(long, default_value_t = 30)]
+    token_ttl_days: u32,
+    /// 撤销现有 bootstrap-admin Token 并签发新 Token
+    #[arg(long)]
+    rotate_token: bool,
+    /// 管理员固定 UTC 偏移，例如 +08:00
+    #[arg(long, default_value = "+00:00")]
+    utc_offset: String,
+    #[arg(long, default_value = "mon,tue,wed,thu,fri")]
+    workdays: String,
+    #[arg(long, default_value = "09:00")]
+    day_start: String,
+    #[arg(long, default_value = "18:00")]
+    day_end: String,
 }
 
 #[derive(Subcommand)]
@@ -979,9 +1012,10 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let allow_postgres_bootstrap = matches!(
         &command,
-        Command::Org {
-            command: OrgCommand::Init { .. }
-        }
+        Command::Setup(_)
+            | Command::Org {
+                command: OrgCommand::Init { .. }
+            }
     );
     let mut app = open_selected_app(
         &cli.data_dir,
@@ -989,6 +1023,59 @@ async fn run(cli: Cli) -> Result<()> {
         allow_postgres_bootstrap,
     )?;
     match command {
+        Command::Setup(args) => {
+            let setup = app.setup_installation(manbaflow::app::InstallationSetupOptions {
+                organization_name: args.organization,
+                team_name: args.team,
+                administrator_name: args.administrator,
+                capabilities: args.capabilities,
+                token_ttl_days: args.token_ttl_days,
+                rotate_token: args.rotate_token,
+            })?;
+            let utc_offset = parse_utc_offset(&args.utc_offset)?;
+            let workdays = parse_workdays(&args.workdays)?;
+            let day_start = parse_clock_minute(&args.day_start, false)?;
+            let day_end = parse_clock_minute(&args.day_end, true)?;
+            let current = app.state().work_calendar(&setup.administrator.id)?.clone();
+            let calendar = if current.utc_offset_minutes == utc_offset
+                && current.working_days == workdays
+                && current.day_start_minute == day_start
+                && current.day_end_minute == day_end
+            {
+                current
+            } else {
+                app.configure_work_calendar(
+                    &setup.administrator.id,
+                    utc_offset,
+                    workdays,
+                    day_start,
+                    day_end,
+                    &setup.administrator.id,
+                )?
+            };
+            if cli.tenant.is_none() {
+                let mut catalog = TenantCatalog::configured(&cli.data_dir)?;
+                catalog.adopt_default(app.state().tenant()?)?;
+            }
+            let token_message = setup.token.as_deref().map_or_else(
+                || {
+                    "现有 bootstrap-admin Token 保持有效；如已遗失，请加 --rotate-token 重新签发"
+                        .to_string()
+                },
+                |token| format!("管理员 Token 只显示一次：{token}"),
+            );
+            output(
+                &json!({"setup": setup, "calendar": calendar}),
+                cli.json,
+                format!(
+                    "生产塔台就位：{} · {} · {}\n{}\nConsole：http://127.0.0.1:7777/console",
+                    setup.organization.name,
+                    setup.team.name,
+                    setup.administrator.name,
+                    token_message
+                ),
+            );
+        }
         Command::Tui { actor, workspace } => {
             manbaflow::tui::run(
                 &mut app,
