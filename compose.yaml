@@ -3,6 +3,7 @@ name: manbaflow
 services:
   postgres:
     image: postgres:18-alpine
+    profiles: ["local-db"]
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
@@ -27,9 +28,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    depends_on:
-      postgres:
-        condition: service_healthy
+    environment:
+      MAMBA_DATABASE_URL_FILE: /run/secrets/mamba-database-url
+    secrets:
+      - mamba-database-url
     command:
       - serve
       - --bind
@@ -73,3 +75,7 @@ volumes:
   mamba-data:
   caddy-data:
   caddy-config:
+
+secrets:
+  mamba-database-url:
+    file: ${MAMBA_DATABASE_URL_SECRET_FILE:-./deploy/secrets/database-url}

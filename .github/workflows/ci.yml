@@ -51,6 +51,8 @@ jobs:
           sh -n deploy/install.sh
           sh -n deploy/manage.sh
           cp .env.example .env
+          mkdir -p deploy/secrets
+          printf '%s\n' 'postgresql://mamba:secret@postgres/mamba' > deploy/secrets/database-url
           docker compose --profile hosted config --quiet
       - name: Build Remote Worker runtime
         run: >-
@@ -84,9 +86,29 @@ jobs:
           test "$(jq -r '.metrics.total_tasks' /tmp/dashboard.json)" = "0"
           ./deploy/manage.sh backup /tmp/manbaflow-ci.dump
           test -s /tmp/manbaflow-ci.dump
+      - name: Switch the installer to external PostgreSQL mode
+        run: |
+          cp deploy/secrets/database-url /tmp/external-database-url
+          ./deploy/install.sh \
+            --local \
+            --non-interactive \
+            --organization "CI Team" \
+            --administrator "CI Admin" \
+            --team "Engineering" \
+            --capabilities "product,delivery,rust" \
+            --utc-offset +00:00 \
+            --token-ttl-days 1 \
+            --port 7780 \
+            --database-url-file /tmp/external-database-url
+          test "$(sed -n 's/^MAMBA_DATABASE_MODE=//p' .env)" = "external"
+          if ./deploy/manage.sh backup /tmp/must-not-exist.dump; then
+            echo 'external database backup unexpectedly used the bundled pg_dump' >&2
+            exit 1
+          fi
+          test ! -e /tmp/must-not-exist.dump
       - name: Show service logs on failure
         if: failure()
-        run: docker compose --profile hosted logs --tail 200
+        run: docker compose --profile local-db --profile hosted logs --tail 200
       - name: Stop stack
         if: always()
-        run: docker compose --profile hosted down --volumes
+        run: docker compose --profile local-db --profile hosted down --volumes

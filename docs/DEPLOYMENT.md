@@ -41,6 +41,11 @@ export MAMBA_DATABASE_URL='postgresql://mamba@db.internal/manbaflow?sslmode=requ
 mamba --data-dir /var/lib/manbaflow serve --bind 127.0.0.1:7777
 ```
 
+Compose 安装器使用更严格的文件入口：连接串保存在 `deploy/secrets/database-url`，容器只设置
+`MAMBA_DATABASE_URL_FILE=/run/secrets/mamba-database-url`。直接运行二进制仍可使用
+`MAMBA_DATABASE_URL`；两者同时存在时服务拒绝启动，避免实际数据源含糊不清。远程数据库安装示例见
+[团队安装手册](INSTALLATION.md#4-使用远程-postgresql)。
+
 所有副本共享 `mamba_tenants`、`mamba_events`、`mamba_streams`、`mamba_api_credentials` 和
 `mamba_artifacts`。每次提交在事务
 内对 Tenant 的 `mamba_streams` 行执行 `FOR UPDATE`，校验预期 sequence 后才追加事件；每个 API 请求先

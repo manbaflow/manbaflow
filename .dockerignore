@@ -4,5 +4,6 @@
 .mambaflow-showcase
 .env
 backups
+deploy/secrets
 target
 *.log

@@ -535,6 +535,15 @@ Requester 能批准或驳回，Tower 才会从 Secret 调用 Microsoft Graph 或
 完整的无交互安装、成员接入、升级、备份和多 Tenant 托管方式见
 [团队安装手册](docs/INSTALLATION.md)。
 
+使用 RDS、Cloud SQL 或公司 PostgreSQL 时，把连接串保存在独立文件并交给安装器：
+
+```bash
+./deploy/install.sh \
+  --database-url-file /secure/path/manbaflow-database-url
+```
+
+连接串会复制为只读 Docker Secret，不进入容器环境列表或镜像构建上下文。
+
 ### 本地开发与可选演示
 
 源码开发需要 Rust stable。构建后会得到一个 `mamba` 二进制：

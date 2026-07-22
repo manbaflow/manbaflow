@@ -425,18 +425,55 @@ fn decode_postgres_record(row: postgres::Row) -> Result<TenantRecord> {
 }
 
 pub fn database_url_from_env() -> Result<Option<String>> {
-    let Some(value) = std::env::var_os("MAMBA_DATABASE_URL") else {
-        return Ok(None);
-    };
-    let value = value
-        .into_string()
-        .map_err(|_| MambaError::Validation("MAMBA_DATABASE_URL must be valid UTF-8".into()))?;
-    if value.trim().is_empty() {
+    let direct = unicode_environment("MAMBA_DATABASE_URL")?;
+    let file = unicode_environment("MAMBA_DATABASE_URL_FILE")?.map(PathBuf::from);
+    database_url_from_sources(direct, file)
+}
+
+fn database_url_from_sources(
+    direct: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<Option<String>> {
+    if direct.is_some() && file.is_some() {
         return Err(MambaError::Validation(
-            "MAMBA_DATABASE_URL cannot be empty".into(),
+            "configure only one of MAMBA_DATABASE_URL or MAMBA_DATABASE_URL_FILE".into(),
         ));
     }
-    Ok(Some(value))
+    let (value, source) = match (direct, file) {
+        (Some(value), None) => (value, "MAMBA_DATABASE_URL"),
+        (None, Some(path)) => {
+            if path.as_os_str().is_empty() || !path.is_file() {
+                return Err(MambaError::Validation(
+                    "MAMBA_DATABASE_URL_FILE must point to a readable regular file".into(),
+                ));
+            }
+            (
+                fs::read_to_string(&path).map_err(|_| {
+                    MambaError::Validation(
+                        "MAMBA_DATABASE_URL_FILE could not be read as UTF-8".into(),
+                    )
+                })?,
+                "MAMBA_DATABASE_URL_FILE",
+            )
+        }
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => unreachable!("conflicting database sources were rejected"),
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(MambaError::Validation(format!("{source} cannot be empty")));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn unicode_environment(name: &str) -> Result<Option<String>> {
+    std::env::var_os(name)
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| MambaError::Validation(format!("{name} must be valid UTF-8")))
+        })
+        .transpose()
 }
 
 fn decode_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TenantRecord> {
@@ -570,5 +607,32 @@ mod tests {
                 .register(&tenant("TEN-bad", "Bad"), "bad", "../bad")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn database_url_file_is_trimmed_and_conflicts_are_rejected() {
+        let directory = tempdir().unwrap();
+        let secret = directory.path().join("database-url");
+        fs::write(
+            &secret,
+            "  postgresql://mamba:secret@database.example/mamba?sslmode=require\n",
+        )
+        .unwrap();
+        assert_eq!(
+            database_url_from_sources(None, Some(secret.clone())).unwrap(),
+            Some("postgresql://mamba:secret@database.example/mamba?sslmode=require".into())
+        );
+        assert!(
+            database_url_from_sources(Some("postgresql://direct/db".into()), Some(secret)).is_err()
+        );
+    }
+
+    #[test]
+    fn database_url_file_must_be_nonempty_and_regular() {
+        let directory = tempdir().unwrap();
+        let empty = directory.path().join("empty");
+        fs::write(&empty, " \n").unwrap();
+        assert!(database_url_from_sources(None, Some(empty)).is_err());
+        assert!(database_url_from_sources(None, Some(directory.path().into())).is_err());
     }
 }

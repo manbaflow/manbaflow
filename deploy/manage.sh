@@ -20,14 +20,29 @@ compose() {
 
 start_stack() {
     domain=$(env_value MAMBA_DOMAIN)
+    database_mode=$(env_value MAMBA_DATABASE_MODE)
+    profiles=
+    if [ "$database_mode" = local ]; then
+        profiles="--profile local-db"
+    elif [ "$database_mode" != external ]; then
+        printf '%s\n' 'MAMBA_DATABASE_MODE must be local or external' >&2
+        exit 1
+    fi
     if [ -n "$domain" ]; then
-        compose --profile hosted up -d
+        # shellcheck disable=SC2086
+        compose $profiles --profile hosted up -d
     else
-        compose up -d postgres mamba
+        # shellcheck disable=SC2086
+        compose $profiles up -d
     fi
 }
 
 backup_database() {
+    database_mode=$(env_value MAMBA_DATABASE_MODE)
+    if [ "$database_mode" != local ]; then
+        printf '%s\n' 'external PostgreSQL backups must be created and verified with the database provider' >&2
+        exit 1
+    fi
     user=$(env_value POSTGRES_USER)
     database=$(env_value POSTGRES_DB)
     timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -35,7 +50,7 @@ backup_database() {
     output=${1:-"$directory/manbaflow-$timestamp.dump"}
     mkdir -p "$(dirname -- "$output")"
     [ ! -e "$output" ] || { printf 'backup already exists: %s\n' "$output" >&2; exit 1; }
-    compose exec -T postgres pg_dump -U "$user" -d "$database" --format=custom >"$output"
+    compose --profile local-db exec -T postgres pg_dump -U "$user" -d "$database" --format=custom >"$output"
     chmod 600 "$output"
     printf 'Backup created: %s\n' "$output"
 }
@@ -43,23 +58,38 @@ backup_database() {
 command=${1:-status}
 case "$command" in
     status)
-        compose ps
+        compose --profile local-db --profile hosted ps
         ;;
     logs)
         shift || true
-        compose logs --tail 200 -f "$@"
+        compose --profile local-db --profile hosted logs --tail 200 -f "$@"
         ;;
     start)
         start_stack
         ;;
     stop)
-        compose --profile hosted down
+        compose --profile local-db --profile hosted down
         ;;
     backup)
         backup_database "${2:-}"
         ;;
     upgrade)
-        backup_database
+        database_mode=$(env_value MAMBA_DATABASE_MODE)
+        case "$database_mode" in
+            local)
+                backup_database
+                ;;
+            external)
+                if [ "${2:-}" != "--external-backup-confirmed" ]; then
+                    printf '%s\n' 'create a provider snapshot, then rerun upgrade --external-backup-confirmed' >&2
+                    exit 1
+                fi
+                ;;
+            *)
+                printf '%s\n' 'MAMBA_DATABASE_MODE must be local or external' >&2
+                exit 1
+                ;;
+        esac
         image=$(env_value MAMBA_IMAGE)
         if [ "$image" = "manbaflow:local" ]; then
             compose build --pull mamba
@@ -69,7 +99,7 @@ case "$command" in
         start_stack
         ;;
     *)
-        printf 'Usage: %s {status|logs [service]|start|stop|backup [path]|upgrade}\n' "$0" >&2
+        printf 'Usage: %s {status|logs [service]|start|stop|backup [path]|upgrade [--external-backup-confirmed]}\n' "$0" >&2
         exit 2
         ;;
 esac
