@@ -279,7 +279,9 @@ fi
 
 if [ -n "$DATABASE_URL" ]; then
     printf '%s\n' "$DATABASE_URL" >"$DATABASE_SECRET_FILE"
-    chmod 600 "$DATABASE_SECRET_FILE"
+    # Compose file secrets are bind mounts and cannot remap ownership to UID 10001.
+    # The 0700 parent directory protects the 0644 file from other host users.
+    chmod 644 "$DATABASE_SECRET_FILE"
 fi
 [ -s "$DATABASE_SECRET_FILE" ] || { printf '%s\n' 'database URL Secret is empty' >&2; exit 1; }
 

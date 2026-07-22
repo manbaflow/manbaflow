@@ -82,7 +82,8 @@ printf '%s\n' \
 
 安装器把内容复制到 Git 和 Docker build context 都会忽略的 `deploy/secrets/database-url`，以只读 Docker
 Secret 挂载到 `/run/secrets/mamba-database-url`。应用只获得文件路径，不把连接串放进容器环境列表或
-命令参数。`--database-url URL` 也受支持，但会留在 shell history，生产环境优先使用文件参数。
+命令参数。Secret 目录权限为 `0700`；其中的文件需要让容器内非 root UID `10001` 可读，但宿主机其他
+用户无法穿过父目录。`--database-url URL` 也受支持，但会留在 shell history，生产环境优先使用文件参数。
 
 远程数据库必须满足：
 
