@@ -9,8 +9,23 @@
 
 FROM rust:bookworm AS builder
 
+# 集群在 cn-hangzhou，直连 crates.io 拉依赖会卡住：上一次构建 cargo fmt
+# 空转了 23 分钟没有任何输出，全花在下载索引和 crate 上。
+# 用和 apt 同一个阿里云镜像（那边实测 17 秒装完全部包）。
+# 在国外构建时用 --build-arg CARGO_MIRROR=sparse+https://index.crates.io/ 关掉。
+ARG CARGO_MIRROR=sparse+https://mirrors.aliyun.com/crates.io-index/
+RUN mkdir -p "$CARGO_HOME" && printf '%s\n' \
+        '[source.crates-io]' \
+        'replace-with = "mirror"' \
+        '[source.mirror]' \
+        "registry = \"${CARGO_MIRROR}\"" \
+        > "$CARGO_HOME/config.toml"
+
 WORKDIR /build
+# 依赖下载单独一层：只依赖 Cargo.lock，改源码不会让它失效。
 COPY Cargo.toml Cargo.lock rust-toolchain.toml README.md LICENSE ./
+RUN cargo fetch --locked
+
 COPY src ./src
 COPY tests ./tests
 
