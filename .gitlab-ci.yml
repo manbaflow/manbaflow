@@ -90,12 +90,13 @@ build_agent_runtime:
       --progress=plain
       --local context=.
       --local dockerfile=.
+  # 只手动触发。原来带 changes 规则，但 web/api 触发的流水线没有 diff 基准，
+  # changes 会判定为「变了」而每次都跑，跟 build_production 抢同一个 buildkit
+  # 守护进程，导致 auth session 混在一起、推镜像被拒。
+  # 这个镜像只在 Remote Worker 沙箱要用，不随控制面每次提交变化。
   rules:
     - if: '$CI_COMMIT_MESSAGE =~ /^\[skip\]/'
       when: never
-    - changes:
-        - docker/agent-runtime/Dockerfile
-      when: always
     - when: manual
       allow_failure: true
 
