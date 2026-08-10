@@ -95,8 +95,7 @@ impl DockerSandboxConfig {
                 "Docker image inspect did not return a sha256 image ID".into(),
             ));
         }
-        let user = self.user.clone().unwrap_or(current_user()?);
-        validate_user(&user)?;
+        let user = resolve_sandbox_user(self.user.clone(), current_user)?;
         Ok(ResolvedDockerSandbox {
             config: self,
             image_id,
@@ -318,6 +317,24 @@ fn validate_environment_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// 决定容器以哪个用户运行：显式指定优先，没指定才回退到宿主机当前用户。
+///
+/// `fallback` 必须惰性调用。之前这里写的是 `self.user.clone().unwrap_or(current_user()?)`，
+/// 而 `unwrap_or` 的参数是立即求值的——宿主机是 root 时 `current_user()` 会先返回
+/// 「must use non-root numeric UID:GID」，于是即使显式传了 `--sandbox-user`
+/// 也起不来，正好堵死「以 root 跑 Worker、显式指定容器用户」这个最该支持的场景。
+fn resolve_sandbox_user(
+    explicit: Option<String>,
+    fallback: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    let user = match explicit {
+        Some(user) => user,
+        None => fallback()?,
+    };
+    validate_user(&user)?;
+    Ok(user)
+}
+
 fn validate_user(user: &str) -> Result<()> {
     let Some((uid, gid)) = user.split_once(':') else {
         return Err(RelayError::Validation(
@@ -470,6 +487,32 @@ mod tests {
             invocation.lines().collect::<Vec<_>>(),
             ["container", "rm", "--force", "relay-WRUN-cancelled"]
         );
+    }
+
+    #[test]
+    fn explicit_sandbox_user_wins_even_when_the_host_user_is_unusable() {
+        // 宿主机是 root（或 `id` 取不到）时，fallback 一定失败。显式指定的用户
+        // 必须照常生效，否则以 root 跑 Worker 就没法指定容器用户了。
+        let resolved = resolve_sandbox_user(Some("1000:1000".into()), || {
+            Err(RelayError::Validation(
+                "Docker sandbox user must use non-root numeric UID:GID".into(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(resolved, "1000:1000");
+    }
+
+    #[test]
+    fn sandbox_user_falls_back_to_the_host_user_when_unspecified() {
+        let resolved = resolve_sandbox_user(None, || Ok("501:20".into())).unwrap();
+        assert_eq!(resolved, "501:20");
+    }
+
+    #[test]
+    fn explicit_root_sandbox_user_is_still_rejected() {
+        // 放宽的只是求值时机，不是校验本身。
+        let error = resolve_sandbox_user(Some("0:0".into()), || Ok("1000:1000".into()));
+        assert!(error.is_err());
     }
 
     fn config() -> DockerSandboxConfig {
