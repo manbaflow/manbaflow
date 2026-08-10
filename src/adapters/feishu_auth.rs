@@ -188,6 +188,14 @@ impl FeishuProvider {
 
         // 外部企业的用户也能走完整个 OAuth 流程，所以这一步不能省。
         if !self.provisioning.allows(&profile.tenant_key) {
+            // 把被拒的 tenant_key 记进服务端日志：首次部署时管理员往往不知道本企业的
+            // tenant_key（查询它需要 tenant:tenant:readonly 权限），让第一次登录失败
+            // 直接把值告诉运维，比让人去翻后台快得多。
+            // 只进日志不进 HTTP 响应——没必要告诉浏览器端本部署放行了哪些企业。
+            eprintln!(
+                "Feishu sign-in rejected: tenant_key={} is not in RELAY_FEISHU_ALLOWED_TENANT_KEYS",
+                profile.tenant_key
+            );
             return Err(RelayError::PermissionDenied(
                 "Feishu tenant is not allowed to sign in".into(),
             ));

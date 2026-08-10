@@ -70,8 +70,27 @@ kubectl -n relay create secret generic relay-feishu \
 整个 OAuth 流程**，`tenant_key` 是唯一能区分本企业员工的字段。漏配等于对全网开放，所以
 适配器在缺失时直接拒绝启动。
 
-不知道自己企业的 `tenant_key`：先用一个已知同事登录一次，失败日志里会带上被拒的 key；
-或者调一次任意飞书服务端 API，响应里都有。
+### 怎么拿到本企业的 `tenant_key`
+
+用 API 查（`GET /open-apis/tenant/v2/tenant/query`）需要 `tenant:tenant:readonly` 权限，
+当前这个应用没开，申请要走审批。更快的办法是**让第一次登录失败**：
+
+先随便填一个值把服务跑起来，点一次「用飞书登录」，然后读日志：
+
+```bash
+kubectl -n relay logs deploy/relay | grep "Feishu sign-in rejected"
+# Feishu sign-in rejected: tenant_key=xxxxxxxx is not in RELAY_FEISHU_ALLOWED_TENANT_KEYS
+```
+
+把日志里的值填回 Secret 并重启即可：
+
+```bash
+kubectl -n relay delete secret relay-feishu
+kubectl -n relay create secret generic relay-feishu --from-literal=... # 用真实 tenant_key
+kubectl -n relay rollout restart deploy/relay
+```
+
+`tenant_key` 只是企业标识，不是密钥，进日志是安全的；它不会出现在 HTTP 响应里。
 
 不建 `relay-feishu` 这个 Secret 也能正常部署，只是首页没有飞书登录入口。
 
