@@ -14,13 +14,17 @@ default:
     - mkdir -p ~/.docker
     - cat /etc/ssl/edumind/ca.crt >> /etc/ssl/certs/ca-certificates.crt
     - |
-      if [ -z "${CI_JOB_TOKEN:-}" ]; then
-        echo "Missing CI_JOB_TOKEN" >&2
+      if [ -z "${REGISTRY_PAT:-}" ]; then
+        echo "Missing REGISTRY_PAT (project CI variable)" >&2
         exit 1
       fi
-      # 用字面量 gitlab-ci-token + CI_JOB_TOKEN，与 platform/console 一致——
-      # 那是本实例上已验证能用 job token 推镜像的写法。
-      REGISTRY_AUTH=$(printf '%s:%s' 'gitlab-ci-token' "${CI_JOB_TOKEN}" | base64 | tr -d '\n')
+      # 这里不能用 CI_JOB_TOKEN。运行时镜像基于 debian:bookworm-slim，与
+      # agent/multimodal_agent/dev 共享层；推送时 buildkit 会请求从那个仓库
+      # 跨仓库挂载已有 blob，于是把它的 pull scope 一并塞进令牌请求：
+      #   [auth] agent/multimodal_agent/dev:pull platform/relay/main:pull,push
+      # job token 只对本项目有权，整个请求拿不到 push，registry 返回
+      # insufficient_scope。用带 read_registry 的 PAT 才能覆盖到源仓库。
+      REGISTRY_AUTH=$(printf '%s:%s' 'QeuryEnd' "${REGISTRY_PAT}" | base64 | tr -d '\n')
     - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${REGISTRY_AUTH}\"}}}" > ~/.docker/config.json
 
 stages:
