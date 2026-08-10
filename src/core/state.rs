@@ -11,7 +11,7 @@ use crate::domain::{
     PrincipalKind, ResourceLease, ResourceLeaseStatus, RoleBinding, StagedArtifact, TargetKind,
     TaskStatus, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 
 #[derive(Clone, Debug, Default)]
@@ -55,10 +55,10 @@ impl OrganizationState {
 
     pub fn apply(&mut self, envelope: &EventEnvelope) -> Result<()> {
         let expected_sequence = self.last_sequence.checked_add(1).ok_or_else(|| {
-            MambaError::Validation("event sequence exceeded the supported range".into())
+            RelayError::Validation("event sequence exceeded the supported range".into())
         })?;
         if envelope.sequence != expected_sequence {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "event sequence {} is not the expected next sequence {}",
                 envelope.sequence, expected_sequence
             )));
@@ -67,13 +67,13 @@ impl OrganizationState {
         match &envelope.event {
             DomainEvent::TenantInitialized { tenant } => {
                 if self.tenant.is_some() {
-                    return Err(MambaError::TenantAlreadyInitialized);
+                    return Err(RelayError::TenantAlreadyInitialized);
                 }
                 self.tenant = Some(tenant.clone());
             }
             DomainEvent::OrganizationInitialized { organization } => {
                 if self.organization.is_some() {
-                    return Err(MambaError::OrganizationAlreadyInitialized);
+                    return Err(RelayError::OrganizationAlreadyInitialized);
                 }
                 self.organization = Some(organization.clone());
             }
@@ -92,7 +92,7 @@ impl OrganizationState {
                     .values()
                     .any(|team| team.id != *team_id && team.name.eq_ignore_ascii_case(name))
                 {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "team already exists: {name}"
                     )));
                 }
@@ -102,14 +102,14 @@ impl OrganizationState {
                             && team.directory_external_id.as_ref() == Some(external_id)
                     })
                 }) {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "directory Group externalId already exists".into(),
                     ));
                 }
                 let team = self
                     .teams
                     .get_mut(team_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "team",
                         id: team_id.clone(),
                     })?;
@@ -140,7 +140,7 @@ impl OrganizationState {
                 if self.principals.values().any(|principal| {
                     principal.id != *principal_id && principal.name.eq_ignore_ascii_case(name)
                 }) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "principal already exists: {name}"
                     )));
                 }
@@ -151,14 +151,14 @@ impl OrganizationState {
                             .as_deref()
                             .is_some_and(|current| current.eq_ignore_ascii_case(user_name))
                 }) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "directory userName already exists: {user_name}"
                     )));
                 }
                 let principal =
                     self.principals
                         .get_mut(principal_id)
-                        .ok_or_else(|| MambaError::NotFound {
+                        .ok_or_else(|| RelayError::NotFound {
                             entity: "principal",
                             id: principal_id.clone(),
                         })?;
@@ -171,7 +171,7 @@ impl OrganizationState {
                 let tenant = self.tenant()?;
                 let organization = self.organization()?;
                 if binding.tenant_id != tenant.id || binding.organization_id != organization.id {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "role binding scope does not match the active tenant and organization"
                             .into(),
                     ));
@@ -182,7 +182,7 @@ impl OrganizationState {
                         && existing.principal_id == binding.principal_id
                         && existing.role == binding.role
                 }) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "principal {} already has role {}",
                         binding.principal_id, binding.role
                     )));
@@ -198,12 +198,12 @@ impl OrganizationState {
                 let binding =
                     self.role_bindings
                         .get_mut(binding_id)
-                        .ok_or_else(|| MambaError::NotFound {
+                        .ok_or_else(|| RelayError::NotFound {
                             entity: "role binding",
                             id: binding_id.clone(),
                         })?;
                 if !binding.is_active() {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "role binding {binding_id} is already revoked"
                     )));
                 }
@@ -212,14 +212,14 @@ impl OrganizationState {
             }
             DomainEvent::ExternalIdentityBound { binding } => {
                 if self.external_identities.contains_key(&binding.id) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "external identity binding already exists: {}",
                         binding.id
                     )));
                 }
                 let principal = self.principal(&binding.principal_id)?;
                 if principal.kind != PrincipalKind::Human || !principal.active {
-                    return Err(MambaError::PermissionDenied(
+                    return Err(RelayError::PermissionDenied(
                         "external identities can only bind to an active Human principal".into(),
                     ));
                 }
@@ -229,7 +229,7 @@ impl OrganizationState {
                         && (candidate.external_user_id == binding.external_user_id
                             || candidate.principal_id == binding.principal_id)
                 }) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "active {} identity is already bound",
                         binding.provider
                     )));
@@ -245,12 +245,12 @@ impl OrganizationState {
                 let binding = self
                     .external_identities
                     .get_mut(binding_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "external identity binding",
                         id: binding_id.clone(),
                     })?;
                 if !binding.is_active() {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "external identity binding {binding_id} is already inactive"
                     )));
                 }
@@ -266,7 +266,7 @@ impl OrganizationState {
             DomainEvent::TimeOffAdded { block } => {
                 self.principal(&block.principal_id)?;
                 let calendar = self.calendars.get_mut(&block.principal_id).ok_or_else(|| {
-                    MambaError::NotFound {
+                    RelayError::NotFound {
                         entity: "work calendar",
                         id: block.principal_id.clone(),
                     }
@@ -276,7 +276,7 @@ impl OrganizationState {
                     .iter()
                     .any(|existing| existing.id == block.id)
                 {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "time off block already exists: {}",
                         block.id
                     )));
@@ -292,7 +292,7 @@ impl OrganizationState {
                 let calendar =
                     self.calendars
                         .get_mut(principal_id)
-                        .ok_or_else(|| MambaError::NotFound {
+                        .ok_or_else(|| RelayError::NotFound {
                             entity: "work calendar",
                             id: principal_id.clone(),
                         })?;
@@ -300,12 +300,12 @@ impl OrganizationState {
                     .time_off
                     .iter_mut()
                     .find(|block| block.id == *block_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "time off block",
                         id: block_id.clone(),
                     })?;
                 if !block.is_active() {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "time off block {block_id} is already cancelled"
                     )));
                 }
@@ -314,7 +314,7 @@ impl OrganizationState {
             }
             DomainEvent::NotificationEndpointRegistered { endpoint } => {
                 if self.notification_endpoints.contains_key(&endpoint.id) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "notification endpoint already exists: {}",
                         endpoint.id
                     )));
@@ -330,12 +330,12 @@ impl OrganizationState {
                 let endpoint = self
                     .notification_endpoints
                     .get_mut(endpoint_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "notification endpoint",
                         id: endpoint_id.clone(),
                     })?;
                 if !endpoint.active {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "notification endpoint {endpoint_id} is already disabled"
                     )));
                 }
@@ -356,12 +356,12 @@ impl OrganizationState {
                 let endpoint = self
                     .notification_endpoints
                     .get(&delivery.endpoint_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "notification endpoint",
                         id: delivery.endpoint_id.clone(),
                     })?;
                 if !endpoint.active || self.notification_deliveries.contains_key(&delivery.id) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "notification delivery {} cannot be queued",
                         delivery.id
                     )));
@@ -380,7 +380,7 @@ impl OrganizationState {
                     delivery.status,
                     NotificationStatus::Delivered | NotificationStatus::Cancelled
                 ) {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "notification delivery {delivery_id} is already delivered"
                     )));
                 }
@@ -403,7 +403,7 @@ impl OrganizationState {
                     delivery.status,
                     NotificationStatus::Delivered | NotificationStatus::Cancelled
                 ) {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "delivered notification {delivery_id} cannot fail"
                     )));
                 }
@@ -424,13 +424,13 @@ impl OrganizationState {
                 revoked_at,
             } => {
                 let credential = self.credentials.get_mut(credential_id).ok_or_else(|| {
-                    MambaError::NotFound {
+                    RelayError::NotFound {
                         entity: "API credential",
                         id: credential_id.clone(),
                     }
                 })?;
                 if credential.principal_id != *principal_id {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "API credential {} does not belong to principal {}",
                         credential_id, principal_id
                     )));
@@ -459,7 +459,7 @@ impl OrganizationState {
                 self.flow(&message.flow_id)?;
                 if let Some(task_id) = &message.task_id {
                     self.flow(&message.flow_id)?.task(task_id).ok_or_else(|| {
-                        MambaError::NotFound {
+                        RelayError::NotFound {
                             entity: "task",
                             id: task_id.clone(),
                         }
@@ -489,12 +489,12 @@ impl OrganizationState {
                 let message =
                     self.messages
                         .get_mut(message_id)
-                        .ok_or_else(|| MambaError::NotFound {
+                        .ok_or_else(|| RelayError::NotFound {
                             entity: "flow message",
                             id: message_id.clone(),
                         })?;
                 if message.flow_id != *flow_id {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "flow message {message_id} does not belong to flow {flow_id}"
                     )));
                 }
@@ -504,7 +504,7 @@ impl OrganizationState {
                         .iter()
                         .any(|recipient| recipient.id == acknowledgement.recipient_id)
                     {
-                        return Err(MambaError::Validation(format!(
+                        return Err(RelayError::Validation(format!(
                             "flow message {message_id} has no recipient {}",
                             acknowledgement.recipient_id
                         )));
@@ -528,7 +528,7 @@ impl OrganizationState {
             } => {
                 let flow = self.flow_mut(flow_id)?;
                 flow.status = FlowStatus::Active;
-                let task = flow.task_mut(task_id).ok_or_else(|| MambaError::NotFound {
+                let task = flow.task_mut(task_id).ok_or_else(|| RelayError::NotFound {
                     entity: "task",
                     id: task_id.clone(),
                 })?;
@@ -558,7 +558,7 @@ impl OrganizationState {
             } => {
                 let task = self.task_mut(flow_id, task_id)?;
                 if task.assignment.as_ref() != previous_assignment.as_ref() {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "task {task_id} reassignment does not match its previous owner"
                     )));
                 }
@@ -588,12 +588,12 @@ impl OrganizationState {
                 let request =
                     self.flow_changes
                         .get(request_id)
-                        .ok_or_else(|| MambaError::NotFound {
+                        .ok_or_else(|| RelayError::NotFound {
                             entity: "flow change request",
                             id: request_id.clone(),
                         })?;
                 if request.flow_id != *flow_id || request.status != FlowChangeStatus::Proposed {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "flow change request {request_id} cannot be applied"
                     )));
                 }
@@ -602,7 +602,7 @@ impl OrganizationState {
                     if flow.task(&task.id).is_some()
                         || flow.tasks.iter().any(|existing| existing.key == task.key)
                     {
-                        return Err(MambaError::Validation(format!(
+                        return Err(RelayError::Validation(format!(
                             "flow change request adds duplicate task {}",
                             task.key
                         )));
@@ -626,12 +626,12 @@ impl OrganizationState {
                 let request =
                     self.flow_changes
                         .get_mut(request_id)
-                        .ok_or_else(|| MambaError::NotFound {
+                        .ok_or_else(|| RelayError::NotFound {
                             entity: "flow change request",
                             id: request_id.clone(),
                         })?;
                 if request.flow_id != *flow_id || request.status != FlowChangeStatus::Proposed {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "flow change request {request_id} cannot be rejected"
                     )));
                 }
@@ -724,7 +724,7 @@ impl OrganizationState {
             DomainEvent::ExternalInteractionProcessed { receipt } => {
                 let key = format!("{}:{}", receipt.provider, receipt.delivery_id);
                 if self.external_interactions.contains_key(&key) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "external interaction already processed: {key}"
                     )));
                 }
@@ -754,7 +754,7 @@ impl OrganizationState {
             DomainEvent::TrackingAttentionRaised { attention } => {
                 self.flow(&attention.flow_id)?
                     .task(&attention.task_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "task",
                         id: attention.task_id.clone(),
                     })?;
@@ -772,7 +772,7 @@ impl OrganizationState {
                 let attention =
                     self.attentions
                         .get_mut(attention_id)
-                        .ok_or_else(|| MambaError::NotFound {
+                        .ok_or_else(|| RelayError::NotFound {
                             entity: "tracking attention",
                             id: attention_id.clone(),
                         })?;
@@ -780,7 +780,7 @@ impl OrganizationState {
                     || attention.task_id != *task_id
                     || attention.kind != *kind
                 {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "tracking attention {} resolution does not match its source",
                         attention_id
                     )));
@@ -791,14 +791,14 @@ impl OrganizationState {
                 let attention = self
                     .attentions
                     .get(&escalation.attention_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "tracking attention",
                         id: escalation.attention_id.clone(),
                     })?;
                 if attention.flow_id != escalation.flow_id
                     || attention.task_id != escalation.task_id
                 {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "tracking escalation {} does not match its attention",
                         escalation.id
                     )));
@@ -834,7 +834,7 @@ impl OrganizationState {
             DomainEvent::RemoteFlightAuthorized { lease } => {
                 self.flow(&lease.flow_id)?
                     .task(&lease.task_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "task",
                         id: lease.task_id.clone(),
                     })?;
@@ -846,7 +846,7 @@ impl OrganizationState {
                 let flight = self
                     .flight_leases
                     .get(&lease.flight_lease_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "flight lease",
                         id: lease.flight_lease_id.clone(),
                     })?;
@@ -854,14 +854,14 @@ impl OrganizationState {
                     || flight.task_id != lease.task_id
                     || flight.principal_id != lease.principal_id
                 {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "resource lease does not match its flight".into(),
                     ));
                 }
                 if self.resource_leases.values().any(|active| {
                     active.id != lease.id && active.conflicts_with(&lease.claim, lease.issued_at)
                 }) {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "resource {:?}:{} is already leased",
                         lease.claim.kind, lease.claim.key
                     )));
@@ -878,17 +878,17 @@ impl OrganizationState {
                 let lease = self
                     .resource_leases
                     .get_mut(resource_lease_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "resource lease",
                         id: resource_lease_id.clone(),
                     })?;
                 if lease.flow_id != *flow_id || lease.task_id != *task_id {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "resource release does not match its flight scope".into(),
                     ));
                 }
                 if lease.status != ResourceLeaseStatus::Active {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "resource lease {resource_lease_id} is already released"
                     )));
                 }
@@ -912,18 +912,18 @@ impl OrganizationState {
                 let lease = self
                     .flight_leases
                     .get(&artifact.flight_lease_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "flight lease",
                         id: artifact.flight_lease_id.clone(),
                     })?;
                 if lease.flow_id != artifact.flow_id || lease.task_id != artifact.task_id {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "artifact {} does not match flight scope",
                         artifact.id
                     )));
                 }
                 if lease.status != FlightLeaseStatus::Active {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "flight {} cannot stage artifacts while {:?}",
                         lease.id, lease.status
                     )));
@@ -932,7 +932,7 @@ impl OrganizationState {
                     existing.flight_lease_id == artifact.flight_lease_id
                         && existing.path == artifact.path
                 }) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "flight artifact path already staged: {}",
                         artifact.path
                     )));
@@ -948,13 +948,13 @@ impl OrganizationState {
                     || request.dispatch_id.is_some()
                     || request.result.is_some()
                 {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "Office release {} has invalid initial state",
                         request.id
                     )));
                 }
                 if self.office_releases.contains_key(&request.id) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "Office release already exists: {}",
                         request.id
                     )));
@@ -971,7 +971,7 @@ impl OrganizationState {
             } => {
                 let release = self.office_release_mut(release_id, flow_id, task_id)?;
                 if release.status != OfficeReleaseStatus::Requested {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "Office release {release_id} is {:?}, expected requested",
                         release.status
                     )));
@@ -991,7 +991,7 @@ impl OrganizationState {
             } => {
                 let release = self.office_release_mut(release_id, flow_id, task_id)?;
                 if release.status != OfficeReleaseStatus::Requested {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "Office release {release_id} is {:?}, expected requested",
                         release.status
                     )));
@@ -1010,7 +1010,7 @@ impl OrganizationState {
             } => {
                 let release = self.office_release_mut(release_id, flow_id, task_id)?;
                 if release.status != OfficeReleaseStatus::Approved {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "Office release {release_id} is {:?}, expected approved",
                         release.status
                     )));
@@ -1060,7 +1060,7 @@ impl OrganizationState {
             } => {
                 let release = self.office_release_mut(release_id, flow_id, task_id)?;
                 if release.status != OfficeReleaseStatus::Failed {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "Office release {release_id} is {:?}, expected failed",
                         release.status
                     )));
@@ -1083,7 +1083,7 @@ impl OrganizationState {
                 let release = self.office_release_mut(release_id, flow_id, task_id)?;
                 ensure_office_dispatch(release, dispatch_id)?;
                 if release.payload.retry_safe(release.provider) != *retry_safe {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "Office release {release_id} recovery safety does not match its payload"
                     )));
                 }
@@ -1115,13 +1115,13 @@ impl OrganizationState {
                     || request.dispatch_id.is_some()
                     || request.result.is_some()
                 {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "GitLab write {} has invalid initial state",
                         request.id
                     )));
                 }
                 if self.gitlab_writes.contains_key(&request.id) {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "GitLab write already exists: {}",
                         request.id
                     )));
@@ -1138,7 +1138,7 @@ impl OrganizationState {
             } => {
                 let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
                 if request.status != GitLabWriteStatus::Requested {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "GitLab write {write_id} is {:?}, expected requested",
                         request.status
                     )));
@@ -1158,7 +1158,7 @@ impl OrganizationState {
             } => {
                 let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
                 if request.status != GitLabWriteStatus::Requested {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "GitLab write {write_id} is {:?}, expected requested",
                         request.status
                     )));
@@ -1177,7 +1177,7 @@ impl OrganizationState {
             } => {
                 let request = self.gitlab_write_mut(write_id, flow_id, task_id)?;
                 if request.status != GitLabWriteStatus::Approved {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "GitLab write {write_id} is {:?}, expected approved",
                         request.status
                     )));
@@ -1230,7 +1230,7 @@ impl OrganizationState {
                     request.status,
                     GitLabWriteStatus::Failed | GitLabWriteStatus::Indeterminate
                 ) {
-                    return Err(MambaError::InvalidTransition(format!(
+                    return Err(RelayError::InvalidTransition(format!(
                         "GitLab write {write_id} is {:?}, expected failed or indeterminate",
                         request.status
                     )));
@@ -1297,7 +1297,7 @@ impl OrganizationState {
             }
             DomainEvent::FlightRecoveryDecided { decision, .. } => {
                 if !self.flight_leases.contains_key(&decision.parent_lease_id) {
-                    return Err(MambaError::NotFound {
+                    return Err(RelayError::NotFound {
                         entity: "parent flight lease",
                         id: decision.parent_lease_id.clone(),
                     });
@@ -1319,11 +1319,11 @@ impl OrganizationState {
     pub fn organization(&self) -> Result<&Organization> {
         self.organization
             .as_ref()
-            .ok_or(MambaError::OrganizationNotInitialized)
+            .ok_or(RelayError::OrganizationNotInitialized)
     }
 
     pub fn tenant(&self) -> Result<&Tenant> {
-        self.tenant.as_ref().ok_or(MambaError::TenantNotInitialized)
+        self.tenant.as_ref().ok_or(RelayError::TenantNotInitialized)
     }
 
     pub fn roles_for(&self, principal_id: &str) -> Vec<OrganizationRole> {
@@ -1345,14 +1345,14 @@ impl OrganizationState {
     }
 
     pub fn flow(&self, id: &str) -> Result<&Flow> {
-        self.flows.get(id).ok_or_else(|| MambaError::NotFound {
+        self.flows.get(id).ok_or_else(|| RelayError::NotFound {
             entity: "flow",
             id: id.to_string(),
         })
     }
 
     pub fn flow_mut(&mut self, id: &str) -> Result<&mut Flow> {
-        self.flows.get_mut(id).ok_or_else(|| MambaError::NotFound {
+        self.flows.get_mut(id).ok_or_else(|| RelayError::NotFound {
             entity: "flow",
             id: id.to_string(),
         })
@@ -1366,7 +1366,7 @@ impl OrganizationState {
                     .values()
                     .find(|principal| principal.name.eq_ignore_ascii_case(id_or_name))
             })
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "principal",
                 id: id_or_name.to_string(),
             })
@@ -1384,7 +1384,7 @@ impl OrganizationState {
                     && binding.provider == provider
                     && binding.external_user_id == external_user_id
             })
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "active external identity",
                 id: format!("{provider}:{external_user_id}"),
             })
@@ -1394,7 +1394,7 @@ impl OrganizationState {
         let principal = self.principal(id_or_name)?;
         self.calendars
             .get(&principal.id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "work calendar",
                 id: principal.id.clone(),
             })
@@ -1403,7 +1403,7 @@ impl OrganizationState {
     fn notification_delivery_mut(&mut self, id: &str) -> Result<&mut NotificationDelivery> {
         self.notification_deliveries
             .get_mut(id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "notification delivery",
                 id: id.to_string(),
             })
@@ -1417,7 +1417,7 @@ impl OrganizationState {
                     .values()
                     .find(|team| team.name.eq_ignore_ascii_case(id_or_name))
             })
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "team",
                 id: id_or_name.to_string(),
             })
@@ -1427,7 +1427,7 @@ impl OrganizationState {
         self.flows
             .values()
             .find_map(|flow| flow.task(task_id).map(|task| (flow, task)))
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "task",
                 id: task_id.to_string(),
             })
@@ -1454,12 +1454,12 @@ impl OrganizationState {
         let lease = self
             .flight_leases
             .get_mut(lease_id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flight lease",
                 id: lease_id.to_string(),
             })?;
         if lease.flow_id != flow_id || lease.task_id != task_id {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "flight lease {lease_id} does not match its task"
             )));
         }
@@ -1475,12 +1475,12 @@ impl OrganizationState {
         let release =
             self.office_releases
                 .get_mut(release_id)
-                .ok_or_else(|| MambaError::NotFound {
+                .ok_or_else(|| RelayError::NotFound {
                     entity: "Office release",
                     id: release_id.to_string(),
                 })?;
         if release.flow_id != flow_id || release.task_id != task_id {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "Office release {release_id} does not match its task"
             )));
         }
@@ -1496,12 +1496,12 @@ impl OrganizationState {
         let request = self
             .gitlab_writes
             .get_mut(write_id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "GitLab write",
                 id: write_id.to_string(),
             })?;
         if request.flow_id != flow_id || request.task_id != task_id {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "GitLab write {write_id} does not match flow/task scope"
             )));
         }
@@ -1517,12 +1517,12 @@ impl OrganizationState {
         let escalation =
             self.escalations
                 .get_mut(escalation_id)
-                .ok_or_else(|| MambaError::NotFound {
+                .ok_or_else(|| RelayError::NotFound {
                     entity: "tracking escalation",
                     id: escalation_id.to_string(),
                 })?;
         if escalation.flow_id != flow_id || escalation.task_id != task_id {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "tracking escalation {} event does not match its source",
                 escalation_id
             )));
@@ -1533,7 +1533,7 @@ impl OrganizationState {
     fn task_mut(&mut self, flow_id: &str, task_id: &str) -> Result<&mut crate::domain::Task> {
         self.flow_mut(flow_id)?
             .task_mut(task_id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "task",
                 id: task_id.to_string(),
             })
@@ -1558,7 +1558,7 @@ impl OrganizationState {
         let flow = self.flow_mut(flow_id)?;
         for task in &mut flow.tasks {
             let estimate = revision.task_estimates.get(&task.id).ok_or_else(|| {
-                MambaError::Validation(format!(
+                RelayError::Validation(format!(
                     "flow schedule revision has no estimate for task {}",
                     task.id
                 ))
@@ -1566,7 +1566,7 @@ impl OrganizationState {
             task.estimate = estimate.clone();
         }
         if revision.task_estimates.len() != flow.tasks.len() {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "flow schedule revision for {flow_id} has unexpected tasks"
             )));
         }
@@ -1581,7 +1581,7 @@ fn ensure_office_dispatch(release: &OfficeReleaseRequest, dispatch_id: &str) -> 
     if release.status != OfficeReleaseStatus::Dispatching
         || release.dispatch_id.as_deref() != Some(dispatch_id)
     {
-        return Err(MambaError::InvalidTransition(format!(
+        return Err(RelayError::InvalidTransition(format!(
             "Office release {} is not owned by dispatch {dispatch_id}",
             release.id
         )));
@@ -1593,7 +1593,7 @@ fn ensure_gitlab_dispatch(request: &GitLabWriteRequest, dispatch_id: &str) -> Re
     if request.status != GitLabWriteStatus::Dispatching
         || request.dispatch_id.as_deref() != Some(dispatch_id)
     {
-        return Err(MambaError::InvalidTransition(format!(
+        return Err(RelayError::InvalidTransition(format!(
             "GitLab write {} is not owned by dispatch {dispatch_id}",
             request.id
         )));
@@ -1612,7 +1612,7 @@ mod tests {
     fn replay_rejects_event_stream_gaps() {
         let organization = Organization {
             id: "ORG-1".into(),
-            name: "Mamba".into(),
+            name: "Relay".into(),
             created_at: Utc::now(),
         };
         let envelope = EventEnvelope {
@@ -1629,7 +1629,7 @@ mod tests {
 
         let error = OrganizationState::replay(&[envelope]).unwrap_err();
         assert!(
-            matches!(error, MambaError::Validation(message) if message.contains("expected next sequence 1"))
+            matches!(error, RelayError::Validation(message) if message.contains("expected next sequence 1"))
         );
     }
 }

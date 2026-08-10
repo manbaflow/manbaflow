@@ -1,15 +1,15 @@
 use chrono::{DateTime, Duration, Utc};
 
-use super::MambaApp;
+use super::RelayApp;
 use super::authority::Permission;
 use crate::domain::{AvailabilityBlock, FlowScheduleRevision, FlowStatus, WorkCalendar, Workday};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 use crate::scheduler::reschedule;
 use crate::state::OrganizationState;
 
-impl MambaApp {
+impl RelayApp {
     #[allow(clippy::too_many_arguments)]
     pub fn configure_work_calendar(
         &mut self,
@@ -79,17 +79,17 @@ impl MambaApp {
         }
         let reason = reason.trim();
         if reason.is_empty() || reason.chars().count() > 500 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "time off reason must contain 1 to 500 characters".into(),
             ));
         }
         if starts_at >= ends_at {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "time off must end after it starts".into(),
             ));
         }
         if ends_at.signed_duration_since(starts_at) > Duration::days(366) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "one time off block cannot exceed 366 days".into(),
             ));
         }
@@ -109,7 +109,7 @@ impl MambaApp {
         projected
             .calendars
             .get_mut(&principal.id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "work calendar",
                 id: principal.id.clone(),
             })?
@@ -149,12 +149,12 @@ impl MambaApp {
             .iter()
             .find(|block| block.id == block_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "time off block",
                 id: block_id.to_string(),
             })?;
         if !block.is_active() {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "time off block {block_id} is already cancelled"
             )));
         }
@@ -169,7 +169,7 @@ impl MambaApp {
                     .iter_mut()
                     .find(|block| block.id == block_id)
             })
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "time off block",
                 id: block_id.to_string(),
             })?;

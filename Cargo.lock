@@ -1615,37 +1615,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "manbaflow"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "chrono",
- "clap",
- "crossterm",
- "hmac 0.13.0",
- "native-tls",
- "openidconnect",
- "postgres",
- "postgres-native-tls",
- "ratatui",
- "reqwest 0.13.4",
- "rusqlite",
- "rustls",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sha2 0.11.0",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "uuid",
-]
-
-[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2585,6 +2554,37 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "relay"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "crossterm",
+ "hmac 0.13.0",
+ "native-tls",
+ "openidconnect",
+ "postgres",
+ "postgres-native-tls",
+ "ratatui",
+ "reqwest 0.13.4",
+ "rusqlite",
+ "rustls",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2 0.11.0",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "uuid",
+]
 
 [[package]]
 name = "reqwest"

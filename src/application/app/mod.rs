@@ -13,7 +13,7 @@ use crate::domain::{
     OrganizationRole, Principal, PrincipalKind, RemoteFlightReport, RoleBinding, TargetKind, Task,
     TaskDraft, TaskStatus, Team, Tenant,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
 use crate::ids::{new_id, normalize_capability, parse_capabilities};
@@ -46,7 +46,7 @@ use self::policy::ensure_status;
 pub use self::credentials::tenant_token_hint;
 pub use self::setup::{InstallationSetup, InstallationSetupOptions, SetupCreated};
 
-pub struct MambaApp {
+pub struct RelayApp {
     data_dir: PathBuf,
     store: FlowStore,
     state: OrganizationState,
@@ -72,7 +72,7 @@ fn restrict_data_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-impl MambaApp {
+impl RelayApp {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
@@ -98,7 +98,7 @@ impl MambaApp {
         if let (Some(expected), Some(actual)) = (store.tenant_id(), state.tenant.as_ref())
             && expected != actual.id
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "PostgreSQL stream {expected} contains events for tenant {}",
                 actual.id
             )));
@@ -108,7 +108,7 @@ impl MambaApp {
             store,
             state,
         };
-        if let Err(MambaError::ConcurrentModification { .. }) = app.migrate_legacy_authority() {
+        if let Err(RelayError::ConcurrentModification { .. }) = app.migrate_legacy_authority() {
             app.migrate_legacy_authority()?;
         }
         Ok(app)
@@ -155,15 +155,15 @@ impl MambaApp {
 
     pub fn init_organization(&mut self, name: &str, actor: &str) -> Result<Organization> {
         if self.state.organization.is_some() {
-            return Err(MambaError::OrganizationAlreadyInitialized);
+            return Err(RelayError::OrganizationAlreadyInitialized);
         }
         if name.trim().is_empty() {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "organization name cannot be empty".into(),
             ));
         }
         if self.state.tenant.is_some() {
-            return Err(MambaError::TenantAlreadyInitialized);
+            return Err(RelayError::TenantAlreadyInitialized);
         }
         let now = Utc::now();
         let tenant = Tenant {
@@ -197,7 +197,7 @@ impl MambaApp {
         self.state.organization()?;
         self.ensure_permission(actor, Permission::OrganizationManage)?;
         if name.trim().is_empty() {
-            return Err(MambaError::Validation("team name cannot be empty".into()));
+            return Err(RelayError::Validation("team name cannot be empty".into()));
         }
         if self
             .state
@@ -205,7 +205,7 @@ impl MambaApp {
             .values()
             .any(|team| team.name.eq_ignore_ascii_case(name.trim()))
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "team already exists: {}",
                 name.trim()
             )));
@@ -237,12 +237,12 @@ impl MambaApp {
         self.state.organization()?;
         self.ensure_permission(actor, Permission::PrincipalManage)?;
         if name.trim().is_empty() {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "principal name cannot be empty".into(),
             ));
         }
         if !(1..=100).contains(&capacity_percent) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "capacity must be between 1 and 100".into(),
             ));
         }
@@ -252,13 +252,13 @@ impl MambaApp {
             .values()
             .any(|principal| principal.name.eq_ignore_ascii_case(name.trim()))
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "principal already exists: {}",
                 name.trim()
             )));
         }
         if kind == PrincipalKind::Human && (owner.is_some() || executor.is_some()) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "a human cannot have an owner or terminal executor".into(),
             ));
         }
@@ -269,7 +269,7 @@ impl MambaApp {
             .map(|value| {
                 let principal = self.state.principal(value)?;
                 if principal.kind != PrincipalKind::Human {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "an agent owner must be a human".into(),
                     ));
                 }
@@ -279,7 +279,7 @@ impl MambaApp {
         if let Some(config) = &executor
             && !config.workspace.is_dir()
         {
-            return Err(MambaError::InvalidWorkspace(config.workspace.clone()));
+            return Err(RelayError::InvalidWorkspace(config.workspace.clone()));
         }
         let default_role = match &kind {
             PrincipalKind::Human
@@ -343,23 +343,23 @@ impl MambaApp {
     ) -> Result<Flow> {
         self.state.organization()?;
         if summary.trim().is_empty() {
-            return Err(MambaError::Validation("demand cannot be empty".into()));
+            return Err(RelayError::Validation("demand cannot be empty".into()));
         }
         if self.state.principals.is_empty() {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "register at least one human or agent before creating a demand".into(),
             ));
         }
         let requester = self.state.principal(requester)?;
         if requester.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "a demand requester must be a registered human".into(),
             ));
         }
         self.ensure_permission(&requester.id, Permission::DemandCreate)?;
         let requester = requester.name.clone();
         if !workspace.is_dir() {
-            return Err(MambaError::InvalidWorkspace(workspace.to_path_buf()));
+            return Err(RelayError::InvalidWorkspace(workspace.to_path_buf()));
         }
 
         let flow_id = new_id("FLOW");
@@ -420,19 +420,19 @@ impl MambaApp {
     pub fn approve_flow(&mut self, flow_id: &str, approved_by: &str) -> Result<Flow> {
         let approver = self.state.principal(approved_by)?;
         if approver.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "flow approval requires a registered human".into(),
             ));
         }
         let flow = self.state.flow(flow_id)?.clone();
         if flow.demand.requester != approver.name && flow.demand.requester != approver.id {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "only demand requester {} can approve flow {}",
                 flow.demand.requester, flow.id
             )));
         }
         if flow.status != FlowStatus::Draft {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flow {} is {:?}, expected draft",
                 flow.id, flow.status
             )));
@@ -446,7 +446,7 @@ impl MambaApp {
             let assignment = task
                 .assignment
                 .as_ref()
-                .ok_or_else(|| MambaError::NoEligibleAssignee(task.title.clone()))?;
+                .ok_or_else(|| RelayError::NoEligibleAssignee(task.title.clone()))?;
             events.push(DomainEvent::WorkRequestSent {
                 flow_id: flow.id.clone(),
                 task_id: task.id.clone(),
@@ -496,7 +496,7 @@ impl MambaApp {
         effort_hours: f64,
     ) -> Result<Task> {
         if !effort_hours.is_finite() || effort_hours <= 0.0 || effort_hours > 100_000.0 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "estimate must be greater than zero and at most 100000 hours".into(),
             ));
         }
@@ -515,7 +515,7 @@ impl MambaApp {
         let mut updated_flow = flow.clone();
         updated_flow
             .task_mut(&task.id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "task",
                 id: task.id.clone(),
             })?
@@ -557,19 +557,19 @@ impl MambaApp {
     ) -> Result<Vec<AssignmentTarget>> {
         let principal = self.state.principal(actor)?;
         if principal.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "task reassignment requires a human requester".into(),
             ));
         }
         let (flow, task) = self.state.find_task(task_id)?;
         if !matches!(flow.status, FlowStatus::Approved | FlowStatus::Active) {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flow {} is {:?}; only an approved or active flow can be reassigned",
                 flow.id, flow.status
             )));
         }
         if flow.demand.requester != principal.id && flow.demand.requester != principal.name {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "only demand requester {} can reassign task {}",
                 flow.demand.requester, task.id
             )));
@@ -640,7 +640,7 @@ impl MambaApp {
     ) -> Result<Flow> {
         let reason = reason.trim();
         if reason.is_empty() || reason.chars().count() > 1_000 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "reassignment reason must contain 1 to 1000 characters".into(),
             ));
         }
@@ -651,7 +651,7 @@ impl MambaApp {
                 candidate.id == new_owner || candidate.name.eq_ignore_ascii_case(new_owner)
             })
             .ok_or_else(|| {
-                MambaError::Validation(format!(
+                RelayError::Validation(format!(
                     "{new_owner} is not an eligible reassignment target for task {task_id}"
                 ))
             })?;
@@ -661,7 +661,7 @@ impl MambaApp {
             lease.task_id == task.id
                 && (lease.status == FlightLeaseStatus::Active || lease.is_claimable_at(now))
         }) {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "task {} has an open flight lease; revoke or finish it before reassignment",
                 task.id
             )));
@@ -671,7 +671,7 @@ impl MambaApp {
         for value in copilots {
             let target = self.resolve_active_target(value)?;
             if target.id == owner.id {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "task owner cannot also be a copilot".into(),
                 ));
             }
@@ -694,7 +694,7 @@ impl MambaApp {
         let mut updated_flow = flow.clone();
         let updated_task = updated_flow
             .task_mut(&task.id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "task",
                 id: task.id.clone(),
             })?;
@@ -749,35 +749,35 @@ impl MambaApp {
     ) -> Result<FlowChangeRequest> {
         let summary = summary.trim();
         if summary.is_empty() || summary.chars().count() > 4_000 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "flow change summary must contain 1 to 4000 characters".into(),
             ));
         }
         if !workspace.is_dir() {
-            return Err(MambaError::InvalidWorkspace(workspace.to_path_buf()));
+            return Err(RelayError::InvalidWorkspace(workspace.to_path_buf()));
         }
         if self.state.flow_changes.values().any(|request| {
             request.flow_id == flow_id && request.status == FlowChangeStatus::Proposed
         }) {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flow {flow_id} already has a proposed change awaiting a decision"
             )));
         }
         let requester = self.state.principal(actor)?.clone();
         if requester.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "flow change requests require a human requester".into(),
             ));
         }
         let flow = self.state.flow(flow_id)?.clone();
         if flow.demand.requester != requester.id && flow.demand.requester != requester.name {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "only demand requester {} can revise flow {}",
                 flow.demand.requester, flow.id
             )));
         }
         if !matches!(flow.status, FlowStatus::Approved | FlowStatus::Active) {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flow {} is {:?}; only approved or active flows can be revised",
                 flow.id, flow.status
             )));
@@ -801,7 +801,7 @@ impl MambaApp {
         .await?;
         let additions = validate_append_only_revision(&flow, &plan.tasks)?;
         if additions.len() > 20 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "one flow change can append at most 20 tasks".into(),
             ));
         }
@@ -826,13 +826,13 @@ impl MambaApp {
                 let assignment = assignments
                     .get(&draft.key)
                     .cloned()
-                    .ok_or_else(|| MambaError::NoEligibleAssignee(draft.title.clone()))?;
+                    .ok_or_else(|| RelayError::NoEligibleAssignee(draft.title.clone()))?;
                 let depends_on = draft
                     .depends_on
                     .iter()
                     .map(|dependency| {
                         ids.get(dependency).cloned().ok_or_else(|| {
-                            MambaError::Validation(format!(
+                            RelayError::Validation(format!(
                                 "new task {} depends on unknown task {dependency}",
                                 draft.key
                             ))
@@ -965,7 +965,7 @@ impl MambaApp {
         let flow = self.state.flow(flow_id)?;
         let principal = self.state.principal(actor)?;
         if !self.principal_has_flow_access(flow, principal) {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "{} cannot access flow {}",
                 principal.name, flow.id
             )));
@@ -998,7 +998,7 @@ impl MambaApp {
             .flow_changes
             .get(request_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flow change request",
                 id: request_id.to_string(),
             })?;
@@ -1006,13 +1006,13 @@ impl MambaApp {
         if principal.kind != PrincipalKind::Human
             || (flow.demand.requester != principal.id && flow.demand.requester != principal.name)
         {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "only demand requester {} can approve flow change {}",
                 flow.demand.requester, request.id
             )));
         }
         if request.status != FlowChangeStatus::Proposed {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flow change {} is {:?}",
                 request.id, request.status
             )));
@@ -1025,7 +1025,7 @@ impl MambaApp {
         if current_statuses != request.base_task_statuses
             || flow.p80_finish != request.base_p80_finish
         {
-            return Err(MambaError::InvalidTransition(
+            return Err(RelayError::InvalidTransition(
                 "flow changed after this preview; generate a fresh change request".into(),
             ));
         }
@@ -1073,7 +1073,7 @@ impl MambaApp {
     ) -> Result<FlowChangeRequest> {
         let reason = reason.trim();
         if reason.is_empty() || reason.chars().count() > 1_000 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "flow change rejection reason must contain 1 to 1000 characters".into(),
             ));
         }
@@ -1083,7 +1083,7 @@ impl MambaApp {
             .flow_changes
             .get(request_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flow change request",
                 id: request_id.to_string(),
             })?;
@@ -1091,13 +1091,13 @@ impl MambaApp {
         if principal.kind != PrincipalKind::Human
             || (flow.demand.requester != principal.id && flow.demand.requester != principal.name)
         {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "only demand requester {} can reject flow change {}",
                 flow.demand.requester, request.id
             )));
         }
         if request.status != FlowChangeStatus::Proposed {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flow change {} is {:?}",
                 request.id, request.status
             )));
@@ -1181,7 +1181,7 @@ impl MambaApp {
     ) -> Result<Evidence> {
         let (flow, task) = self.task_snapshot(task_id)?;
         if task.status.is_terminal() {
-            return Err(MambaError::InvalidTransition(
+            return Err(RelayError::InvalidTransition(
                 "cannot add evidence to a terminal task".into(),
             ));
         }
@@ -1303,7 +1303,7 @@ impl MambaApp {
                     continue;
                 }
                 let task = self.state.flow(flow_id)?.task(task_id).ok_or_else(|| {
-                    MambaError::NotFound {
+                    RelayError::NotFound {
                         entity: "task",
                         id: task_id.clone(),
                     }
@@ -1355,7 +1355,7 @@ impl MambaApp {
     pub fn admin_dashboard(&self, actor: &str) -> Result<DashboardSnapshot> {
         let principal = self.state.principal(actor)?;
         if principal.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "organization dashboard requires a human identity".into(),
             ));
         }
@@ -1392,7 +1392,7 @@ impl MambaApp {
     ) -> Result<FlightLease> {
         self.expire_remote_flights("tower://lease-reaper")?;
         if !(60..=86_400).contains(&ttl_seconds) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "flight lease TTL must be between 60 and 86400 seconds".into(),
             ));
         }
@@ -1409,18 +1409,18 @@ impl MambaApp {
         self.ensure_task_actor(&task, authorized_by)?;
         let human = self.state.principal(authorized_by)?.clone();
         if human.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "remote write authorization requires a human".into(),
             ));
         }
         let worker = self.state.principal(worker)?.clone();
         if worker.kind != PrincipalKind::Agent {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "a remote flight lease can only target an agent".into(),
             ));
         }
         if worker.owner_id.as_deref() != Some(human.id.as_str()) {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "{} can only authorize a personal agent they own",
                 human.name
             )));
@@ -1432,7 +1432,7 @@ impl MambaApp {
                 && lease.principal_id == worker.id
                 && (lease.status == FlightLeaseStatus::Active || lease.is_claimable_at(now))
         }) {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "task {} already has an open flight lease for {}",
                 task.id, worker.name
             )));
@@ -1509,7 +1509,7 @@ impl MambaApp {
     pub fn revoke_remote_flight(&mut self, lease_id: &str, actor: &str) -> Result<FlightLease> {
         let principal = self.state.principal(actor)?.clone();
         if principal.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "flight lease revocation requires a human".into(),
             ));
         }
@@ -1518,18 +1518,18 @@ impl MambaApp {
             .flight_leases
             .get(lease_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flight lease",
                 id: lease_id.to_string(),
             })?;
         if lease.authorized_by != principal.name {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "only {} can revoke flight lease {}",
                 lease.authorized_by, lease.id
             )));
         }
         if lease.status != FlightLeaseStatus::Authorized {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flight lease {} is {:?}; only an unclaimed lease can be revoked",
                 lease.id, lease.status
             )));
@@ -1556,7 +1556,7 @@ impl MambaApp {
         validate_run_id(run_id)?;
         let principal = self.state.principal(actor)?.clone();
         if principal.kind != PrincipalKind::Agent {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "only the authorized remote agent can claim a flight lease".into(),
             ));
         }
@@ -1565,19 +1565,19 @@ impl MambaApp {
             .flight_leases
             .get(lease_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flight lease",
                 id: lease_id.to_string(),
             })?;
         if lease.principal_id != principal.id {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "flight lease {} belongs to another agent",
                 lease.id
             )));
         }
         let now = Utc::now();
         if !lease.is_claimable_at(now) {
-            return Err(MambaError::InvalidTransition(if lease.expires_at <= now {
+            return Err(RelayError::InvalidTransition(if lease.expires_at <= now {
                 format!("flight lease {} has expired", lease.id)
             } else {
                 format!("flight lease {} is {:?}", lease.id, lease.status)
@@ -1627,12 +1627,12 @@ impl MambaApp {
             .flight_leases
             .get(lease_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flight lease",
                 id: lease_id.to_string(),
             })?;
         if lease.principal_id != principal.id {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "flight lease {} belongs to another agent",
                 lease.id
             )));
@@ -1661,7 +1661,7 @@ impl MambaApp {
             return Ok(lease);
         }
         if lease.status != FlightLeaseStatus::Active {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flight lease {} is {:?}, expected active",
                 lease.id, lease.status
             )));
@@ -1781,7 +1781,7 @@ impl MambaApp {
                 .iter()
                 .any(|artifact| artifact.verified)
         {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "attach evidence or sync a verified external artifact before submission".into(),
             ));
         }
@@ -1800,13 +1800,13 @@ impl MambaApp {
     pub fn complete_task(&mut self, task_id: &str, actor: &str) -> Result<Task> {
         let principal = self.state.principal(actor)?;
         if principal.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "task completion requires a registered human".into(),
             ));
         }
         let (flow, task) = self.task_snapshot(task_id)?;
         if flow.demand.requester != principal.name && flow.demand.requester != principal.id {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "only demand requester {} can complete task {}",
                 flow.demand.requester, task.id
             )));
@@ -1857,13 +1857,13 @@ impl MambaApp {
         if mode == ExecutorMode::Execute
             && self.state.principal(requested_by)?.kind != PrincipalKind::Human
         {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "execute mode requires an assigned human to authorize takeoff".into(),
             ));
         }
         let executor = self.resolve_executor(&task, executor_principal)?.clone();
         let config = executor.executor.clone().ok_or_else(|| {
-            MambaError::Validation(format!("{} has no terminal executor", executor.name))
+            RelayError::Validation(format!("{} has no terminal executor", executor.name))
         })?;
         let execution_id = new_id("RUN");
         let log_path = self
@@ -1982,7 +1982,7 @@ impl MambaApp {
         let assignment = task
             .assignment
             .as_ref()
-            .ok_or_else(|| MambaError::NoEligibleAssignee(task.title.clone()))?;
+            .ok_or_else(|| RelayError::NoEligibleAssignee(task.title.clone()))?;
         let allowed = |principal: &&Principal| {
             principal.executor.is_some()
                 && (assignment.owner.id == principal.id
@@ -1997,7 +1997,7 @@ impl MambaApp {
             if allowed(&principal) {
                 return Ok(principal);
             }
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "executor {} is not assigned to task {}",
                 principal.name, task.id
             )));
@@ -2008,7 +2008,7 @@ impl MambaApp {
             .filter(allowed)
             .min_by(|left, right| left.name.cmp(&right.name))
             .ok_or_else(|| {
-                MambaError::Validation(format!(
+                RelayError::Validation(format!(
                     "task {} has no assigned Claude Code or Codex terminal",
                     task.id
                 ))
@@ -2018,7 +2018,7 @@ impl MambaApp {
     fn resolve_active_target(&self, value: &str) -> Result<AssignmentTarget> {
         if let Ok(principal) = self.state.principal(value) {
             if !principal.active {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "principal {} is inactive",
                     principal.name
                 )));
@@ -2027,7 +2027,7 @@ impl MambaApp {
         }
         let team = self.state.team(value)?;
         if !team.active {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "team {} is inactive",
                 team.name
             )));
@@ -2111,7 +2111,7 @@ fn validate_append_only_revision(flow: &Flow, drafts: &[TaskDraft]) -> Result<Ve
         .map(|draft| draft.key.as_str())
         .collect::<BTreeSet<_>>();
     if keys.len() != drafts.len() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "flow change task keys must be unique".into(),
         ));
     }
@@ -2140,13 +2140,13 @@ fn validate_append_only_revision(flow: &Flow, drafts: &[TaskDraft]) -> Result<Ve
             .iter()
             .find(|draft| draft.key == task.key)
             .ok_or_else(|| {
-                MambaError::Validation(format!(
+                RelayError::Validation(format!(
                     "flow change cannot remove existing task {}",
                     task.key
                 ))
             })?;
         if proposed != &expected {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "flow change cannot modify existing task {}; append a new task instead",
                 task.key
             )));
@@ -2167,7 +2167,7 @@ fn validate_append_only_revision(flow: &Flow, drafts: &[TaskDraft]) -> Result<Ve
             .iter()
             .find(|dependency| !all_keys.contains(dependency.as_str()))
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "new task {} depends on unknown task {}",
                 task.key, dependency
             )));
@@ -2183,7 +2183,7 @@ fn validate_run_id(run_id: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "invalid remote flight run ID".into(),
         ));
     }
@@ -2193,27 +2193,27 @@ fn validate_run_id(run_id: &str) -> Result<()> {
 fn validate_remote_flight_report(lease: &FlightLease, report: &RemoteFlightReport) -> Result<()> {
     validate_run_id(&report.run_id)?;
     if lease.run_id.as_deref() != Some(report.run_id.as_str()) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight report run ID does not match its lease".into(),
         ));
     }
     if lease.executor != report.executor {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight report executor does not match its lease".into(),
         ));
     }
     if report.summary.trim().is_empty() || report.summary.chars().count() > 4_000 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight report summary must contain 1 to 4000 characters".into(),
         ));
     }
     if report.base_revision.trim().is_empty() || report.base_revision.len() > 128 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight report has an invalid base revision".into(),
         ));
     }
     if report.started_at > report.finished_at {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight report finishes before it starts".into(),
         ));
     }
@@ -2222,7 +2222,7 @@ fn validate_remote_flight_report(lease: &FlightLease, report: &RemoteFlightRepor
         .cost_usd
         .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight report contains invalid fuel cost".into(),
         ));
     }
@@ -2237,7 +2237,7 @@ fn validate_remote_flight_report(lease: &FlightLease, report: &RemoteFlightRepor
             .tool_calls
             .is_some_and(|tool_calls| tool_calls > 1_000_000)
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight report contains implausible fuel usage".into(),
         ));
     }
@@ -2247,12 +2247,12 @@ fn validate_remote_flight_report(lease: &FlightLease, report: &RemoteFlightRepor
             .as_deref()
             .is_some_and(|hash| !is_sha256(hash))
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight report contains an invalid SHA-256 digest".into(),
         ));
     }
     if report.patch_sha256.is_some() == report.changed_files.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight patch digest and changed-file list do not agree".into(),
         ));
     }
@@ -2266,7 +2266,7 @@ fn validate_remote_flight_report(lease: &FlightLease, report: &RemoteFlightRepor
                     .any(|component| matches!(component, std::path::Component::ParentDir))
         })
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "remote flight report contains an unsafe changed-file path".into(),
         ));
     }
@@ -2289,7 +2289,7 @@ fn validate_execution_sandbox_report(report: &ExecutionSandboxReport) -> Result<
                 && report.pids_limit.is_none()
                 && report.forwarded_environment.is_empty();
             if !is_host_process {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "process sandbox report contains contradictory isolation claims".into(),
                 ));
             }
@@ -2328,14 +2328,14 @@ fn validate_execution_sandbox_report(report: &ExecutionSandboxReport) -> Result<
                 || !user_is_valid
                 || !resources_are_valid
             {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "Docker sandbox report does not describe a closed, bounded runtime".into(),
                 ));
             }
             validate_forwarded_environment(&report.forwarded_environment)?;
         }
         _ => {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "remote flight report uses an unknown sandbox backend".into(),
             ));
         }
@@ -2345,7 +2345,7 @@ fn validate_execution_sandbox_report(report: &ExecutionSandboxReport) -> Result<
 
 fn validate_forwarded_environment(environment: &[String]) -> Result<()> {
     const DENIED: &[&str] = &[
-        "MAMBA_TOKEN",
+        "RELAY_TOKEN",
         "DOCKER_HOST",
         "DOCKER_TLS_VERIFY",
         "DOCKER_CERT_PATH",
@@ -2353,7 +2353,7 @@ fn validate_forwarded_environment(environment: &[String]) -> Result<()> {
         "PATH",
     ];
     if environment.len() > 64 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "sandbox report contains too many forwarded environment variables".into(),
         ));
     }
@@ -2368,7 +2368,7 @@ fn validate_forwarded_environment(environment: &[String]) -> Result<()> {
             || DENIED.contains(&name.as_str())
             || !unique.insert(name)
     }) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "sandbox report contains an invalid, denied, or duplicate environment name".into(),
         ));
     }
@@ -2392,7 +2392,7 @@ fn validate_external_artifact(artifact: &ExternalArtifact) -> Result<()> {
         || artifact.url.trim().is_empty()
         || artifact.status.trim().is_empty()
     {
-        Err(MambaError::Validation(
+        Err(RelayError::Validation(
             "external artifact fields cannot be empty".into(),
         ))
     } else {
@@ -2410,7 +2410,7 @@ fn task_prompt(flow: &Flow, task: &Task, mode: &ExecutorMode, requested_by: &str
         }
     };
     format!(
-        "MambaFlow work request\n\
+        "Relay work request\n\
          Flow: {} - {}\n\
          Requested by: {}\n\
          Task: {} - {}\n\
@@ -2446,7 +2446,7 @@ mod tests {
     fn sandbox_reports_enforce_closed_runtime_claims() {
         let mut report = ExecutionSandboxReport {
             backend: "docker".into(),
-            image: Some("manbaflow-agent-runtime:0.1.0".into()),
+            image: Some("relay-agent-runtime:0.1.0".into()),
             image_id: Some(format!("sha256:{}", "a".repeat(64))),
             network: "none".into(),
             root_read_only: true,
@@ -2461,7 +2461,7 @@ mod tests {
         report.user = Some("0:0".into());
         assert!(validate_execution_sandbox_report(&report).is_err());
         report.user = Some("1000:1000".into());
-        report.forwarded_environment = vec!["MAMBA_TOKEN".into()];
+        report.forwarded_environment = vec!["RELAY_TOKEN".into()];
         assert!(validate_execution_sandbox_report(&report).is_err());
 
         let process = ExecutionSandboxReport {
@@ -2483,7 +2483,7 @@ mod tests {
     async fn external_human_interactions_are_bound_atomic_idempotent_and_replayable() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Delivery", "product,delivery", "admin")
@@ -2599,7 +2599,7 @@ mod tests {
         assert_eq!(app.state().external_interactions.len(), 2);
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(replayed.state().external_interactions.len(), 2);
         assert!(!replayed.state().external_identities[&binding.id].is_active());
         assert_eq!(
@@ -2617,8 +2617,8 @@ mod tests {
 
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("office-release");
-        let mut app = MambaApp::open(&data_dir).unwrap();
-        app.init_organization("Mamba Office", "admin").unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
+        app.init_organization("Relay Office", "admin").unwrap();
         let team = app
             .create_team(
                 "Operations",
@@ -2816,7 +2816,7 @@ mod tests {
         );
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(
             replayed.state().office_releases[&release.id].status,
             OfficeReleaseStatus::Released
@@ -2833,8 +2833,8 @@ mod tests {
 
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("gitlab-write");
-        let mut app = MambaApp::open(&data_dir).unwrap();
-        app.init_organization("Mamba GitLab", "admin").unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
+        app.init_organization("Relay GitLab", "admin").unwrap();
         let team = app
             .create_team(
                 "Delivery",
@@ -2953,7 +2953,7 @@ mod tests {
         }));
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(
             replayed.state().gitlab_writes[&request.id].status,
             GitLabWriteStatus::Written
@@ -2974,7 +2974,7 @@ mod tests {
     async fn notification_outbox_is_atomic_retryable_and_replayable() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Delivery", "product,delivery", "admin")
@@ -2994,9 +2994,9 @@ mod tests {
         let endpoint = app
             .register_notification_endpoint(
                 "operations",
-                "https://example.invalid/hooks/mamba",
+                "https://example.invalid/hooks/relay",
                 &["task.blocked".into(), "flow_message.posted".into()],
-                "MAMBA_TEST_WEBHOOK_SECRET",
+                "RELAY_TEST_WEBHOOK_SECRET",
                 "admin",
             )
             .unwrap();
@@ -3101,17 +3101,17 @@ mod tests {
             .register_notification_connector(
                 "leadership teams",
                 NotificationConnector::Teams,
-                "MAMBA_TEAMS_WEBHOOK_URL",
+                "RELAY_TEAMS_WEBHOOK_URL",
                 &["tracking.escalation_raised".into()],
                 None,
                 "admin",
             )
             .unwrap();
-        assert_eq!(teams.url_env.as_deref(), Some("MAMBA_TEAMS_WEBHOOK_URL"));
+        assert_eq!(teams.url_env.as_deref(), Some("RELAY_TEAMS_WEBHOOK_URL"));
         assert!(teams.url.is_empty());
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         let replayed_delivery = &replayed.state().notification_deliveries[&delivery.id];
         assert_eq!(replayed_delivery.status, NotificationStatus::Delivered);
         assert_eq!(replayed_delivery.attempts, 2);
@@ -3130,7 +3130,7 @@ mod tests {
     async fn work_calendar_and_time_off_reschedule_active_flows_and_replay() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Product", "product,delivery", "admin")
@@ -3218,7 +3218,7 @@ mod tests {
         assert!(after_cancel < during_leave);
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         let replayed_calendar = replayed.state().work_calendar(&manager.id).unwrap();
         assert_eq!(replayed_calendar.utc_offset_minutes, 8 * 60);
         assert!(!replayed_calendar.time_off[0].is_active());
@@ -3237,7 +3237,7 @@ mod tests {
     #[test]
     fn remote_agent_does_not_require_a_server_local_executor() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app.create_team("Platform", "backend", "admin").unwrap();
         let human = app
@@ -3272,7 +3272,7 @@ mod tests {
     async fn human_authorized_remote_flight_is_single_use_and_replays() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Delivery", "product,delivery", "admin")
@@ -3324,7 +3324,7 @@ mod tests {
         );
         assert!(matches!(
             agent_authorization,
-            Err(MambaError::PermissionDenied(_))
+            Err(RelayError::PermissionDenied(_))
         ));
         let lease = app
             .authorize_remote_flight(
@@ -3361,7 +3361,7 @@ mod tests {
         );
         assert!(matches!(
             unsafe_reassignment,
-            Err(MambaError::InvalidTransition(_))
+            Err(RelayError::InvalidTransition(_))
         ));
         assert!(
             app.authorize_remote_flight(
@@ -3595,7 +3595,7 @@ mod tests {
         );
         drop(app);
 
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         let replayed_lease = &replayed.state().flight_leases[&lease.id];
         assert_eq!(replayed_lease.status, FlightLeaseStatus::Landed);
         assert_eq!(replayed_lease.run_id.as_deref(), Some("WRUN-test"));
@@ -3616,7 +3616,7 @@ mod tests {
     async fn flight_fuel_resources_and_supervision_tree_are_enforced_and_replayed() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Platform", "product,delivery", "admin")
@@ -3709,7 +3709,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(matches!(conflict, Err(MambaError::InvalidTransition(_))));
+        assert!(matches!(conflict, Err(RelayError::InvalidTransition(_))));
 
         app.claim_remote_flight(&lease.id, &agent.name, "WRUN-fuel")
             .unwrap();
@@ -3798,7 +3798,7 @@ mod tests {
         }));
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(
             replayed.state().flight_leases[&lease.id].status,
             FlightLeaseStatus::Crashed
@@ -3818,7 +3818,7 @@ mod tests {
     fn api_credentials_authenticate_replay_and_revoke() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app.create_team("Ops", "operations", "admin").unwrap();
         let human = app
@@ -3857,7 +3857,7 @@ mod tests {
         );
         drop(app);
 
-        let mut replayed = MambaApp::open(&data_dir).unwrap();
+        let mut replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(
             replayed
                 .authenticate_api_token(&issued.token)
@@ -3877,7 +3877,7 @@ mod tests {
         );
         drop(replayed);
 
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert!(
             replayed
                 .authenticate_api_token(&issued.token)
@@ -3898,7 +3898,7 @@ mod tests {
     async fn organization_flow_replays_after_human_acceptance() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Product", "product,delivery", "admin")
@@ -3942,7 +3942,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, MambaError::PermissionDenied(_)));
+        assert!(matches!(error, RelayError::PermissionDenied(_)));
         let flow = app
             .create_demand(
                 "Prepare a launch brief",
@@ -3983,14 +3983,14 @@ mod tests {
             .run_task(&agent_task, &human.name, None, ExecutorMode::Execute, 1)
             .await
             .unwrap_err();
-        assert!(matches!(error, MambaError::ExecutorUnavailable(_)));
+        assert!(matches!(error, RelayError::ExecutorUnavailable(_)));
         assert_eq!(
             app.state().find_task(&agent_task).unwrap().1.status,
             TaskStatus::Blocked
         );
         drop(app);
 
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(
             replayed.state().find_task(&first_task).unwrap().1.status,
             TaskStatus::Completed
@@ -4002,7 +4002,7 @@ mod tests {
     async fn flow_messages_route_to_humans_agents_and_teams_with_replayable_receipts() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let product = app
             .create_team("Product", "product,delivery", "admin")
@@ -4113,7 +4113,7 @@ mod tests {
         assert_eq!(app.message_inbox(&engineer.name, true).unwrap().len(), 1);
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(replayed.state().messages.len(), 2);
         assert_eq!(
             replayed.state().messages[&message.id]
@@ -4135,7 +4135,7 @@ mod tests {
     async fn reassignment_and_negotiation_reschedule_the_full_flow_and_replay() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team(
@@ -4205,7 +4205,7 @@ mod tests {
                 "capacity rebalance",
             )
             .unwrap_err();
-        assert!(matches!(denied, MambaError::PermissionDenied(_)));
+        assert!(matches!(denied, RelayError::PermissionDenied(_)));
         let reassigned = app
             .reassign_task(
                 &gateway.id,
@@ -4244,7 +4244,7 @@ mod tests {
         let expected_p80 = updated.p80_finish;
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         let replayed_flow = replayed.state().flow(&flow.id).unwrap();
         assert_eq!(replayed_flow.p80_finish, expected_p80);
         assert_eq!(
@@ -4272,7 +4272,7 @@ mod tests {
     async fn flow_change_preview_requires_fresh_human_approval_and_replays() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Delivery", "product,delivery,security", "admin")
@@ -4379,14 +4379,14 @@ mod tests {
         let stale_error = app
             .approve_flow_change(&stale.id, &manager.name)
             .unwrap_err();
-        assert!(matches!(stale_error, MambaError::InvalidTransition(_)));
+        assert!(matches!(stale_error, RelayError::InvalidTransition(_)));
         let rejected = app
             .reject_flow_change(&stale.id, &manager.name, "Regenerate against current work")
             .unwrap();
         assert_eq!(rejected.status, FlowChangeStatus::Rejected);
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(
             replayed.state().flow(&flow.id).unwrap().tasks.len(),
             original_tasks + 1
@@ -4405,7 +4405,7 @@ mod tests {
     async fn external_artifact_sync_is_idempotent_and_can_gate_submission() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team(
@@ -4502,7 +4502,7 @@ mod tests {
         app.submit_task(&task_id, &human.name).unwrap();
         drop(app);
 
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         let task = replayed.state().find_task(&task_id).unwrap().1;
         assert_eq!(task.external_artifacts.len(), 1);
         assert_eq!(task.status, TaskStatus::Submitted);
@@ -4512,7 +4512,7 @@ mod tests {
     async fn tracking_scan_is_idempotent_resolves_and_replays() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Delivery", "product,delivery", "admin")
@@ -4572,7 +4572,7 @@ mod tests {
         let error = app
             .acknowledge_escalation(&escalation_id, &observer.name)
             .unwrap_err();
-        assert!(matches!(error, MambaError::PermissionDenied(_)));
+        assert!(matches!(error, RelayError::PermissionDenied(_)));
         let acknowledged = app
             .acknowledge_escalation(&escalation_id, &human.name)
             .unwrap();
@@ -4641,7 +4641,7 @@ mod tests {
         active_ids.sort();
 
         drop(app);
-        let mut replayed = MambaApp::open(&data_dir).unwrap();
+        let mut replayed = RelayApp::open(&data_dir).unwrap();
         let mut replayed_ids = replayed
             .state()
             .active_attentions()
@@ -4688,7 +4688,7 @@ mod tests {
         assert!(reviewed.active.is_empty());
         drop(replayed);
 
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(replayed.state().active_attentions().count(), 0);
         assert_eq!(replayed.state().active_escalations().count(), 0);
         assert!(

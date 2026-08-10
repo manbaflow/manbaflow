@@ -11,7 +11,7 @@ use sha2::Sha256;
 use crate::domain::{
     NotificationConnector, NotificationDelivery, NotificationEndpoint, NotificationStatus,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 use crate::state::OrganizationState;
@@ -61,7 +61,7 @@ pub struct NotificationDispatchSummary {
 
 pub fn validate_endpoint(endpoint: &NotificationEndpoint) -> Result<()> {
     if endpoint.name.trim().is_empty() || endpoint.name.chars().count() > 100 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "notification endpoint name must contain 1 to 100 characters".into(),
         ));
     }
@@ -69,9 +69,9 @@ pub fn validate_endpoint(endpoint: &NotificationEndpoint) -> Result<()> {
         Some(url_env) => validate_env_name(url_env, "notification URL")?,
         None => {
             let url = Url::parse(&endpoint.url)
-                .map_err(|_| MambaError::Validation("notification URL is invalid".into()))?;
+                .map_err(|_| RelayError::Validation("notification URL is invalid".into()))?;
             if !matches!(url.scheme(), "http" | "https") {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "notification URL must use http or https".into(),
                 ));
             }
@@ -80,12 +80,12 @@ pub fn validate_endpoint(endpoint: &NotificationEndpoint) -> Result<()> {
     if endpoint.connector != NotificationConnector::Generic
         && (endpoint.url_env.is_none() || !endpoint.url.is_empty())
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "provider connector URLs must be referenced through an environment variable".into(),
         ));
     }
     if endpoint.event_kinds.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "notification endpoint must subscribe to at least one event kind".into(),
         ));
     }
@@ -94,7 +94,7 @@ pub fn validate_endpoint(endpoint: &NotificationEndpoint) -> Result<()> {
         .iter()
         .any(|kind| kind.trim().is_empty() || kind.starts_with("notification."))
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "notification event filters cannot be empty or subscribe to notification.*".into(),
         ));
     }
@@ -108,7 +108,7 @@ pub fn validate_endpoint(endpoint: &NotificationEndpoint) -> Result<()> {
         NotificationConnector::Slack | NotificationConnector::Teams
             if !endpoint.secret_env.is_empty() =>
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "{} connector stores its credential in the webhook URL environment variable",
                 endpoint.connector.as_str()
             )));
@@ -124,7 +124,7 @@ fn validate_env_name(value: &str, label: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} environment name must contain only letters, digits and _"
         )));
     }
@@ -218,7 +218,7 @@ pub async fn deliver_with_secret(
 fn resolve_url(endpoint: &NotificationEndpoint) -> Result<String> {
     let value = if let Some(url_env) = &endpoint.url_env {
         std::env::var(url_env).map_err(|_| {
-            MambaError::ExternalConnector(format!(
+            RelayError::ExternalConnector(format!(
                 "webhook URL environment variable {url_env} is missing"
             ))
         })?
@@ -226,9 +226,9 @@ fn resolve_url(endpoint: &NotificationEndpoint) -> Result<String> {
         endpoint.url.clone()
     };
     let url = Url::parse(&value)
-        .map_err(|_| MambaError::ExternalConnector("resolved webhook URL is invalid".into()))?;
+        .map_err(|_| RelayError::ExternalConnector("resolved webhook URL is invalid".into()))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(MambaError::ExternalConnector(
+        return Err(RelayError::ExternalConnector(
             "resolved webhook URL must use http or https".into(),
         ));
     }
@@ -238,7 +238,7 @@ fn resolve_url(endpoint: &NotificationEndpoint) -> Result<String> {
 fn resolve_secret(secret_env: &str) -> Result<Vec<u8>> {
     match std::env::var(secret_env) {
         Ok(secret) if !secret.is_empty() => Ok(secret.into_bytes()),
-        _ => Err(MambaError::ExternalConnector(format!(
+        _ => Err(RelayError::ExternalConnector(format!(
             "secret environment variable {secret_env} is missing"
         ))),
     }
@@ -254,12 +254,12 @@ async fn deliver_configured(
     let webhook = NotificationWebhook {
         specversion: "1.0",
         id: delivery.id.clone(),
-        source: format!("mambaflow://organizations/{}", delivery.organization_id),
+        source: format!("relay://organizations/{}", delivery.organization_id),
         event_type: delivery.source_event_kind.clone(),
         subject: delivery
             .flow_id
             .as_ref()
-            .map(|flow_id| format!("mambaflow://flows/{flow_id}")),
+            .map(|flow_id| format!("relay://flows/{flow_id}")),
         time: delivery.queued_at,
         actor: delivery.actor.clone(),
         data: delivery.payload.clone(),
@@ -289,7 +289,7 @@ async fn deliver_configured(
     let mut request = client
         .post(url)
         .header("content-type", "application/json")
-        .header("user-agent", "MambaFlow-Notification/1.0")
+        .header("user-agent", "Relay-Notification/1.0")
         .header("webhook-id", &delivery.id)
         .header("webhook-timestamp", &timestamp);
     if endpoint.connector == NotificationConnector::Generic {
@@ -417,12 +417,12 @@ fn notification_card(
     let data = webhook.data.get("data").unwrap_or(&webhook.data);
     let (title, summary, severity) = match webhook.event_type.as_str() {
         "work_request.sent" => (
-            "新任务已传球",
-            "任务已经派往对应队员与个人 Agent，请确认接球。".into(),
+            "新任务已派发",
+            "任务已经派往对应队员与个人 Agent，请确认接单。".into(),
             CardSeverity::Info,
         ),
         "flow_message.posted" => (
-            "Flow 收到新传球",
+            "Flow 收到新消息",
             value_text(data, "body").unwrap_or_else(|| "协作线程有一条新消息。".into()),
             CardSeverity::Info,
         ),
@@ -465,17 +465,17 @@ fn notification_card(
             CardSeverity::Critical,
         ),
         "flow.completed" => (
-            "Mamba Out",
+            "Flow 已验收完成",
             "所有任务已经通过验收，Flow 安全落地。".into(),
             CardSeverity::Success,
         ),
         "connector.test" => (
             "塔台信号测试",
-            "Connector 已收到 MambaFlow 测试传球。".into(),
+            "Connector 已收到 Relay 测试消息。".into(),
             CardSeverity::Success,
         ),
         event_type => (
-            "MambaFlow 状态更新",
+            "Relay 状态更新",
             format!("组织事件 {event_type} 已写入 Flow Ledger。"),
             CardSeverity::Info,
         ),
@@ -486,18 +486,18 @@ fn notification_card(
     }
     for (label, keys) in [
         ("任务", &["task_id", "task", "task_key"][..]),
-        ("接球人", &["target_id", "owner_id", "principal_id"][..]),
+        ("接收人", &["target_id", "owner_id", "principal_id"][..]),
     ] {
         if let Some(value) = keys.iter().find_map(|key| value_text(data, key)) {
             facts.push((label.into(), value));
         }
     }
-    facts.push(("传球人".into(), webhook.actor.clone()));
+    facts.push(("发送人".into(), webhook.actor.clone()));
     let actions = match webhook.event_type.as_str() {
         "work_request.sent" => value_text(data, "task_id")
             .map(|target_id| CardAction {
-                label: "接球",
-                action_id: "mambaflow.task.accept",
+                label: "接单",
+                action_id: "relay.task.accept",
                 target_id,
             })
             .into_iter()
@@ -506,7 +506,7 @@ fn notification_card(
             nested_text(data, &["message", "id"])
                 .map(|target_id| CardAction {
                     label: "确认收到",
-                    action_id: "mambaflow.message.ack",
+                    action_id: "relay.message.ack",
                     target_id,
                 })
                 .into_iter()
@@ -515,7 +515,7 @@ fn notification_card(
         "tracking.escalation_raised" => nested_text(data, &["escalation", "id"])
             .map(|target_id| CardAction {
                 label: "接手处理",
-                action_id: "mambaflow.escalation.ack",
+                action_id: "relay.escalation.ack",
                 target_id,
             })
             .into_iter()
@@ -773,9 +773,9 @@ mod tests {
         let endpoint: NotificationEndpoint = serde_json::from_value(json!({
             "id": "NEND-LEGACY",
             "name": "legacy",
-            "url": "https://bridge.example.com/mamba",
+            "url": "https://bridge.example.com/relay",
             "event_kinds": ["task.blocked"],
-            "secret_env": "MAMBA_SECRET",
+            "secret_env": "RELAY_SECRET",
             "active": true,
             "created_by": "admin",
             "created_at": "2026-07-17T00:00:00Z",
@@ -797,7 +797,7 @@ mod tests {
             endpoint_id: "NEND-1".into(),
             source_event_kind: "work_request.sent".into(),
             flow_id: Some("FLOW-1".into()),
-            actor: "牢大".into(),
+            actor: "陈静".into(),
             payload: json!({
                 "type": "work_request_sent",
                 "data": {"flow_id": "FLOW-1", "task_id": "TSK-1", "target_id": "HUM-1"}
@@ -813,9 +813,9 @@ mod tests {
         let webhook = NotificationWebhook {
             specversion: "1.0",
             id: delivery.id.clone(),
-            source: "mambaflow://organizations/ORG-1".into(),
+            source: "relay://organizations/ORG-1".into(),
             event_type: delivery.source_event_kind.clone(),
-            subject: Some("mambaflow://flows/FLOW-1".into()),
+            subject: Some("relay://flows/FLOW-1".into()),
             time: now,
             actor: delivery.actor.clone(),
             data: delivery.payload.clone(),
@@ -827,7 +827,7 @@ mod tests {
             .iter()
             .find(|block| block["type"] == "actions")
             .unwrap();
-        assert_eq!(action["elements"][0]["action_id"], "mambaflow.task.accept");
+        assert_eq!(action["elements"][0]["action_id"], "relay.task.accept");
         assert_eq!(action["elements"][0]["value"], "TSK-1");
     }
 
@@ -894,7 +894,7 @@ mod tests {
         let webhook: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(webhook["id"], "NTF-1");
         assert_eq!(webhook["type"], "task.blocked");
-        assert_eq!(webhook["subject"], "mambaflow://flows/FLOW-1");
+        assert_eq!(webhook["subject"], "relay://flows/FLOW-1");
         server.abort();
     }
 
@@ -931,7 +931,7 @@ mod tests {
             endpoint_id: "NEND-CARD".into(),
             source_event_kind: "task.blocked".into(),
             flow_id: Some("FLOW-1".into()),
-            actor: "佐巴扬".into(),
+            actor: "李伟".into(),
             payload: json!({
                 "type": "task_blocked",
                 "data": {"task_id": "TSK-1", "reason": "等待生产权限"}

@@ -243,24 +243,24 @@ if [ ! -f "$ENV_FILE" ]; then
         DATABASE_MODE=external
     else
         DATABASE_MODE=local
-        DATABASE_URL="postgresql://manbaflow:$password@postgres:5432/manbaflow"
+        DATABASE_URL="postgresql://relay:$password@postgres:5432/relay"
     fi
     cat >"$ENV_FILE" <<EOF
-POSTGRES_DB=manbaflow
-POSTGRES_USER=manbaflow
+POSTGRES_DB=relay
+POSTGRES_USER=relay
 POSTGRES_PASSWORD=$password
-MAMBA_DATABASE_MODE=$DATABASE_MODE
-MAMBA_DATABASE_URL_SECRET_FILE=./deploy/secrets/database-url
-MAMBA_PORT=$PORT
-MAMBA_IMAGE=manbaflow:local
-MAMBA_DOMAIN=$DOMAIN
+RELAY_DATABASE_MODE=$DATABASE_MODE
+RELAY_DATABASE_URL_SECRET_FILE=./deploy/secrets/database-url
+RELAY_PORT=$PORT
+RELAY_IMAGE=relay:local
+RELAY_DOMAIN=$DOMAIN
 EOF
     chmod 600 "$ENV_FILE"
     printf 'Created %s with mode 0600.\n' "$ENV_FILE"
 else
     printf 'Reusing existing %s and its database credentials.\n' "$ENV_FILE"
-    DATABASE_MODE=$(env_value MAMBA_DATABASE_MODE)
-    legacy_database_url=$(env_value MAMBA_DATABASE_URL)
+    DATABASE_MODE=$(env_value RELAY_DATABASE_MODE)
+    legacy_database_url=$(env_value RELAY_DATABASE_URL)
     if [ "$EXTERNAL_DATABASE_REQUESTED" -eq 1 ]; then
         DATABASE_MODE=external
     elif [ -f "$DATABASE_SECRET_FILE" ]; then
@@ -287,27 +287,27 @@ fi
 
 case "$DATABASE_MODE" in
     local|external) ;;
-    *) printf '%s\n' 'MAMBA_DATABASE_MODE must be local or external' >&2; exit 1 ;;
+    *) printf '%s\n' 'RELAY_DATABASE_MODE must be local or external' >&2; exit 1 ;;
 esac
 
-set_env_value MAMBA_DATABASE_MODE "$DATABASE_MODE"
-set_env_value MAMBA_DATABASE_URL_SECRET_FILE "./deploy/secrets/database-url"
-remove_env_value MAMBA_DATABASE_URL
+set_env_value RELAY_DATABASE_MODE "$DATABASE_MODE"
+set_env_value RELAY_DATABASE_URL_SECRET_FILE "./deploy/secrets/database-url"
+remove_env_value RELAY_DATABASE_URL
 
-set_env_value MAMBA_PORT "$PORT"
+set_env_value RELAY_PORT "$PORT"
 if [ -n "$IMAGE" ]; then
-    set_env_value MAMBA_IMAGE "$IMAGE"
+    set_env_value RELAY_IMAGE "$IMAGE"
 fi
 if [ "$MODE" = hosted ]; then
-    set_env_value MAMBA_DOMAIN "$DOMAIN"
+    set_env_value RELAY_DOMAIN "$DOMAIN"
 else
-    set_env_value MAMBA_DOMAIN ""
+    set_env_value RELAY_DOMAIN ""
 fi
 
 POSTGRES_USER=$(env_value POSTGRES_USER)
 POSTGRES_DB=$(env_value POSTGRES_DB)
-IMAGE=$(env_value MAMBA_IMAGE)
-[ -n "$IMAGE" ] || { printf '%s\n' '.env is missing MAMBA_IMAGE' >&2; exit 1; }
+IMAGE=$(env_value RELAY_IMAGE)
+[ -n "$IMAGE" ] || { printf '%s\n' '.env is missing RELAY_IMAGE' >&2; exit 1; }
 
 compose() {
     docker compose --project-directory "$ROOT" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
@@ -334,16 +334,16 @@ else
     printf '%s\n' 'Using external PostgreSQL from the mounted database URL Secret.'
 fi
 
-if [ "$IMAGE" = "manbaflow:local" ]; then
-    printf '%s\n' 'Building MambaFlow from the current source checkout...'
-    compose build mamba
+if [ "$IMAGE" = "relay:local" ]; then
+    printf '%s\n' 'Building Relay from the current source checkout...'
+    compose build relay
 else
-    printf 'Pulling MambaFlow image %s...\n' "$IMAGE"
-    compose pull mamba
+    printf 'Pulling Relay image %s...\n' "$IMAGE"
+    compose pull relay
 fi
 
 printf '%s\n' 'Creating the production organization (no Showcase data)...'
-setup_output=$(compose run --rm -T mamba setup \
+setup_output=$(compose run --rm -T relay setup \
     --organization "$ORGANIZATION" \
     --administrator "$ADMINISTRATOR" \
     --team "$TEAM" \
@@ -351,12 +351,12 @@ setup_output=$(compose run --rm -T mamba setup \
     --utc-offset "$UTC_OFFSET" \
     --token-ttl-days "$TOKEN_TTL_DAYS")
 
-compose up -d mamba
+compose up -d relay
 attempt=0
-until compose exec -T mamba curl --fail --silent http://127.0.0.1:7777/health/ready >/dev/null 2>&1; do
+until compose exec -T relay curl --fail --silent http://127.0.0.1:7777/health/ready >/dev/null 2>&1; do
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 60 ]; then
-        printf '%s\n' 'MambaFlow did not become ready; inspect ./deploy/manage.sh logs' >&2
+        printf '%s\n' 'Relay did not become ready; inspect ./deploy/manage.sh logs' >&2
         exit 1
     fi
     sleep 1
@@ -370,6 +370,6 @@ else
 fi
 
 printf '\n%s\n' "$setup_output"
-printf '\nMambaFlow is ready: %s\n' "$URL"
+printf '\nRelay is ready: %s\n' "$URL"
 printf '%s\n' 'If a new bootstrap Token was printed above, store it in a password manager.'
 printf '%s\n' 'Operations: ./deploy/manage.sh status | logs | backup | upgrade | stop'

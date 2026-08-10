@@ -14,7 +14,7 @@ use crate::domain::{
     FlightLease, FlightLeaseStatus, FlowMessage, FuelUsage, MessageInboxItem, Principal,
     RemoteFlightReport, Task, TaskStatus,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
 use crate::sandbox::{DockerSandboxConfig, ResolvedDockerSandbox, SandboxBackend};
 use crate::worktree::{IsolatedWorktree, WorktreeArtifact, sha256_file};
@@ -89,15 +89,15 @@ enum WorkerSandbox {
 impl RemoteWorker {
     pub fn new(mut options: WorkerOptions) -> Result<Self> {
         if options.token.trim().is_empty() {
-            return Err(MambaError::Validation(
-                "MAMBA_TOKEN is required for a remote worker".into(),
+            return Err(RelayError::Validation(
+                "RELAY_TOKEN is required for a remote worker".into(),
             ));
         }
         if !options.workspace.is_dir() {
-            return Err(MambaError::InvalidWorkspace(options.workspace.clone()));
+            return Err(RelayError::InvalidWorkspace(options.workspace.clone()));
         }
         if options.timeout_seconds == 0 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "worker timeout must be greater than zero".into(),
             ));
         }
@@ -105,7 +105,7 @@ impl RemoteWorker {
         let sandbox = match options.sandbox {
             SandboxBackend::Process => {
                 if options.docker.is_some() {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "Docker sandbox configuration requires --sandbox docker".into(),
                     ));
                 }
@@ -116,7 +116,7 @@ impl RemoteWorker {
                     .docker
                     .take()
                     .ok_or_else(|| {
-                        MambaError::Validation(
+                        RelayError::Validation(
                             "Docker sandbox backend requires Docker configuration".into(),
                         )
                     })?
@@ -159,7 +159,7 @@ impl RemoteWorker {
             task = self.control_plane.task_action(&task.id, "start").await?;
         }
         if task.status != TaskStatus::InProgress {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "remote worker cannot plan task {} while it is {:?}",
                 task.id, task.status
             )));
@@ -203,7 +203,7 @@ impl RemoteWorker {
                     timeout_seconds: self.options.timeout_seconds,
                     log_path: log_path.clone(),
                 },
-                &format!("mamba-{run_id}"),
+                &format!("relay-{run_id}"),
             )
             .await;
 
@@ -276,13 +276,13 @@ impl RemoteWorker {
             .iter()
             .find(|item| item.task.id == lease.task_id)
             .ok_or_else(|| {
-                MambaError::InvalidTransition(format!(
+                RelayError::InvalidTransition(format!(
                     "leased task {} is not in the worker inbox",
                     lease.task_id
                 ))
             })?;
         if !item.blocked_by.is_empty() {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "leased task {} still has incomplete dependencies",
                 lease.task_id
             )));
@@ -303,7 +303,7 @@ impl RemoteWorker {
                 run_id
             }
             FlightLeaseStatus::Active => lease.run_id.clone().ok_or_else(|| {
-                MambaError::InvalidTransition(format!(
+                RelayError::InvalidTransition(format!(
                     "active flight lease {} has no run ID",
                     lease.id
                 ))
@@ -373,7 +373,7 @@ impl RemoteWorker {
                                 timeout_seconds: self.options.timeout_seconds,
                                 log_path: log_path.clone(),
                             },
-                            &format!("mamba-{run_id}"),
+                            &format!("relay-{run_id}"),
                         )
                         .await;
                     let collected = worktree.collect(&patch_path).and_then(|artifact| {
@@ -478,7 +478,7 @@ impl RemoteWorker {
             }
         }
         if !log_path.is_file() {
-            write_setup_blackbox(&log_path, &run_id, &MambaError::Validation(summary.clone()))?;
+            write_setup_blackbox(&log_path, &run_id, &RelayError::Validation(summary.clone()))?;
         }
         let finished_at = Utc::now();
         let report = RemoteFlightReport {
@@ -575,22 +575,22 @@ impl ControlPlaneClient {
     fn new(server_url: &str, token: &str) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut api_base = Url::parse(server_url.trim())
-            .map_err(|_| MambaError::Validation("invalid MambaFlow server URL".into()))?;
+            .map_err(|_| RelayError::Validation("invalid Relay server URL".into()))?;
         if !matches!(api_base.scheme(), "http" | "https") {
-            return Err(MambaError::Validation(
-                "MambaFlow server URL must use http or https".into(),
+            return Err(RelayError::Validation(
+                "Relay server URL must use http or https".into(),
             ));
         }
         if !api_base.username().is_empty() || api_base.password().is_some() {
-            return Err(MambaError::Validation(
-                "MambaFlow server URL must not contain credentials; use MAMBA_TOKEN".into(),
+            return Err(RelayError::Validation(
+                "Relay server URL must not contain credentials; use RELAY_TOKEN".into(),
             ));
         }
         api_base.set_query(None);
         api_base.set_fragment(None);
         {
             let mut segments = api_base.path_segments_mut().map_err(|_| {
-                MambaError::Validation("MambaFlow server URL cannot be used as an API base".into())
+                RelayError::Validation("Relay server URL cannot be used as an API base".into())
             })?;
             segments.pop_if_empty().push("api").push("v1");
         }
@@ -600,10 +600,10 @@ impl ControlPlaneClient {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
-            .user_agent(concat!("MambaFlow-Worker/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("Relay-Worker/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| {
-                MambaError::ExternalConnector("could not initialize remote worker client".into())
+                RelayError::ExternalConnector("could not initialize remote worker client".into())
             })?;
         Ok(Self {
             client,
@@ -713,7 +713,7 @@ impl ControlPlaneClient {
         let mut url = self.api_base.clone();
         {
             let mut segments = url.path_segments_mut().map_err(|_| {
-                MambaError::Validation("MambaFlow server URL cannot form an endpoint".into())
+                RelayError::Validation("Relay server URL cannot form an endpoint".into())
             })?;
             segments.pop_if_empty();
             for segment in ["flight-leases", lease_id, "artifacts"] {
@@ -730,14 +730,14 @@ impl ControlPlaneClient {
             .send()
             .await
             .map_err(|error| {
-                MambaError::ExternalConnector(format!("artifact staging request failed: {error}"))
+                RelayError::ExternalConnector(format!("artifact staging request failed: {error}"))
             })?;
         let status = response.status();
         if !status.is_success() {
             return Err(control_plane_error(status, response).await);
         }
         response.json().await.map_err(|_| {
-            MambaError::ExternalConnector(
+            RelayError::ExternalConnector(
                 "control plane returned an invalid staged artifact".into(),
             )
         })
@@ -752,7 +752,7 @@ impl ControlPlaneClient {
         let mut url = self.api_base.clone();
         {
             let mut path = url.path_segments_mut().map_err(|_| {
-                MambaError::Validation("MambaFlow server URL cannot form an endpoint".into())
+                RelayError::Validation("Relay server URL cannot form an endpoint".into())
             })?;
             path.pop_if_empty();
             for segment in segments {
@@ -764,14 +764,14 @@ impl ControlPlaneClient {
             request = request.json(&body);
         }
         let response = request.send().await.map_err(|error| {
-            MambaError::ExternalConnector(format!("control plane request failed: {error}"))
+            RelayError::ExternalConnector(format!("control plane request failed: {error}"))
         })?;
         let status = response.status();
         if !status.is_success() {
             return Err(control_plane_error(status, response).await);
         }
         response.json().await.map_err(|_| {
-            MambaError::ExternalConnector("control plane returned an invalid JSON response".into())
+            RelayError::ExternalConnector("control plane returned an invalid JSON response".into())
         })
     }
 }
@@ -844,7 +844,7 @@ fn worker_prompt(
     instructions: &str,
 ) -> String {
     format!(
-        "MambaFlow remote PASS for a read-only planning flight.\n\
+        "Relay remote PASS for a read-only planning flight.\n\
          Worker principal: {} ({})\n\
          Flow: {} - {}\n\
          Task: {} - {}\n\
@@ -887,7 +887,7 @@ fn execute_prompt(
     });
     let execution_contract = CapabilityAdapter::execution_directive(pack);
     format!(
-        "MambaFlow remote PASS for a Human-authorized {pack:?} flight.\n\
+        "Relay remote PASS for a Human-authorized {pack:?} flight.\n\
          Flight lease: {}\n\
          Authorized by: {}\n\
          Worker principal: {} ({})\n\
@@ -925,27 +925,27 @@ fn collect_staged_files(
     for path in changed_files {
         let source = workspace.join(path);
         let metadata = fs::symlink_metadata(&source).map_err(|_| {
-            MambaError::Validation(format!(
+            RelayError::Validation(format!(
                 "Office deliverable is missing or was deleted: {path}"
             ))
         })?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "Office deliverable must be a regular file: {path}"
             )));
         }
         let canonical = source.canonicalize()?;
         if !canonical.starts_with(&workspace) {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "Office deliverable escapes the isolated workspace: {path}"
             )));
         }
         let content = fs::read(canonical)?;
         total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
-            MambaError::Validation("Office deliverables exceed the staging budget".into())
+            RelayError::Validation("Office deliverables exceed the staging budget".into())
         })?;
         if total_bytes > crate::application::app::artifacts::MAX_ARTIFACT_BYTES {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "Office deliverables exceed the {} byte staging budget",
                 crate::application::app::artifacts::MAX_ARTIFACT_BYTES
             )));
@@ -1021,7 +1021,7 @@ fn plan_evidence_uri(principal: &Principal, task: &Task) -> String {
     format!("worker://{}/{}/plan", principal.id, task.id)
 }
 
-async fn control_plane_error(status: StatusCode, response: reqwest::Response) -> MambaError {
+async fn control_plane_error(status: StatusCode, response: reqwest::Response) -> RelayError {
     let message = response
         .json::<Value>()
         .await
@@ -1034,7 +1034,7 @@ async fn control_plane_error(status: StatusCode, response: reqwest::Response) ->
         })
         .map(|message| truncate(&message, 300))
         .unwrap_or_else(|| "request was rejected".into());
-    MambaError::ExternalConnector(format!(
+    RelayError::ExternalConnector(format!(
         "control plane returned HTTP {}: {message}",
         status.as_u16()
     ))
@@ -1044,7 +1044,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn write_setup_blackbox(path: &std::path::Path, run_id: &str, error: &MambaError) -> Result<()> {
+fn write_setup_blackbox(path: &std::path::Path, run_id: &str, error: &RelayError) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1069,17 +1069,17 @@ fn empty_artifact() -> WorktreeArtifact {
     }
 }
 
-fn classify_worker_error(error: &MambaError) -> FailureClass {
+fn classify_worker_error(error: &RelayError) -> FailureClass {
     match error {
-        MambaError::ExecutorTimeout(_) => FailureClass::Timeout,
-        MambaError::PermissionDenied(_) => FailureClass::Permission,
-        MambaError::InvalidWorkspace(_) | MambaError::Io(_) => FailureClass::Resource,
-        MambaError::Validation(_) | MambaError::InvalidExecutorOutput(_) | MambaError::Json(_) => {
+        RelayError::ExecutorTimeout(_) => FailureClass::Timeout,
+        RelayError::PermissionDenied(_) => FailureClass::Permission,
+        RelayError::InvalidWorkspace(_) | RelayError::Io(_) => FailureClass::Resource,
+        RelayError::Validation(_) | RelayError::InvalidExecutorOutput(_) | RelayError::Json(_) => {
             FailureClass::Validation
         }
-        MambaError::ExecutorUnavailable(_)
-        | MambaError::ExecutorFailed { .. }
-        | MambaError::ExternalConnector(_) => FailureClass::Tool,
+        RelayError::ExecutorUnavailable(_)
+        | RelayError::ExecutorFailed { .. }
+        | RelayError::ExternalConnector(_) => FailureClass::Tool,
         _ => FailureClass::Unknown,
     }
 }

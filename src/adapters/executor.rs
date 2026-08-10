@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use crate::domain::{ExecutorKind, ExecutorMode};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::sandbox::{
     CONTAINER_OUTPUT, CONTAINER_WORKSPACE, DockerContainerGuard, DockerRunSpec,
     ResolvedDockerSandbox,
@@ -82,7 +82,7 @@ impl TerminalExecutor {
             .map(|value| value.display().to_string())
             .unwrap_or_else(|| default_command(&request.kind).to_string());
         if !request.workspace.is_dir() {
-            let error = MambaError::InvalidWorkspace(request.workspace.clone());
+            let error = RelayError::InvalidWorkspace(request.workspace.clone());
             write_failure_log(&request, &requested_command, started_at, error.to_string())?;
             return Err(error);
         }
@@ -119,7 +119,7 @@ impl TerminalExecutor {
                     started_at,
                     format!("executor not found: {error}"),
                 )?;
-                return Err(MambaError::ExecutorUnavailable(command_label));
+                return Err(RelayError::ExecutorUnavailable(command_label));
             }
             Ok(Err(error)) => {
                 write_failure_log(
@@ -140,7 +140,7 @@ impl TerminalExecutor {
                         request.timeout_seconds
                     ),
                 )?;
-                return Err(MambaError::ExecutorTimeout(request.timeout_seconds));
+                return Err(RelayError::ExecutorTimeout(request.timeout_seconds));
             }
         };
 
@@ -168,7 +168,7 @@ impl TerminalExecutor {
             } else {
                 stderr.trim().to_string()
             };
-            return Err(MambaError::ExecutorFailed {
+            return Err(RelayError::ExecutorFailed {
                 code: output.status.code(),
                 message: truncate(&message, 500),
             });
@@ -369,21 +369,21 @@ fn build_docker_command(
 
 fn container_artifact_path(host_path: &Path) -> Result<PathBuf> {
     let file_name = host_path.file_name().ok_or_else(|| {
-        MambaError::Validation("executor artifact path requires a file name".into())
+        RelayError::Validation("executor artifact path requires a file name".into())
     })?;
     Ok(Path::new(CONTAINER_OUTPUT).join(file_name))
 }
 
 fn parse_claude(stdout: &str, expects_structured: bool) -> Result<ExecutionOutput> {
     let value: Value = serde_json::from_str(stdout.trim())
-        .map_err(|error| MambaError::InvalidExecutorOutput(format!("Claude Code JSON: {error}")))?;
+        .map_err(|error| RelayError::InvalidExecutorOutput(format!("Claude Code JSON: {error}")))?;
     let structured_output = value.get("structured_output").cloned().or_else(|| {
         expects_structured
             .then(|| value.get("result").and_then(parse_embedded_json))
             .flatten()
     });
     if expects_structured && structured_output.is_none() {
-        return Err(MambaError::InvalidExecutorOutput(
+        return Err(RelayError::InvalidExecutorOutput(
             "Claude Code response did not contain structured_output".to_string(),
         ));
     }
@@ -417,7 +417,7 @@ fn parse_codex(
         .then(|| serde_json::from_str::<Value>(result.trim()).ok())
         .flatten();
     if expects_structured && structured_output.is_none() {
-        return Err(MambaError::InvalidExecutorOutput(
+        return Err(RelayError::InvalidExecutorOutput(
             "Codex last message did not match the requested JSON schema".to_string(),
         ));
     }
@@ -513,7 +513,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(error, MambaError::ExecutorUnavailable(_)));
+        assert!(matches!(error, RelayError::ExecutorUnavailable(_)));
         let log: ExecutorLog = serde_json::from_slice(&fs::read(log_path).unwrap()).unwrap();
         assert!(log.stderr.contains("executor not found"));
     }
@@ -547,9 +547,9 @@ result=''
 previous=''
 for value in "$@"; do
   case "$value" in
-    type=bind,src=*,dst=/mamba-output)
+    type=bind,src=*,dst=/relay-output)
       output="${{value#type=bind,src=}}"
-      output="${{output%,dst=/mamba-output}}"
+      output="${{output%,dst=/relay-output}}"
       ;;
   esac
   if [ "$previous" = "--output-last-message" ]; then
@@ -568,7 +568,7 @@ printf '%s\n' '{{"thread_id":"docker-thread"}}'
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
         let sandbox = DockerSandboxConfig {
             runtime,
-            image: "manbaflow-agent-runtime:0.1.0".into(),
+            image: "relay-agent-runtime:0.1.0".into(),
             network: SandboxNetwork::None,
             cpus_millis: 1_000,
             memory_mb: 512,
@@ -593,7 +593,7 @@ printf '%s\n' '{{"thread_id":"docker-thread"}}'
                 log_path,
             },
             &sandbox,
-            "mamba-WRUN-test",
+            "relay-WRUN-test",
         )
         .await
         .unwrap();

@@ -2,9 +2,9 @@
 	admin off
 }
 
-{$MAMBA_DOMAIN} {
+{$RELAY_DOMAIN} {
 	encode zstd gzip
-	reverse_proxy mamba:7777
+	reverse_proxy relay:7777
 
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::postgres_store::PostgresEventStore;
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::state::OrganizationState;
 use crate::store::EventStore;
 use crate::tenant::TenantCatalog;
@@ -45,7 +45,7 @@ pub fn sqlite_fleet_to_postgres(
         let state = OrganizationState::replay(&events)?;
         let tenant = state.tenant()?;
         if tenant.id != record.id {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "SQLite catalog tenant {} points to Ledger {}",
                 record.id, tenant.id
             )));
@@ -58,7 +58,7 @@ pub fn sqlite_fleet_to_postgres(
                 || existing.storage_path != record.storage_path
                 || existing.is_default != record.is_default
             {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "PostgreSQL catalog has a different definition for tenant {}",
                     record.id
                 )));

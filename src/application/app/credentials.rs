@@ -2,14 +2,14 @@ use chrono::{Duration, Utc};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::MambaApp;
+use super::RelayApp;
 use super::authority::Permission;
 use crate::domain::{ApiCredential, IssuedCredential, Principal};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 
-impl MambaApp {
+impl RelayApp {
     pub fn issue_api_credential(
         &mut self,
         target: &str,
@@ -27,7 +27,7 @@ impl MambaApp {
         ttl_days: u32,
     ) -> Result<IssuedCredential> {
         if !(1..=365).contains(&ttl_days) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "credential TTL must be between 1 and 365 days".into(),
             ));
         }
@@ -60,13 +60,13 @@ impl MambaApp {
         let principal = self.state.principal(target)?.clone();
         let label = label.trim();
         if label.is_empty() || label.chars().count() > 80 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "credential label must contain 1 to 80 characters".into(),
             ));
         }
         let tenant_id = &self.state.tenant()?.id;
         let token = format!(
-            "mmb_{tenant_id}_{}{}",
+            "rly_{tenant_id}_{}{}",
             Uuid::new_v4().simple(),
             Uuid::new_v4().simple()
         );
@@ -109,13 +109,13 @@ impl MambaApp {
             .state
             .credentials
             .get(credential_id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "API credential",
                 id: credential_id.to_string(),
             })?
             .clone();
         if !credential.is_active() {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "API credential {} is no longer active",
                 credential.id
             )));
@@ -134,7 +134,7 @@ impl MambaApp {
             .state
             .credentials
             .get(credential_id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "API credential",
                 id: credential_id.to_string(),
             })?
@@ -167,7 +167,7 @@ impl MambaApp {
 
     pub fn revoke_oidc_session(&mut self, token: &str) -> Result<()> {
         if !valid_api_token(token) {
-            return Err(MambaError::PermissionDenied("invalid OIDC session".into()));
+            return Err(RelayError::PermissionDenied("invalid OIDC session".into()));
         }
         let token_hash = credential_hash(token);
         let Some((credential_id, principal_id)) =
@@ -179,7 +179,7 @@ impl MambaApp {
             return Ok(());
         };
         if credential.principal_id != principal_id || !credential.label.starts_with("OIDC ") {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "credential is not an OIDC browser session".into(),
             ));
         }
@@ -201,7 +201,7 @@ fn credential_hash(token: &str) -> Vec<u8> {
 }
 
 pub fn tenant_token_hint(token: &str) -> Option<&str> {
-    let value = token.strip_prefix("mmb_")?;
+    let value = token.strip_prefix("rly_")?;
     let (tenant_id, secret) = value.rsplit_once('_')?;
     (tenant_id.starts_with("TEN-")
         && tenant_id.len() > 4
@@ -215,7 +215,7 @@ pub fn tenant_token_hint(token: &str) -> Option<&str> {
 
 fn valid_api_token(token: &str) -> bool {
     let legacy = token.len() == 68
-        && token.starts_with("mmb_")
+        && token.starts_with("rly_")
         && token[4..].bytes().all(|value| value.is_ascii_hexdigit());
     legacy || tenant_token_hint(token).is_some()
 }
@@ -227,13 +227,13 @@ mod token_tests {
     #[test]
     fn tenant_hint_is_strict_and_legacy_tokens_remain_valid() {
         let secret = "a".repeat(64);
-        let routed = format!("mmb_TEN-ab12cd34_{secret}");
+        let routed = format!("rly_TEN-ab12cd34_{secret}");
         assert_eq!(tenant_token_hint(&routed), Some("TEN-ab12cd34"));
-        assert!(valid_api_token(&format!("mmb_{secret}")));
+        assert!(valid_api_token(&format!("rly_{secret}")));
         assert!(!valid_api_token(&format!(
-            "mmb_TEN-ab12cd34_{}",
+            "rly_TEN-ab12cd34_{}",
             "z".repeat(64)
         )));
-        assert_eq!(tenant_token_hint(&format!("mmb_other_{secret}")), None);
+        assert_eq!(tenant_token_hint(&format!("rly_other_{secret}")), None);
     }
 }

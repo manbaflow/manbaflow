@@ -3,14 +3,14 @@ use std::path::Path;
 use chrono::Utc;
 use serde::Serialize;
 
-use crate::MambaApp;
+use crate::RelayApp;
 use crate::domain::{
     CapabilityPack, ExecutionSandboxReport, ExecutorConfig, ExecutorKind,
     ExternalInteractionAction, FailureClass, FlightManifestDraft, Flow, FlowMessageKind,
     GitLabWritePayload, OfficeBodyType, OfficeProvider, OfficeReleasePayload, PrincipalKind,
     RemoteFlightReport, TargetKind, Task, TaskStatus,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::planner::PlannerKind;
 
 #[derive(Clone, Debug, Serialize)]
@@ -26,21 +26,21 @@ pub struct ShowcaseSummary {
     pub flows: Vec<Flow>,
 }
 
-pub async fn bootstrap_showcase(app: &mut MambaApp, workspace: &Path) -> Result<ShowcaseSummary> {
+pub async fn bootstrap_showcase(app: &mut RelayApp, workspace: &Path) -> Result<ShowcaseSummary> {
     if app.state().organization.is_some() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "Showcase 只能装载到空塔台，请换一个独立的 --data-dir".to_string(),
         ));
     }
 
-    app.init_organization("Mamba Labs", "admin")?;
+    app.init_organization("Relay Labs", "admin")?;
     let team = app.create_team(
-        "洛杉矶研发队",
+        "平台研发组",
         "product,delivery,backend,rust,llm-platform,security,quality,observability,operations",
         "admin",
     )?;
     let leader = app.register_principal(
-        "牢大",
+        "陈静",
         PrincipalKind::Human,
         Some(&team.id),
         None,
@@ -50,7 +50,7 @@ pub async fn bootstrap_showcase(app: &mut MambaApp, workspace: &Path) -> Result<
         "admin",
     )?;
     let engineer = app.register_principal(
-        "佐巴扬",
+        "李伟",
         PrincipalKind::Human,
         Some(&team.id),
         None,
@@ -104,7 +104,7 @@ pub async fn bootstrap_showcase(app: &mut MambaApp, workspace: &Path) -> Result<
 }
 
 pub async fn seed_showcase(
-    app: &mut MambaApp,
+    app: &mut RelayApp,
     workspace: &Path,
     requester: &str,
 ) -> Result<ShowcaseSummary> {
@@ -125,7 +125,7 @@ pub async fn seed_showcase(
         .flow(&gateway.id)?
         .task("gateway-core")
         .cloned()
-        .ok_or_else(|| MambaError::NotFound {
+        .ok_or_else(|| RelayError::NotFound {
             entity: "showcase task",
             id: "gateway-core".into(),
         })?;
@@ -185,7 +185,7 @@ pub async fn seed_showcase(
             title: "LLM Gateway v0 rollout checklist".into(),
             description:
                 "Track contract tests, observability, staged rollout and rollback evidence.".into(),
-            labels: vec!["delivery".into(), "mambaflow".into()],
+            labels: vec!["delivery".into(), "relay".into()],
         },
         &gateway_actor,
     )?;
@@ -226,7 +226,7 @@ pub async fn seed_showcase(
             contract_violations: Vec::new(),
             sandbox: Some(ExecutionSandboxReport {
                 backend: "docker".into(),
-                image: Some("manbaflow-agent-runtime:0.1.0".into()),
+                image: Some("relay-agent-runtime:0.1.0".into()),
                 image_id: Some(format!("sha256:{}", "7".repeat(64))),
                 network: "none".into(),
                 root_read_only: true,
@@ -238,14 +238,14 @@ pub async fn seed_showcase(
             }),
         },
     )?;
-    let command_message_id = if app.state().principal("佐巴扬").is_ok() {
+    let command_message_id = if app.state().principal("李伟").is_ok() {
         Some(
             app.post_flow_message(
                 &gateway.id,
                 Some(&auth_policy.id),
                 requester,
                 FlowMessageKind::Command,
-                &["佐巴扬".to_string(), "Codex 副驾".to_string()],
+                &["李伟".to_string(), "Codex 副驾".to_string()],
                 "确认 Provider Secret 轮换边界，给出生产放行结论；收到后回传塔台",
                 true,
             )?
@@ -280,9 +280,9 @@ pub async fn seed_showcase(
         &deliver.id,
         OfficeProvider::Microsoft365,
         OfficeReleasePayload::SendEmail {
-            account_id: "release-owner@mamba.example".into(),
-            to: vec!["customers@mamba.example".into()],
-            cc: vec!["support@mamba.example".into()],
+            account_id: "release-owner@relay.example".into(),
+            to: vec!["customers@relay.example".into()],
+            cc: vec!["support@relay.example".into()],
             bcc: Vec::new(),
             subject: "Q3 客户发布说明".into(),
             body: "发布说明、迁移指南和 FAQ 已完成 Human Review，详见发布包。".into(),
@@ -322,13 +322,13 @@ pub async fn seed_showcase(
     })
 }
 
-fn start_task(app: &mut MambaApp, flow_id: &str, task_key: &str) -> Result<Task> {
+fn start_task(app: &mut RelayApp, flow_id: &str, task_key: &str) -> Result<Task> {
     let task = app
         .state()
         .flow(flow_id)?
         .task(task_key)
         .cloned()
-        .ok_or_else(|| MambaError::NotFound {
+        .ok_or_else(|| RelayError::NotFound {
             entity: "showcase task",
             id: task_key.to_string(),
         })?;
@@ -340,7 +340,7 @@ fn start_task(app: &mut MambaApp, flow_id: &str, task_key: &str) -> Result<Task>
     match task.status {
         TaskStatus::Accepted | TaskStatus::Blocked => app.start_task(&task.id, &actor),
         TaskStatus::InProgress => Ok(task),
-        status => Err(MambaError::InvalidTransition(format!(
+        status => Err(RelayError::InvalidTransition(format!(
             "showcase task {} cannot start from {:?}",
             task.id, status
         ))),
@@ -348,7 +348,7 @@ fn start_task(app: &mut MambaApp, flow_id: &str, task_key: &str) -> Result<Task>
 }
 
 fn complete_task(
-    app: &mut MambaApp,
+    app: &mut RelayApp,
     flow_id: &str,
     task_key: &str,
     requester: &str,
@@ -366,17 +366,17 @@ fn complete_task(
     app.complete_task(&task.id, requester)
 }
 
-fn task_actor(app: &MambaApp, task: &Task) -> Result<String> {
+fn task_actor(app: &RelayApp, task: &Task) -> Result<String> {
     let assignment = task
         .assignment
         .as_ref()
-        .ok_or_else(|| MambaError::NoEligibleAssignee(task.title.clone()))?;
+        .ok_or_else(|| RelayError::NoEligibleAssignee(task.title.clone()))?;
     match assignment.owner.kind {
         TargetKind::Human => Ok(assignment.owner.name.clone()),
         TargetKind::Agent => {
             let agent = app.state().principal(&assignment.owner.id)?;
             let owner_id = agent.owner_id.as_deref().ok_or_else(|| {
-                MambaError::Validation(format!("agent {} has no Human owner", agent.name))
+                RelayError::Validation(format!("agent {} has no Human owner", agent.name))
             })?;
             Ok(app.state().principal(owner_id)?.name.clone())
         }
@@ -390,21 +390,21 @@ fn task_actor(app: &MambaApp, task: &Task) -> Result<String> {
                     && principal.team_id.as_deref() == Some(assignment.owner.id.as_str())
             })
             .map(|principal| principal.name.clone())
-            .ok_or_else(|| MambaError::NoEligibleAssignee(task.title.clone())),
+            .ok_or_else(|| RelayError::NoEligibleAssignee(task.title.clone())),
     }
 }
 
-fn assigned_agent_and_owner(app: &MambaApp, task: &Task) -> Result<(String, String, ExecutorKind)> {
+fn assigned_agent_and_owner(app: &RelayApp, task: &Task) -> Result<(String, String, ExecutorKind)> {
     let assignment = task
         .assignment
         .as_ref()
-        .ok_or_else(|| MambaError::NoEligibleAssignee(task.title.clone()))?;
+        .ok_or_else(|| RelayError::NoEligibleAssignee(task.title.clone()))?;
     let principal = std::iter::once(&assignment.owner)
         .chain(&assignment.copilots)
         .filter_map(|target| app.state().principals.get(&target.id))
         .find(|principal| principal.kind == PrincipalKind::Agent && principal.owner_id.is_some())
         .ok_or_else(|| {
-            MambaError::Validation(format!(
+            RelayError::Validation(format!(
                 "showcase task {} has no assigned personal agent",
                 task.id
             ))
@@ -430,8 +430,8 @@ mod tests {
     #[tokio::test]
     async fn showcase_contains_progress_risk_review_flight_and_completion() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
-        app.init_organization("Mamba Labs", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Relay Labs", "admin").unwrap();
         let team = app
             .create_team(
                 "Platform",
@@ -441,7 +441,7 @@ mod tests {
             .unwrap();
         let human = app
             .register_principal(
-                "牢大",
+                "陈静",
                 PrincipalKind::Human,
                 Some(&team.id),
                 None,

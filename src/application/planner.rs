@@ -5,7 +5,7 @@ use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{ExecutorKind, ExecutorMode, Flow, PlanDraft, PrdDraft, TaskDraft};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
 use crate::ids::normalize_capability;
 use crate::state::OrganizationState;
@@ -122,7 +122,7 @@ async fn model_plan(
     .await?;
     Ok(serde_json::from_value(
         output.structured_output.ok_or_else(|| {
-            MambaError::InvalidExecutorOutput("planner returned no structured output".into())
+            RelayError::InvalidExecutorOutput("planner returned no structured output".into())
         })?,
     )?)
 }
@@ -416,12 +416,12 @@ fn task(
 
 fn validate_plan(mut plan: PlanDraft) -> Result<PlanDraft> {
     if plan.prd.title.trim().is_empty() || plan.prd.acceptance_criteria.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "PRD title and acceptance criteria are required".into(),
         ));
     }
     if plan.tasks.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "plan must contain at least one task".into(),
         ));
     }
@@ -434,7 +434,7 @@ fn validate_plan(mut plan: PlanDraft) -> Result<PlanDraft> {
             || task.effort_hours <= 0.0
             || task.acceptance_criteria.is_empty()
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "task `{}` is missing a key, description, positive effort, or acceptance criteria",
                 task.title
             )));

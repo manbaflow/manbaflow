@@ -1,7 +1,8 @@
 /target/
-.mambaflow/
-.mambaflow-showcase/
+.relay/
+.relay-showcase/
 *.log
 .env
 /backups/
 /deploy/secrets/
+/deploy/.remote-install.env

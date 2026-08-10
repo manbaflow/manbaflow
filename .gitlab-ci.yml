@@ -1,0 +1,108 @@
+# 构建 Relay 控制面镜像并推到内部 registry。
+# 形状对齐 edumind/edumindx：buildkit 远程构建，main/master/release 出正式版，
+# 其余分支出 dev 版。
+#
+# 与 edumindx 的区别：fmt / clippy / test 跑在 Dockerfile.ci 的 builder 阶段里，
+# 没有单独的 check job——集群 runner 侧没有 rust 基础镜像，而 buildkit 配了
+# docker.io 镜像源可以直接拉 rust:bookworm。检查不过镜像就构建不出来。
+default:
+  image: registry.edumind.ai/infra/buildkit:v0.17.1
+  retry: 1
+  tags:
+    - gpu-resource
+  before_script:
+    - mkdir -p ~/.docker
+    - cat /etc/ssl/edumind/ca.crt >> /etc/ssl/certs/ca-certificates.crt
+    - |
+      if [ -z "${CI_REGISTRY_USER:-}" ] || [ -z "${CI_REGISTRY_PASSWORD:-}" ]; then
+        echo "Missing GitLab registry credentials: CI_REGISTRY_USER/CI_REGISTRY_PASSWORD" >&2
+        exit 1
+      fi
+      REGISTRY_AUTH=$(echo -n "${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD}" | base64 -w 0)
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${REGISTRY_AUTH}\"}}}" > ~/.docker/config.json
+
+stages:
+  - check
+  - build
+
+# 部署脚本是 POSIX sh，语法错误在 CI 里拦下来比在服务器上发现便宜得多。
+# 这个 job 不碰 registry，也不需要 buildkit。
+deploy-scripts:
+  stage: check
+  image: registry.edumind.ai/infra/images/node:22-alpine
+  before_script: []
+  script:
+    - sh -n deploy/install.sh
+    - sh -n deploy/manage.sh
+
+.build: &build
+  stage: build
+  script:
+    - buildctl --addr=tcp://buildkit-service.buildkit-service-system:1234 build
+      --frontend dockerfile.v0 --opt platform=linux/amd64
+      --opt filename=Dockerfile.ci
+      ${OUTPUTS}
+      --import-cache type=registry,ref=${CACHE}
+      --export-cache type=registry,ref=${CACHE}
+      --progress=plain
+      --local context=.
+      --local dockerfile=.
+      --opt build-arg:OCI_REVISION=${CI_COMMIT_SHA}
+      --opt build-arg:OCI_SOURCE=${CI_PROJECT_URL}
+
+build_production:
+  <<: *build
+  variables:
+    OUTPUTS: >-
+      --output type=image,name=${VERSION_IMAGE},push=true
+      --output type=image,name=${LATEST_IMAGE},push=true
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /^\[skip\]/'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "release"'
+      when: always
+    - when: never
+
+build_dev:
+  <<: *build
+  variables:
+    OUTPUTS: --output type=image,name=${DEV_IMAGE},push=true
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /^\[skip\]/'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "release"'
+      when: never
+    - when: always
+
+# Remote Worker 的沙箱 Runtime 镜像。它不随控制面每次提交变化，
+# 只在 Dockerfile 或钉住的 CLI 版本改动时才需要重建。
+build_agent_runtime:
+  stage: build
+  script:
+    - buildctl --addr=tcp://buildkit-service.buildkit-service-system:1234 build
+      --frontend dockerfile.v0 --opt platform=linux/amd64
+      --opt filename=docker/agent-runtime/Dockerfile
+      --output type=image,name=${RUNTIME_IMAGE},push=true
+      --import-cache type=registry,ref=${RUNTIME_CACHE}
+      --export-cache type=registry,ref=${RUNTIME_CACHE}
+      --progress=plain
+      --local context=.
+      --local dockerfile=.
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /^\[skip\]/'
+      when: never
+    - changes:
+        - docker/agent-runtime/Dockerfile
+      when: always
+    - when: manual
+      allow_failure: true
+
+variables:
+  VERSION: 1.0.${CI_PIPELINE_IID}
+  IMAGE: ${CI_REGISTRY}/${CI_PROJECT_PATH}
+  VERSION_IMAGE: ${IMAGE}/${CI_COMMIT_BRANCH}:${VERSION}
+  LATEST_IMAGE: ${IMAGE}/${CI_COMMIT_BRANCH}:latest
+  DEV_IMAGE: ${IMAGE}/dev:${VERSION}
+  CACHE: ${CI_REGISTRY}/${CI_PROJECT_PATH}:cache
+  RUNTIME_IMAGE: ${IMAGE}/agent-runtime:${VERSION}
+  RUNTIME_CACHE: ${IMAGE}/agent-runtime:cache

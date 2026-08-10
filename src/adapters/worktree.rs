@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 #[derive(Clone, Debug)]
 pub struct WorktreeArtifact {
@@ -28,17 +28,17 @@ impl IsolatedWorktree {
         let repository = git_text(&source_workspace, &["rev-parse", "--show-toplevel"])?;
         let repository = PathBuf::from(repository).canonicalize()?;
         let relative_workspace = source_workspace.strip_prefix(&repository).map_err(|_| {
-            MambaError::Validation("workspace is not inside its Git repository".into())
+            RelayError::Validation("workspace is not inside its Git repository".into())
         })?;
         let status = git_text(&repository, &["status", "--porcelain"])?;
         if !status.is_empty() {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "remote execute requires a clean source worktree".into(),
             ));
         }
         let base_revision = git_text(&repository, &["rev-parse", "HEAD"])?;
         if root.exists() {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "isolated worktree already exists: {}",
                 root.display()
             )));
@@ -78,29 +78,29 @@ impl IsolatedWorktree {
         )?)
         .canonicalize()?;
         let relative_workspace = source_workspace.strip_prefix(&repository).map_err(|_| {
-            MambaError::Validation("workspace is not inside its Git repository".into())
+            RelayError::Validation("workspace is not inside its Git repository".into())
         })?;
         let root = root.canonicalize().map_err(|_| {
-            MambaError::Validation("active flight has no resumable isolated worktree".into())
+            RelayError::Validation("active flight has no resumable isolated worktree".into())
         })?;
         let worktree_repository =
             PathBuf::from(git_text(&root, &["rev-parse", "--show-toplevel"])?);
         if worktree_repository.canonicalize()? != root {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "active flight worktree root does not match its Git repository".into(),
             ));
         }
         let source_common = git_path(&repository, &["rev-parse", "--git-common-dir"])?;
         let worktree_common = git_path(&root, &["rev-parse", "--git-common-dir"])?;
         if source_common != worktree_common {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "active flight worktree belongs to another Git repository".into(),
             ));
         }
         let base_revision = git_text(&root, &["rev-parse", "HEAD"])?;
         let workspace = root.join(relative_workspace);
         if !workspace.is_dir() {
-            return Err(MambaError::InvalidWorkspace(workspace));
+            return Err(RelayError::InvalidWorkspace(workspace));
         }
         Ok(Self {
             repository,
@@ -203,13 +203,13 @@ fn git_output(workspace: &Path, args: &[&str]) -> Result<Output> {
         .args(args)
         .output()
         .map_err(|error| {
-            MambaError::Validation(format!(
+            RelayError::Validation(format!(
                 "could not start Git for isolated worktree: {error}"
             ))
         })?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "Git worktree operation failed: {message}"
         )));
     }
@@ -218,7 +218,7 @@ fn git_output(workspace: &Path, args: &[&str]) -> Result<Output> {
 
 fn path_arg(path: &Path) -> Result<&str> {
     path.to_str()
-        .ok_or_else(|| MambaError::Validation("worktree path is not valid UTF-8".into()))
+        .ok_or_else(|| RelayError::Validation("worktree path is not valid UTF-8".into()))
 }
 
 #[cfg(test)]

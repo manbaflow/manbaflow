@@ -1,5 +1,6 @@
 pub mod capability;
 pub mod executor;
+pub mod feishu_auth;
 pub mod gitlab;
 pub mod gitlab_write;
 pub mod identity;

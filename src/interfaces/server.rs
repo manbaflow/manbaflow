@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use tokio::time::{MissedTickBehavior, interval};
 use tower::ServiceExt;
 
-use crate::MambaApp;
+use crate::RelayApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
     AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, FlightManifestDraft,
@@ -28,7 +28,8 @@ use crate::domain::{
     OrganizationRole, Principal, PrincipalKind, RecoveryAction, RemoteFlightReport, RoleBinding,
     Task, Team, Tenant, TrackingEscalation, WorkCalendar, Workday,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
+use crate::feishu_auth::FeishuProvider;
 use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
 use crate::gitlab_write::GitLabWriteBridge;
 use crate::identity::{OidcProvider, ScimAuthenticator};
@@ -52,11 +53,12 @@ pub struct ServerOptions {
 
 #[derive(Clone)]
 struct ApiState {
-    app: Arc<Mutex<MambaApp>>,
+    app: Arc<Mutex<RelayApp>>,
     tenant_id: String,
     gitlab_webhook_auth: Option<GitLabWebhookAuth>,
     interaction_auth: InteractionWebhookAuth,
     oidc: Option<OidcProvider>,
+    feishu: Option<FeishuProvider>,
     scim_auth: ScimAuthenticator,
     office_bridge: OfficeBridge,
     gitlab_write_bridge: GitLabWriteBridge,
@@ -126,16 +128,16 @@ impl ApiError {
     }
 }
 
-impl From<MambaError> for ApiError {
-    fn from(error: MambaError) -> Self {
+impl From<RelayError> for ApiError {
+    fn from(error: RelayError) -> Self {
         let status = match &error {
-            MambaError::NotFound { .. } => StatusCode::NOT_FOUND,
-            MambaError::InvalidTransition(_) | MambaError::ConcurrentModification { .. } => {
+            RelayError::NotFound { .. } => StatusCode::NOT_FOUND,
+            RelayError::InvalidTransition(_) | RelayError::ConcurrentModification { .. } => {
                 StatusCode::CONFLICT
             }
-            MambaError::PermissionDenied(_) => StatusCode::FORBIDDEN,
-            MambaError::Validation(_) | MambaError::InvalidWorkspace(_) => StatusCode::BAD_REQUEST,
-            MambaError::OrganizationNotInitialized | MambaError::TenantNotInitialized => {
+            RelayError::PermissionDenied(_) => StatusCode::FORBIDDEN,
+            RelayError::Validation(_) | RelayError::InvalidWorkspace(_) => StatusCode::BAD_REQUEST,
+            RelayError::OrganizationNotInitialized | RelayError::TenantNotInitialized => {
                 StatusCode::PRECONDITION_REQUIRED
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -162,17 +164,17 @@ struct ScimApiError {
     scim_type: Option<&'static str>,
 }
 
-impl From<MambaError> for ScimApiError {
-    fn from(error: MambaError) -> Self {
+impl From<RelayError> for ScimApiError {
+    fn from(error: RelayError) -> Self {
         let (status, scim_type) = match &error {
-            MambaError::NotFound { .. } => (StatusCode::NOT_FOUND, None),
-            MambaError::PermissionDenied(_) => (StatusCode::FORBIDDEN, None),
-            MambaError::Validation(message)
+            RelayError::NotFound { .. } => (StatusCode::NOT_FOUND, None),
+            RelayError::PermissionDenied(_) => (StatusCode::FORBIDDEN, None),
+            RelayError::Validation(message)
                 if message.contains("already") || message.contains("provisioned") =>
             {
                 (StatusCode::CONFLICT, Some("uniqueness"))
             }
-            MambaError::Validation(_) => (StatusCode::BAD_REQUEST, Some("invalidValue")),
+            RelayError::Validation(_) => (StatusCode::BAD_REQUEST, Some("invalidValue")),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, None),
         };
         let detail = if status == StatusCode::INTERNAL_SERVER_ERROR {
@@ -200,7 +202,7 @@ impl IntoResponse for ScimApiError {
         if self.status == StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
-                "Bearer realm=\"MambaFlow SCIM\"".parse().unwrap(),
+                "Bearer realm=\"Relay SCIM\"".parse().unwrap(),
             );
         }
         response
@@ -497,11 +499,12 @@ struct RejectGitLabWriteInput {
     reason: String,
 }
 
-pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
+pub async fn run(app: RelayApp, options: ServerOptions) -> Result<()> {
     validate_server_options(&options)?;
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
     let interaction_auth = InteractionWebhookAuth::from_env()?;
     let oidc = OidcProvider::from_env().await?;
+    let feishu = FeishuProvider::from_env()?;
     let scim_auth = ScimAuthenticator::from_env()?;
     let office_bridge = OfficeBridge::from_env()?;
     let gitlab_write_bridge = GitLabWriteBridge::from_env()?;
@@ -527,12 +530,15 @@ pub async fn run(app: MambaApp, options: ServerOptions) -> Result<()> {
         listener,
         router_with_identity(
             app,
-            gitlab_webhook_auth,
-            interaction_auth,
-            oidc,
-            scim_auth,
-            office_bridge,
-            gitlab_write_bridge,
+            ServerIntegrations {
+                gitlab_webhook_auth,
+                interaction_auth,
+                oidc,
+                feishu,
+                scim_auth,
+                office_bridge,
+                gitlab_write_bridge,
+            },
         ),
     )
     .with_graceful_shutdown(shutdown_signal())
@@ -550,19 +556,20 @@ pub async fn run_fleet(
     let mut catalog = TenantCatalog::configured(data_dir)?;
     let (default_record, mut default_app) = if database_url.is_some() {
         let record = catalog.default_tenant()?.ok_or_else(|| {
-            MambaError::Validation(
-                "PostgreSQL tenant catalog is empty; run `mamba org init` before serve".into(),
+            RelayError::Validation(
+                "PostgreSQL tenant catalog is empty; run `relay org init` before serve".into(),
             )
         })?;
         (record, None)
     } else {
-        let app = MambaApp::open(data_dir)?;
+        let app = RelayApp::open(data_dir)?;
         let record = catalog.adopt_default(app.state().tenant()?)?;
         (record, Some(app))
     };
     let gitlab_webhook_auth = GitLabWebhookAuth::from_env()?;
     let interaction_auth = InteractionWebhookAuth::from_env()?;
     let oidc = OidcProvider::from_env().await?;
+    let feishu = FeishuProvider::from_env()?;
     let scim_auth = ScimAuthenticator::from_env()?;
     let office_bridge = OfficeBridge::from_env()?;
     let gitlab_write_bridge = GitLabWriteBridge::from_env()?;
@@ -570,22 +577,22 @@ pub async fn run_fleet(
 
     for record in catalog.active()? {
         let app = if let Some(database_url) = database_url.as_deref() {
-            MambaApp::open_postgres(catalog.data_dir(&record)?, database_url, &record.id)?
+            RelayApp::open_postgres(catalog.data_dir(&record)?, database_url, &record.id)?
         } else if record.id == default_record.id {
             if default_record.storage_path != record.storage_path {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "default tenant storage path changed while loading the fleet".into(),
                 ));
             }
             default_app.take().ok_or_else(|| {
-                MambaError::Validation("default tenant appears more than once in catalog".into())
+                RelayError::Validation("default tenant appears more than once in catalog".into())
             })?
         } else {
-            MambaApp::open(catalog.data_dir(&record)?)?
+            RelayApp::open(catalog.data_dir(&record)?)?
         };
         let actual_tenant_id = &app.state().tenant()?.id;
         if actual_tenant_id != &record.id {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "tenant catalog entry {} points to a Ledger owned by {actual_tenant_id}",
                 record.id
             )));
@@ -609,12 +616,15 @@ pub async fn run_fleet(
             record.id,
             router_with_identity(
                 app,
-                gitlab_webhook_auth.clone(),
-                interaction_auth.clone(),
-                oidc.clone(),
-                scim_auth.clone(),
-                office_bridge.clone(),
-                gitlab_write_bridge.clone(),
+                ServerIntegrations {
+                    gitlab_webhook_auth: gitlab_webhook_auth.clone(),
+                    interaction_auth: interaction_auth.clone(),
+                    oidc: oidc.clone(),
+                    feishu: feishu.clone(),
+                    scim_auth: scim_auth.clone(),
+                    office_bridge: office_bridge.clone(),
+                    gitlab_write_bridge: gitlab_write_bridge.clone(),
+                },
             ),
         );
     }
@@ -642,26 +652,27 @@ pub async fn run_fleet(
 async fn fleet_dispatch(State(state): State<FleetState>, request: Request) -> Response {
     let header_tenant = request
         .headers()
-        .get("x-mamba-tenant")
+        .get("x-relay-tenant")
         .and_then(|value| value.to_str().ok());
     let token_tenant = bearer_token(request.headers())
-        .or_else(|| cookie_value(request.headers(), "mamba_session"))
+        .or_else(|| cookie_value(request.headers(), "relay_session"))
         .and_then(crate::app::tenant_token_hint);
-    let login_tenant = if request.uri().path() == "/auth/oidc/login" {
+    let path = request.uri().path();
+    let login_tenant = if path == "/auth/oidc/login" || path == "/auth/feishu/login" {
         request.uri().query().and_then(|query| {
             serde_urlencoded::from_str::<BTreeMap<String, String>>(query)
                 .ok()
                 .and_then(|values| values.get("tenant").cloned())
         })
-    } else if request.uri().path() == "/auth/oidc/callback" {
-        cookie_value(request.headers(), "mamba_login_tenant").map(str::to_string)
+    } else if path == "/auth/oidc/callback" || path == "/auth/feishu/callback" {
+        cookie_value(request.headers(), "relay_login_tenant").map(str::to_string)
     } else {
         None
     };
     if token_tenant.is_some() && header_tenant.is_some() && token_tenant != header_tenant {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "bearer token and x-mamba-tenant select different tenants"})),
+            Json(json!({"error": "bearer token and x-relay-tenant select different tenants"})),
         )
             .into_response();
     }
@@ -680,17 +691,17 @@ async fn fleet_dispatch(State(state): State<FleetState>, request: Request) -> Re
 
 fn validate_server_options(options: &ServerOptions) -> Result<()> {
     if options.tracker_interval_seconds == 0 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "tracker interval must be greater than zero".into(),
         ));
     }
     if options.notification_interval_seconds == 0 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "notification interval must be greater than zero".into(),
         ));
     }
     if !options.bind.ip().is_loopback() && !options.allow_insecure_public_http {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "refusing non-loopback plain HTTP; terminate TLS at a trusted proxy and pass --allow-insecure-public-http to acknowledge the hop".into(),
         ));
     }
@@ -704,7 +715,7 @@ fn announce_server(
     tenant_count: usize,
 ) {
     println!(
-        "MambaFlow control plane listening on http://{} ({tenant_count} tenant{})",
+        "Relay control plane listening on http://{} ({tenant_count} tenant{})",
         options.bind,
         if tenant_count == 1 { "" } else { "s" }
     );
@@ -719,32 +730,52 @@ fn announce_server(
     }
 }
 
+/// 一次进程启动解析出来的全部外部集成。
+///
+/// 收成结构体而不是继续加参数：`run` 和 `run_fleet` 都要原样传给每个 Tenant 的
+/// Router，散成一长串位置参数很容易在调用点串位——尤其是相邻的几个
+/// `Option<..Provider>`，串了编译器也未必报错。
+#[derive(Clone)]
+struct ServerIntegrations {
+    gitlab_webhook_auth: Option<GitLabWebhookAuth>,
+    interaction_auth: InteractionWebhookAuth,
+    oidc: Option<OidcProvider>,
+    feishu: Option<FeishuProvider>,
+    scim_auth: ScimAuthenticator,
+    office_bridge: OfficeBridge,
+    gitlab_write_bridge: GitLabWriteBridge,
+}
+
 #[cfg(test)]
 fn router(
-    app: Arc<Mutex<MambaApp>>,
+    app: Arc<Mutex<RelayApp>>,
     gitlab_webhook_auth: Option<GitLabWebhookAuth>,
     interaction_auth: InteractionWebhookAuth,
 ) -> Router {
     router_with_identity(
         app,
-        gitlab_webhook_auth,
-        interaction_auth,
-        None,
-        ScimAuthenticator::default(),
-        OfficeBridge::disabled(),
-        GitLabWriteBridge::disabled(),
+        ServerIntegrations {
+            gitlab_webhook_auth,
+            interaction_auth,
+            oidc: None,
+            feishu: None,
+            scim_auth: ScimAuthenticator::default(),
+            office_bridge: OfficeBridge::disabled(),
+            gitlab_write_bridge: GitLabWriteBridge::disabled(),
+        },
     )
 }
 
-fn router_with_identity(
-    app: Arc<Mutex<MambaApp>>,
-    gitlab_webhook_auth: Option<GitLabWebhookAuth>,
-    interaction_auth: InteractionWebhookAuth,
-    oidc: Option<OidcProvider>,
-    scim_auth: ScimAuthenticator,
-    office_bridge: OfficeBridge,
-    gitlab_write_bridge: GitLabWriteBridge,
-) -> Router {
+fn router_with_identity(app: Arc<Mutex<RelayApp>>, integrations: ServerIntegrations) -> Router {
+    let ServerIntegrations {
+        gitlab_webhook_auth,
+        interaction_auth,
+        oidc,
+        feishu,
+        scim_auth,
+        office_bridge,
+        gitlab_write_bridge,
+    } = integrations;
     let rate_limit = RateLimitState::default();
     let tenant_id = app
         .try_lock()
@@ -760,6 +791,7 @@ fn router_with_identity(
         gitlab_webhook_auth,
         interaction_auth,
         oidc,
+        feishu,
         scim_auth,
         office_bridge,
         gitlab_write_bridge,
@@ -776,6 +808,8 @@ fn router_with_identity(
         .route("/health/ready", get(readiness))
         .route("/auth/oidc/login", get(oidc_login))
         .route("/auth/oidc/callback", get(oidc_callback))
+        .route("/auth/feishu/login", get(feishu_login))
+        .route("/auth/feishu/callback", get(feishu_callback))
         .route("/auth/logout", post(oidc_logout))
         .route("/scim/v2/Users", get(scim_users).post(scim_create_user))
         .route(
@@ -969,7 +1003,7 @@ async fn request_guard(
         .get(header::AUTHORIZATION)
         .map(|value| Sha256::digest(value.as_bytes()).into())
         .or_else(|| {
-            cookie_value(request.headers(), "mamba_session")
+            cookie_value(request.headers(), "relay_session")
                 .map(|value| Sha256::digest(value.as_bytes()).into())
         })
         .unwrap_or_else(|| Sha256::digest(b"anonymous").into());
@@ -1003,7 +1037,7 @@ fn harden_response(mut response: Response, request_id: &str, no_store: bool) -> 
     response
 }
 
-fn spawn_tracker(app: Arc<Mutex<MambaApp>>, options: &ServerOptions) {
+fn spawn_tracker(app: Arc<Mutex<RelayApp>>, options: &ServerOptions) {
     let tracker_interval_seconds = options.tracker_interval_seconds;
     let stale_after_hours = options.stale_after_hours;
     let escalate_after_hours = options.escalate_after_hours;
@@ -1029,7 +1063,7 @@ fn spawn_tracker(app: Arc<Mutex<MambaApp>>, options: &ServerOptions) {
     });
 }
 
-fn spawn_notification_dispatcher(app: Arc<Mutex<MambaApp>>, options: &ServerOptions) {
+fn spawn_notification_dispatcher(app: Arc<Mutex<RelayApp>>, options: &ServerOptions) {
     let interval_seconds = options.notification_interval_seconds;
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(interval_seconds));
@@ -1051,7 +1085,7 @@ fn spawn_notification_dispatcher(app: Arc<Mutex<MambaApp>>, options: &ServerOpti
 }
 
 fn spawn_office_dispatcher(
-    app: Arc<Mutex<MambaApp>>,
+    app: Arc<Mutex<RelayApp>>,
     bridge: OfficeBridge,
     tenant_id: String,
     options: &ServerOptions,
@@ -1077,7 +1111,7 @@ fn spawn_office_dispatcher(
 }
 
 fn spawn_gitlab_write_dispatcher(
-    app: Arc<Mutex<MambaApp>>,
+    app: Arc<Mutex<RelayApp>>,
     bridge: GitLabWriteBridge,
     tenant_id: String,
     options: &ServerOptions,
@@ -1109,7 +1143,7 @@ async fn shutdown_signal() {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        service: "mambaflow-control-plane",
+        service: "relay-control-plane",
     })
 }
 
@@ -1140,7 +1174,7 @@ async fn oidc_login(
     response.headers_mut().append(
         header::SET_COOKIE,
         format!(
-            "mamba_login_tenant={}; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
+            "relay_login_tenant={}; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
             login.tenant_id
         )
         .parse()
@@ -1152,7 +1186,7 @@ async fn oidc_login(
     response.headers_mut().append(
         header::SET_COOKIE,
         format!(
-            "mamba_oidc_state={}; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
+            "relay_oidc_state={}; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
             login.state_cookie
         )
         .parse()
@@ -1174,7 +1208,7 @@ async fn oidc_callback(
         message: "OIDC login is not configured".into(),
     })?;
     let state_cookie =
-        cookie_value(&headers, "mamba_oidc_state").ok_or_else(ApiError::unauthorized)?;
+        cookie_value(&headers, "relay_oidc_state").ok_or_else(ApiError::unauthorized)?;
     let identity = provider
         .complete_login(&query.code, &query.state, state_cookie)
         .await?;
@@ -1193,7 +1227,7 @@ async fn oidc_callback(
     response.headers_mut().append(
         header::SET_COOKIE,
         format!(
-            "mamba_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800{secure}",
+            "relay_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800{secure}",
             session.token
         )
         .parse()
@@ -1205,7 +1239,7 @@ async fn oidc_callback(
     response.headers_mut().append(
         header::SET_COOKIE,
         format!(
-            "mamba_oidc_state=; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
+            "relay_oidc_state=; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
         )
         .parse()
         .map_err(|_| ApiError {
@@ -1216,7 +1250,7 @@ async fn oidc_callback(
     response.headers_mut().append(
         header::SET_COOKIE,
         format!(
-            "mamba_login_tenant=; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
+            "relay_login_tenant=; Path=/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
         )
         .parse()
         .map_err(|_| ApiError {
@@ -1227,14 +1261,130 @@ async fn oidc_callback(
     Ok(response)
 }
 
+async fn feishu_login(
+    State(state): State<ApiState>,
+    Query(query): Query<OidcLoginQuery>,
+) -> ApiResult<Response> {
+    let provider = state.feishu.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "Feishu login is not configured".into(),
+    })?;
+    let app = state.app.lock().await;
+    let tenant_id = &app.state().tenant()?.id;
+    if query
+        .tenant
+        .as_deref()
+        .is_some_and(|value| value != tenant_id)
+    {
+        return Err(ApiError::unauthorized());
+    }
+    let login = provider.begin_login(tenant_id, &query.return_to)?;
+    let mut response = Redirect::temporary(&login.authorization_url).into_response();
+    let secure = if provider.secure_cookie() {
+        "; Secure"
+    } else {
+        ""
+    };
+    // Cookie 名字和 OIDC 那条链路相同，但 Path 不同，两者不会互相覆盖。
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "relay_login_tenant={}; Path=/auth/feishu/callback; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
+            login.tenant_id
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not establish Feishu login state".into(),
+        })?,
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "relay_feishu_state={}; Path=/auth/feishu/callback; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
+            login.state_cookie
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not establish Feishu state cookie".into(),
+        })?,
+    );
+    Ok(response)
+}
+
+async fn feishu_callback(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<OidcCallbackQuery>,
+) -> ApiResult<Response> {
+    let provider = state.feishu.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "Feishu login is not configured".into(),
+    })?;
+    let state_cookie =
+        cookie_value(&headers, "relay_feishu_state").ok_or_else(ApiError::unauthorized)?;
+    // complete_login 内部已经按 tenant_key 白名单挡过外部企业的用户。
+    let identity = provider
+        .complete_login(&query.code, &query.state, state_cookie)
+        .await?;
+    let mut app = state.app.lock().await;
+    if app.state().tenant()?.id != identity.tenant_id {
+        return Err(ApiError::unauthorized());
+    }
+    let principal = app.feishu_principal(&identity.open_id, &identity.name)?;
+    let session = app.issue_oidc_session(&principal.id)?;
+    let mut response = Redirect::to(&identity.return_to).into_response();
+    let secure = if provider.secure_cookie() {
+        "; Secure"
+    } else {
+        ""
+    };
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "relay_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800{secure}",
+            session.token
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not establish Feishu session".into(),
+        })?,
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "relay_feishu_state=; Path=/auth/feishu/callback; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not clear Feishu state cookie".into(),
+        })?,
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "relay_login_tenant=; Path=/auth/feishu/callback; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
+        )
+        .parse()
+        .map_err(|_| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "could not clear Feishu login state".into(),
+        })?,
+    );
+    Ok(response)
+}
+
 async fn oidc_logout(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Response> {
-    if let Some(token) = cookie_value(&headers, "mamba_session") {
+    if let Some(token) = cookie_value(&headers, "relay_session") {
         state.app.lock().await.revoke_oidc_session(token)?;
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        "mamba_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+        "relay_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
             .parse()
             .unwrap(),
     );
@@ -1458,7 +1608,7 @@ async fn scim_schemas(
                 {
                     "id": crate::scim::USER_SCHEMA,
                     "name": "User",
-                    "description": "MambaFlow Human Principal",
+                    "description": "Relay Human Principal",
                     "attributes": [
                         {"name": "userName", "type": "string", "multiValued": false, "required": true, "uniqueness": "server"},
                         {"name": "displayName", "type": "string", "multiValued": false, "required": false},
@@ -1468,7 +1618,7 @@ async fn scim_schemas(
                 {
                     "id": crate::scim::GROUP_SCHEMA,
                     "name": "Group",
-                    "description": "MambaFlow Team",
+                    "description": "Relay Team",
                     "attributes": [
                         {"name": "displayName", "type": "string", "multiValued": false, "required": true},
                         {"name": "members", "type": "complex", "multiValued": true, "required": false}
@@ -1562,17 +1712,17 @@ async fn metrics(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult
     let storage = app.storage_health()?;
     let metrics = dashboard.metrics;
     let body = format!(
-        "# TYPE manbaflow_flows gauge\nmanbaflow_flows {}\n\
-         # TYPE manbaflow_active_flows gauge\nmanbaflow_active_flows {}\n\
-         # TYPE manbaflow_tasks gauge\nmanbaflow_tasks {}\n\
-         # TYPE manbaflow_blocked_tasks gauge\nmanbaflow_blocked_tasks {}\n\
-         # TYPE manbaflow_open_flights gauge\nmanbaflow_open_flights {}\n\
-         # TYPE manbaflow_pending_notifications gauge\nmanbaflow_pending_notifications {}\n\
-         # TYPE manbaflow_pending_office_releases gauge\nmanbaflow_pending_office_releases {}\n\
-         # TYPE manbaflow_indeterminate_office_releases gauge\nmanbaflow_indeterminate_office_releases {}\n\
-         # TYPE manbaflow_pending_gitlab_writes gauge\nmanbaflow_pending_gitlab_writes {}\n\
-         # TYPE manbaflow_indeterminate_gitlab_writes gauge\nmanbaflow_indeterminate_gitlab_writes {}\n\
-         # TYPE manbaflow_ledger_events counter\nmanbaflow_ledger_events {}\n",
+        "# TYPE relay_flows gauge\nrelay_flows {}\n\
+         # TYPE relay_active_flows gauge\nrelay_active_flows {}\n\
+         # TYPE relay_tasks gauge\nrelay_tasks {}\n\
+         # TYPE relay_blocked_tasks gauge\nrelay_blocked_tasks {}\n\
+         # TYPE relay_open_flights gauge\nrelay_open_flights {}\n\
+         # TYPE relay_pending_notifications gauge\nrelay_pending_notifications {}\n\
+         # TYPE relay_pending_office_releases gauge\nrelay_pending_office_releases {}\n\
+         # TYPE relay_indeterminate_office_releases gauge\nrelay_indeterminate_office_releases {}\n\
+         # TYPE relay_pending_gitlab_writes gauge\nrelay_pending_gitlab_writes {}\n\
+         # TYPE relay_indeterminate_gitlab_writes gauge\nrelay_indeterminate_gitlab_writes {}\n\
+         # TYPE relay_ledger_events counter\nrelay_ledger_events {}\n",
         metrics.total_flows,
         metrics.active_flows,
         metrics.total_tasks,
@@ -1731,18 +1881,18 @@ async fn create_demand(
     Json(input): Json<CreateDemandInput>,
 ) -> ApiResult<Json<Flow>> {
     if input.timeout_seconds == 0 || input.timeout_seconds > 3_600 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "planner timeout must be between 1 and 3600 seconds".into(),
         )
         .into());
     }
-    let workspace = std::env::current_dir().map_err(MambaError::from)?;
+    let workspace = std::env::current_dir().map_err(RelayError::from)?;
     let (data_dir, principal_id) = {
         let app = state.app.lock().await;
         let principal = authenticate(&app, &headers)?;
         (app.data_dir().to_path_buf(), principal.id)
     };
-    let mut planning_app = MambaApp::open(data_dir)?;
+    let mut planning_app = RelayApp::open(data_dir)?;
     let flow = planning_app
         .create_demand(
             &input.summary,
@@ -1959,13 +2109,13 @@ async fn propose_flow_change(
     headers: HeaderMap,
     Json(input): Json<ProposeFlowChangeInput>,
 ) -> ApiResult<Json<FlowChangeRequest>> {
-    let workspace = std::env::current_dir().map_err(MambaError::from)?;
+    let workspace = std::env::current_dir().map_err(RelayError::from)?;
     let (data_dir, principal_id) = {
         let app = state.app.lock().await;
         let principal = authenticate(&app, &headers)?;
         (app.data_dir().to_path_buf(), principal.id)
     };
-    let mut planning_app = MambaApp::open(data_dir)?;
+    let mut planning_app = RelayApp::open(data_dir)?;
     let change = planning_app
         .propose_flow_change(
             &flow_id,
@@ -2337,7 +2487,7 @@ async fn dispatch_office_release(
 }
 
 async fn dispatch_office_once(
-    app: &Arc<Mutex<MambaApp>>,
+    app: &Arc<Mutex<RelayApp>>,
     bridge: &OfficeBridge,
     tenant_id: &str,
 ) -> Result<Option<OfficeReleaseRequest>> {
@@ -2351,7 +2501,7 @@ async fn dispatch_office_once(
     let dispatch_id = release
         .dispatch_id
         .as_deref()
-        .ok_or_else(|| MambaError::Validation("claimed Office release has no dispatch ID".into()))?
+        .ok_or_else(|| RelayError::Validation("claimed Office release has no dispatch ID".into()))?
         .to_string();
     let artifact = if let Some(artifact_id) = release.payload.artifact_id() {
         match app
@@ -2380,14 +2530,14 @@ async fn dispatch_office_once(
 }
 
 async fn finish_office_dispatch(
-    app: &Arc<Mutex<MambaApp>>,
+    app: &Arc<Mutex<RelayApp>>,
     release_id: &str,
     dispatch_id: &str,
     outcome: std::result::Result<crate::domain::OfficeReleaseResult, (String, bool)>,
 ) -> Result<OfficeReleaseRequest> {
     let mut app = app.lock().await;
     match app.finish_office_release(release_id, dispatch_id, outcome.clone()) {
-        Err(MambaError::ConcurrentModification { .. }) => {
+        Err(RelayError::ConcurrentModification { .. }) => {
             app.finish_office_release(release_id, dispatch_id, outcome)
         }
         result => result,
@@ -2467,7 +2617,7 @@ async fn dispatch_gitlab_write(
 }
 
 async fn dispatch_gitlab_write_once(
-    app: &Arc<Mutex<MambaApp>>,
+    app: &Arc<Mutex<RelayApp>>,
     bridge: &GitLabWriteBridge,
     tenant_id: &str,
 ) -> Result<Option<GitLabWriteRequest>> {
@@ -2481,7 +2631,7 @@ async fn dispatch_gitlab_write_once(
     let dispatch_id = request
         .dispatch_id
         .as_deref()
-        .ok_or_else(|| MambaError::Validation("claimed GitLab write has no dispatch ID".into()))?
+        .ok_or_else(|| RelayError::Validation("claimed GitLab write has no dispatch ID".into()))?
         .to_string();
     let outcome = bridge
         .dispatch(tenant_id, &request)
@@ -2493,14 +2643,14 @@ async fn dispatch_gitlab_write_once(
 }
 
 async fn finish_gitlab_dispatch(
-    app: &Arc<Mutex<MambaApp>>,
+    app: &Arc<Mutex<RelayApp>>,
     write_id: &str,
     dispatch_id: &str,
     outcome: std::result::Result<crate::domain::GitLabWriteResult, (String, bool)>,
 ) -> Result<GitLabWriteRequest> {
     let mut app = app.lock().await;
     match app.finish_gitlab_write(write_id, dispatch_id, outcome.clone()) {
-        Err(MambaError::ConcurrentModification { .. }) => {
+        Err(RelayError::ConcurrentModification { .. }) => {
             app.finish_gitlab_write(write_id, dispatch_id, outcome)
         }
         result => result,
@@ -2586,10 +2736,10 @@ async fn bridge_interaction(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<crate::domain::ExternalInteractionResult>> {
-    let provider = required_webhook_header(&headers, "x-mamba-provider")?;
-    let delivery_id = required_webhook_header(&headers, "x-mamba-delivery-id")?;
-    let timestamp = required_webhook_header(&headers, "x-mamba-timestamp")?;
-    let signature = required_webhook_header(&headers, "x-mamba-signature")?;
+    let provider = required_webhook_header(&headers, "x-relay-provider")?;
+    let delivery_id = required_webhook_header(&headers, "x-relay-delivery-id")?;
+    let timestamp = required_webhook_header(&headers, "x-relay-timestamp")?;
+    let signature = required_webhook_header(&headers, "x-relay-signature")?;
     state.interaction_auth.verify_bridge(
         provider,
         delivery_id,
@@ -2599,7 +2749,7 @@ async fn bridge_interaction(
         Utc::now(),
     )?;
     let input: ExternalInteractionInput = serde_json::from_slice(&body)
-        .map_err(|_| MambaError::Validation("invalid interaction Bridge payload".into()))?;
+        .map_err(|_| RelayError::Validation("invalid interaction Bridge payload".into()))?;
     let mut app = state.app.lock().await;
     Ok(Json(app.process_external_interaction(
         provider,
@@ -2718,7 +2868,7 @@ async fn gitlab_webhook(
 async fn mutate<T>(
     state: &ApiState,
     headers: &HeaderMap,
-    action: impl FnOnce(&mut MambaApp, &str) -> Result<T>,
+    action: impl FnOnce(&mut RelayApp, &str) -> Result<T>,
 ) -> ApiResult<Json<T>> {
     let mut app = state.app.lock().await;
     let principal = authenticate(&app, headers)?;
@@ -2726,13 +2876,13 @@ async fn mutate<T>(
 }
 
 async fn deliver_notification_batch(
-    app: &Arc<Mutex<MambaApp>>,
+    app: &Arc<Mutex<RelayApp>>,
     limit: usize,
     force_failed: bool,
     actor: &str,
 ) -> Result<NotificationDispatchSummary> {
     if limit == 0 || limit > 1_000 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "notification dispatch limit must be between 1 and 1000".into(),
         ));
     }
@@ -2753,9 +2903,9 @@ async fn deliver_notification_batch(
     Ok(summary)
 }
 
-fn authenticate(app: &MambaApp, headers: &HeaderMap) -> ApiResult<Principal> {
+fn authenticate(app: &RelayApp, headers: &HeaderMap) -> ApiResult<Principal> {
     let token = bearer_token(headers)
-        .or_else(|| cookie_value(headers, "mamba_session"))
+        .or_else(|| cookie_value(headers, "relay_session"))
         .ok_or_else(ApiError::unauthorized)?;
     app.authenticate_api_token(token)?
         .ok_or_else(ApiError::unauthorized)
@@ -2920,7 +3070,7 @@ mod tests {
         let conflict = Request::builder()
             .uri("/api/v1/organization")
             .header(header::AUTHORIZATION, format!("Bearer {first_token}"))
-            .header("x-mamba-tenant", second_tenant)
+            .header("x-relay-tenant", second_tenant)
             .body(Body::empty())
             .unwrap();
         assert_eq!(
@@ -2932,18 +3082,21 @@ mod tests {
     #[tokio::test]
     async fn scim_provisioning_is_authenticated_and_deactivation_revokes_sessions() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path()).unwrap();
-        app.init_organization("Mamba", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path()).unwrap();
+        app.init_organization("Relay", "admin").unwrap();
         let shared = Arc::new(Mutex::new(app));
         let scim_token = "scim-test-token-with-more-than-thirty-two-characters";
         let service = router_with_identity(
             shared.clone(),
-            None,
-            InteractionWebhookAuth::default(),
-            None,
-            ScimAuthenticator::new(scim_token).unwrap(),
-            OfficeBridge::disabled(),
-            GitLabWriteBridge::disabled(),
+            ServerIntegrations {
+                gitlab_webhook_auth: None,
+                interaction_auth: InteractionWebhookAuth::default(),
+                oidc: None,
+                feishu: None,
+                scim_auth: ScimAuthenticator::new(scim_token).unwrap(),
+                office_bridge: OfficeBridge::disabled(),
+                gitlab_write_bridge: GitLabWriteBridge::disabled(),
+            },
         );
         let user_body = json!({
             "schemas": [crate::scim::USER_SCHEMA],
@@ -2997,7 +3150,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/me")
-                    .header(header::COOKIE, format!("mamba_session={}", session.token))
+                    .header(header::COOKIE, format!("relay_session={}", session.token))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3029,7 +3182,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/me")
-                    .header(header::COOKIE, format!("mamba_session={}", session.token))
+                    .header(header::COOKIE, format!("relay_session={}", session.token))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3038,8 +3191,8 @@ mod tests {
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
     }
 
-    fn tenant_app(data_dir: std::path::PathBuf, name: &str) -> (MambaApp, String, String) {
-        let mut app = MambaApp::open(data_dir).unwrap();
+    fn tenant_app(data_dir: std::path::PathBuf, name: &str) -> (RelayApp, String, String) {
+        let mut app = RelayApp::open(data_dir).unwrap();
         app.init_organization(name, "admin").unwrap();
         let team = app
             .create_team("Operations", "operations", "admin")
@@ -3067,7 +3220,7 @@ mod tests {
     #[tokio::test]
     async fn web_console_assets_are_embedded_and_security_hardened() {
         let directory = tempdir().unwrap();
-        let app = MambaApp::open(directory.path().join("data")).unwrap();
+        let app = RelayApp::open(directory.path().join("data")).unwrap();
         let service = router(
             Arc::new(Mutex::new(app)),
             None,
@@ -3100,7 +3253,7 @@ mod tests {
         assert!(page.headers().contains_key(header::CONTENT_SECURITY_POLICY));
         assert!(page.headers().contains_key("x-request-id"));
         let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("MambaFlow Tower"));
+        assert!(String::from_utf8_lossy(&body).contains("Relay Tower"));
 
         let script = service
             .oneshot(
@@ -3121,7 +3274,7 @@ mod tests {
     #[tokio::test]
     async fn readiness_metrics_and_public_http_guard_enforce_operational_boundaries() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Operations", "operations", "admin")
@@ -3176,9 +3329,9 @@ mod tests {
             .unwrap();
         assert_eq!(metrics.status(), StatusCode::OK);
         let body = to_bytes(metrics.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("manbaflow_ledger_events"));
+        assert!(String::from_utf8_lossy(&body).contains("relay_ledger_events"));
 
-        let unopened = MambaApp::open(directory.path().join("public-http")).unwrap();
+        let unopened = RelayApp::open(directory.path().join("public-http")).unwrap();
         let error = run(
             unopened,
             ServerOptions {
@@ -3194,14 +3347,14 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            MambaError::Validation(message) if message.contains("non-loopback plain HTTP")
+            RelayError::Validation(message) if message.contains("non-loopback plain HTTP")
         ));
     }
 
     #[tokio::test]
     async fn tenant_admin_can_manage_roles_and_manager_can_create_remote_demand() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Platform", "product,rust", "admin")
@@ -3310,7 +3463,7 @@ mod tests {
     #[tokio::test]
     async fn signed_bridge_and_slack_actions_use_bound_human_identity() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Delivery", "product,delivery", "admin")
@@ -3409,7 +3562,7 @@ mod tests {
             "type": "block_actions",
             "user": {"id": "U_LEADER"},
             "actions": [{
-                "action_id": "mambaflow.message.ack",
+                "action_id": "relay.message.ack",
                 "value": message.id
             }]
         });
@@ -3455,7 +3608,7 @@ mod tests {
     #[tokio::test]
     async fn bearer_identity_drives_remote_inbox_and_task_actions() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Delivery", "product,delivery", "admin")
@@ -3931,7 +4084,7 @@ mod tests {
     #[tokio::test]
     async fn human_and_agent_tokens_drive_remote_flight_lease_lifecycle() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team("Delivery", "product,delivery", "admin")
@@ -3984,9 +4137,9 @@ mod tests {
         let notification_endpoint = app
             .register_notification_endpoint(
                 "operations",
-                "https://example.invalid/mamba",
+                "https://example.invalid/relay",
                 &["task.blocked".into()],
-                "MAMBA_OPERATIONS_SECRET",
+                "RELAY_OPERATIONS_SECRET",
                 "admin",
             )
             .unwrap();
@@ -4166,7 +4319,7 @@ mod tests {
     async fn signed_gitlab_webhooks_update_bound_tasks_idempotently_and_replay() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         app.init_organization("Test Org", "admin").unwrap();
         let team = app
             .create_team(
@@ -4319,7 +4472,7 @@ mod tests {
         drop(state);
         drop(app);
 
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(replayed.state().external_deliveries.len(), 3);
         assert!(
             replayed
@@ -4415,10 +4568,10 @@ mod tests {
             .method("POST")
             .uri("/api/v1/connectors/interactions")
             .header("content-type", "application/json")
-            .header("x-mamba-provider", provider)
-            .header("x-mamba-delivery-id", delivery_id)
-            .header("x-mamba-timestamp", timestamp)
-            .header("x-mamba-signature", signature)
+            .header("x-relay-provider", provider)
+            .header("x-relay-delivery-id", delivery_id)
+            .header("x-relay-timestamp", timestamp)
+            .header("x-relay-signature", signature)
             .body(Body::from(body.to_vec()))
             .unwrap()
     }

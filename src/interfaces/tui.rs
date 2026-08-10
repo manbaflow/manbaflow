@@ -10,24 +10,24 @@ use crossterm::event::{
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
-use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Gauge, HighlightSpacing, List, ListItem, ListState, Paragraph,
-    Row, Table, TableState, Tabs, Wrap,
+    Block, Borders, Cell, Gauge, HighlightSpacing, List, ListItem, ListState, Paragraph, Row,
+    Table, TableState, Tabs, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
-use crate::MambaApp;
+use crate::RelayApp;
 use crate::dashboard::{ActionPriority, FlowHealth, build_dashboard};
 use crate::domain::{
     AssignmentTarget, AttentionSeverity, ExecutorMode, FlightLease, FlightLeaseStatus, Flow,
     FlowMessageKind, FlowStatus, GitLabWriteStatus, MessageInboxItem, OfficeReleaseStatus,
     PrincipalKind, RecoveryAction, Task, TaskStatus, TrackingEscalation,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 use crate::planner::PlannerKind;
 use crate::showcase::bootstrap_showcase;
@@ -65,7 +65,7 @@ impl Drop for MouseCaptureGuard {
     }
 }
 
-pub async fn run(app: &mut MambaApp, options: TuiOptions) -> Result<()> {
+pub async fn run(app: &mut RelayApp, options: TuiOptions) -> Result<()> {
     let mut terminal = ratatui::init();
     let mouse_capture = match MouseCaptureGuard::enable() {
         Ok(guard) => guard,
@@ -81,7 +81,7 @@ pub async fn run(app: &mut MambaApp, options: TuiOptions) -> Result<()> {
 }
 
 async fn run_loop(
-    app: &mut MambaApp,
+    app: &mut RelayApp,
     terminal: &mut DefaultTerminal,
     options: TuiOptions,
 ) -> Result<()> {
@@ -134,7 +134,7 @@ impl View {
             Self::Overview => "总览 OVERVIEW",
             Self::Flows => "任务流 FLOWS",
             Self::Inbox => "收件箱 INBOX",
-            Self::Roster => "阵容 ROSTER",
+            Self::Roster => "成员 ROSTER",
             Self::Timeline => "黑匣子 TIMELINE",
         }
     }
@@ -298,6 +298,8 @@ struct UiState {
     flight_index: usize,
     focus_tasks: bool,
     focus_flights: bool,
+    composer: String,
+    log: Vec<(String, bool)>,
     actor_id: Option<String>,
     workspace: PathBuf,
     timeline: Vec<EventEnvelope>,
@@ -321,7 +323,7 @@ struct UiState {
 }
 
 impl UiState {
-    fn new(app: &MambaApp, options: TuiOptions) -> Self {
+    fn new(app: &RelayApp, options: TuiOptions) -> Self {
         let (flight_tx, flight_rx) = mpsc::unbounded_channel();
         let (planning_tx, planning_rx) = mpsc::unbounded_channel();
         let (notification_tx, notification_rx) = mpsc::unbounded_channel();
@@ -344,11 +346,14 @@ impl UiState {
             flight_index: 0,
             focus_tasks: false,
             focus_flights: false,
+            composer: String::new(),
+            log: Vec::new(),
             actor_id,
             workspace: options.workspace,
             timeline: Vec::new(),
             modal: None,
-            message: "塔台在线。通过标签、列表和底部操作带调度 Flow。".to_string(),
+            message: "塔台在线。在底部输入框描述需求即可发起规划；点击列表与操作带调度 Flow。"
+                .to_string(),
             message_is_error: false,
             active_flights: BTreeMap::new(),
             flight_tx,
@@ -369,17 +374,64 @@ impl UiState {
         state
     }
 
-    async fn handle_key(&mut self, app: &mut MambaApp, key: KeyEvent) -> Result<bool> {
-        if self.modal.is_some() {
-            return self.handle_modal_key(app, key).await;
-        }
+    async fn handle_key(&mut self, app: &mut RelayApp, key: KeyEvent) -> Result<bool> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(self.request_quit());
         }
-        Ok(matches!(key.code, KeyCode::Char('q')) && self.request_quit())
+        match key.code {
+            KeyCode::Esc => {
+                if self.modal.take().is_some() {
+                    self.success("已取消当前输入，回到自由需求模式");
+                } else {
+                    self.composer.clear();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(modal) = &mut self.modal {
+                    modal.value.pop();
+                } else {
+                    self.composer.pop();
+                }
+            }
+            KeyCode::Enter => self.submit_composer(app).await,
+            KeyCode::Char(value) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(modal) = &mut self.modal {
+                    modal.value.push(value);
+                } else {
+                    self.composer.push(value);
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
-    async fn handle_mouse(&mut self, app: &mut MambaApp, mouse: MouseEvent) -> Result<bool> {
+    async fn submit_composer(&mut self, app: &mut RelayApp) {
+        if self.modal.is_some() {
+            self.submit_modal(app).await;
+            return;
+        }
+        let value = self.composer.trim().to_string();
+        if value.is_empty() {
+            return;
+        }
+        if self.active_planning.is_some() {
+            self.failure(RelayError::Validation(
+                "已有 PRD 规划任务运行中，请等待规划结果".to_string(),
+            ));
+            return;
+        }
+        let Some(actor) = self.actor_name(app).map(str::to_string) else {
+            self.failure(RelayError::Validation(
+                "请先注册 Human，或点击顶部当前操作人进行切换".to_string(),
+            ));
+            return;
+        };
+        self.composer.clear();
+        self.launch_planning(app, value, actor);
+    }
+
+    async fn handle_mouse(&mut self, app: &mut RelayApp, mouse: MouseEvent) -> Result<bool> {
         let target = self.target_at(mouse.column, mouse.row);
         if self.modal.is_some() {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -471,7 +523,7 @@ impl UiState {
 
     async fn handle_mouse_action(
         &mut self,
-        app: &mut MambaApp,
+        app: &mut RelayApp,
         action: MouseAction,
     ) -> Result<bool> {
         match action {
@@ -498,8 +550,11 @@ impl UiState {
             MouseAction::RecoverFlight(action) => self.open_recovery_input(app, action),
             MouseAction::CycleActor => self.cycle_actor(app),
             MouseAction::Quit => return Ok(self.request_quit()),
-            MouseAction::ConfirmModal => self.submit_modal(app).await,
-            MouseAction::CancelModal => self.modal = None,
+            MouseAction::ConfirmModal => self.submit_composer(app).await,
+            MouseAction::CancelModal => {
+                self.modal = None;
+                self.composer.clear();
+            }
             MouseAction::SelectPlanner(planner) => self.demand_planner = planner,
             MouseAction::SelectAssignee(_) => {}
         }
@@ -530,37 +585,18 @@ impl UiState {
         }
     }
 
-    async fn handle_modal_key(&mut self, app: &mut MambaApp, key: KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc => self.modal = None,
-            KeyCode::Backspace => {
-                if let Some(modal) = &mut self.modal {
-                    modal.value.pop();
-                }
-            }
-            KeyCode::Enter => self.submit_modal(app).await,
-            KeyCode::Char(value) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(modal) = &mut self.modal {
-                    modal.value.push(value);
-                }
-            }
-            _ => {}
-        }
-        Ok(false)
-    }
-
-    async fn submit_modal(&mut self, app: &mut MambaApp) {
+    async fn submit_modal(&mut self, app: &mut RelayApp) {
         let Some(modal) = self.modal.take() else {
             return;
         };
         let value = modal.value.trim();
         if value.is_empty() {
-            self.failure(MambaError::Validation("输入不能为空".to_string()));
+            self.failure(RelayError::Validation("输入不能为空".to_string()));
             return;
         }
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
-            self.failure(MambaError::Validation(
-                "请先注册 Human，或点击顶部当前球权选择操作人".to_string(),
+            self.failure(RelayError::Validation(
+                "请先注册 Human，或点击顶部当前操作人进行切换".to_string(),
             ));
             return;
         };
@@ -573,7 +609,7 @@ impl UiState {
         if let InputPurpose::Run { task_id, mode } = &modal.purpose {
             let expected = confirmation_token(mode);
             if value != expected {
-                self.failure(MambaError::Validation(format!(
+                self.failure(RelayError::Validation(format!(
                     "确认失败：请输入 {expected}"
                 )));
                 return;
@@ -617,7 +653,7 @@ impl UiState {
                     &task_id,
                     &actor,
                     "note",
-                    &format!("mambaflow://task/{task_id}/evidence"),
+                    &format!("relay://task/{task_id}/evidence"),
                     value,
                 )
                 .map(|evidence| format!("证据 {} 已进入黑匣子", evidence.id)),
@@ -642,7 +678,7 @@ impl UiState {
                 )
                 .map(|message| {
                     format!(
-                        "{} 已传球给 {}",
+                        "{} 已发送给 {}",
                         message.id,
                         message
                             .recipients
@@ -654,7 +690,7 @@ impl UiState {
                 }),
             InputPurpose::Negotiate { task_id, .. } => value
                 .parse::<f64>()
-                .map_err(|_| MambaError::Validation("工时必须是数字".into()))
+                .map_err(|_| RelayError::Validation("工时必须是数字".into()))
                 .and_then(|hours| app.negotiate_task(&task_id, &actor, hours))
                 .map(|task| {
                     format!(
@@ -668,14 +704,14 @@ impl UiState {
                 selected,
             } => candidates
                 .get(selected)
-                .ok_or_else(|| MambaError::Validation("没有可用的换防候选人".into()))
+                .ok_or_else(|| RelayError::Validation("没有可用的改派候选人".into()))
                 .and_then(|target| app.reassign_task(&task_id, &actor, &target.id, &[], value))
                 .map(|flow| {
                     let task = flow
                         .task(&task_id)
                         .expect("reassigned task remains in flow");
                     format!(
-                        "{} 已换防给 {}；P80 {}",
+                        "{} 已改派给 {}；P80 {}",
                         task.id,
                         task.assignment.as_ref().unwrap().owner.name,
                         flow.p80_finish.format("%m-%d %H:%M")
@@ -706,22 +742,25 @@ impl UiState {
     }
 
     fn paste(&mut self, value: String) {
+        let cleaned = value.replace(['\r', '\n'], " ");
         if let Some(modal) = &mut self.modal {
-            modal.value.push_str(&value.replace(['\r', '\n'], " "));
+            modal.value.push_str(&cleaned);
+        } else {
+            self.composer.push_str(&cleaned);
         }
     }
 
-    fn switch_view(&mut self, app: &MambaApp, view: View) {
+    fn switch_view(&mut self, app: &RelayApp, view: View) {
         self.view = view;
         self.refresh_timeline(app);
     }
 
-    async fn load_showcase(&mut self, app: &mut MambaApp) {
+    async fn load_showcase(&mut self, app: &mut RelayApp) {
         match bootstrap_showcase(app, &self.workspace).await {
             Ok(showcase) => {
                 self.actor_id = app
                     .state()
-                    .principal("牢大")
+                    .principal("陈静")
                     .ok()
                     .map(|principal| principal.id.clone());
                 self.flow_index = flow_ids(app)
@@ -741,7 +780,7 @@ impl UiState {
         }
     }
 
-    fn move_selection(&mut self, app: &MambaApp, delta: isize) {
+    fn move_selection(&mut self, app: &RelayApp, delta: isize) {
         match self.view {
             View::Overview => {
                 self.flow_index = shifted(self.flow_index, flow_ids(app).len(), delta);
@@ -777,11 +816,11 @@ impl UiState {
         }
     }
 
-    fn cycle_actor(&mut self, app: &MambaApp) {
+    fn cycle_actor(&mut self, app: &RelayApp) {
         let humans = human_ids(app);
         if humans.is_empty() {
             self.actor_id = None;
-            self.failure(MambaError::Validation("组织中还没有注册 Human".to_string()));
+            self.failure(RelayError::Validation("组织中还没有注册 Human".to_string()));
             return;
         }
         let current = self
@@ -792,13 +831,13 @@ impl UiState {
         self.actor_id = Some(humans[(current + 1) % humans.len()].clone());
         self.inbox_index = 0;
         if let Some(actor) = self.actor_name(app) {
-            self.success(format!("当前球权切换为 {actor}"));
+            self.success(format!("当前操作人切换为 {actor}"));
         }
     }
 
-    fn approve_or_accept(&mut self, app: &mut MambaApp) {
+    fn approve_or_accept(&mut self, app: &mut RelayApp) {
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "没有可用的 Human 操作人".to_string(),
             ));
             return;
@@ -808,17 +847,17 @@ impl UiState {
         {
             let flow_id = self.selected_flow(app).map(|flow| flow.id.clone());
             flow_id
-                .ok_or_else(|| MambaError::Validation("没有选中的 Flow".to_string()))
+                .ok_or_else(|| RelayError::Validation("没有选中的 Flow".to_string()))
                 .and_then(|flow_id| {
                     if let Some(change_id) = app
                         .pending_flow_change(&flow_id)
                         .map(|change| change.id.clone())
                     {
                         app.approve_flow_change(&change_id, &actor)
-                            .map(|change| format!("{} 已批准，新增任务完成传球", change.id))
+                            .map(|change| format!("{} 已批准，新增任务完成派发", change.id))
                     } else {
                         app.approve_flow(&flow_id, &actor)
-                            .map(|flow| format!("{} 已批准，WorkRequest 完成传球", flow.id))
+                            .map(|flow| format!("{} 已批准，WorkRequest 完成派发", flow.id))
                     }
                 })
         } else {
@@ -826,16 +865,16 @@ impl UiState {
                 .selected_task_context(app)
                 .map(|(_, task)| task.id.clone());
             task_id
-                .ok_or_else(|| MambaError::Validation("没有选中的任务".to_string()))
+                .ok_or_else(|| RelayError::Validation("没有选中的任务".to_string()))
                 .and_then(|task_id| app.accept_task(&task_id, &actor))
-                .map(|task| format!("{} 已接球", task.id))
+                .map(|task| format!("{} 已接单", task.id))
         };
         self.finish_action(app, result);
     }
 
-    fn approve_next_office_release(&mut self, app: &mut MambaApp) {
+    fn approve_next_office_release(&mut self, app: &mut RelayApp) {
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "没有可用的 Human 操作人".to_string(),
             ));
             return;
@@ -855,15 +894,15 @@ impl UiState {
                 .map(|release| release.id.clone())
         });
         let result = release_id
-            .ok_or_else(|| MambaError::Validation("当前没有待你放行的 Office 发布".into()))
+            .ok_or_else(|| RelayError::Validation("当前没有待你放行的 Office 发布".into()))
             .and_then(|release_id| app.approve_office_release(&release_id, &actor))
             .map(|release| format!("{} 已由 Human 放行，等待 Tower 发布", release.id));
         self.finish_action(app, result);
     }
 
-    fn approve_next_gitlab_write(&mut self, app: &mut MambaApp) {
+    fn approve_next_gitlab_write(&mut self, app: &mut RelayApp) {
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "没有可用的 Human 操作人".to_string(),
             ));
             return;
@@ -883,15 +922,15 @@ impl UiState {
                 .map(|request| request.id.clone())
         });
         let result = write_id
-            .ok_or_else(|| MambaError::Validation("当前没有待你放行的 GitLab 写入".into()))
+            .ok_or_else(|| RelayError::Validation("当前没有待你放行的 GitLab 写入".into()))
             .and_then(|write_id| app.approve_gitlab_write(&write_id, &actor))
             .map(|request| format!("{} 已由 Human 放行，等待 Tower 写入 GitLab", request.id));
         self.finish_action(app, result);
     }
 
-    fn retry_next_gitlab_write(&mut self, app: &mut MambaApp) {
+    fn retry_next_gitlab_write(&mut self, app: &mut RelayApp) {
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "没有可用的 Human 操作人".to_string(),
             ));
             return;
@@ -916,21 +955,21 @@ impl UiState {
                 .map(|request| request.id.clone())
         });
         let result = write_id
-            .ok_or_else(|| MambaError::Validation("当前没有可人工复飞的 GitLab 写入".into()))
+            .ok_or_else(|| RelayError::Validation("当前没有可人工复飞的 GitLab 写入".into()))
             .and_then(|write_id| app.retry_gitlab_write(&write_id, &actor))
             .map(|request| format!("{} 已确认复飞，等待 Tower 再次写入", request.id));
         self.finish_action(app, result);
     }
 
-    fn advance_task(&mut self, app: &mut MambaApp) {
+    fn advance_task(&mut self, app: &mut RelayApp) {
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "没有可用的 Human 操作人".to_string(),
             ));
             return;
         };
         let Some((_, task)) = self.selected_task_context(app) else {
-            self.failure(MambaError::Validation("没有选中的任务".to_string()));
+            self.failure(RelayError::Validation("没有选中的任务".to_string()));
             return;
         };
         let task_id = task.id.clone();
@@ -938,14 +977,14 @@ impl UiState {
         let result = match status {
             TaskStatus::Assigned => app
                 .accept_task(&task_id, &actor)
-                .map(|task| format!("{} 已接球", task.id)),
+                .map(|task| format!("{} 已接单", task.id)),
             TaskStatus::Accepted | TaskStatus::Blocked => app
                 .start_task(&task_id, &actor)
                 .map(|task| format!("{} 已起飞", task.id)),
             TaskStatus::InProgress => app
                 .submit_task(&task_id, &actor)
                 .map(|task| format!("{} 已提交验收", task.id)),
-            _ => Err(MambaError::InvalidTransition(format!(
+            _ => Err(RelayError::InvalidTransition(format!(
                 "当前状态 {:?} 不能继续推进",
                 status
             ))),
@@ -953,9 +992,9 @@ impl UiState {
         self.finish_action(app, result);
     }
 
-    fn complete_task(&mut self, app: &mut MambaApp) {
+    fn complete_task(&mut self, app: &mut RelayApp) {
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "没有可用的 Human 操作人".to_string(),
             ));
             return;
@@ -964,15 +1003,15 @@ impl UiState {
             .selected_task_context(app)
             .map(|(_, task)| task.id.clone());
         let result = task_id
-            .ok_or_else(|| MambaError::Validation("没有选中的任务".to_string()))
+            .ok_or_else(|| RelayError::Validation("没有选中的任务".to_string()))
             .and_then(|task_id| app.complete_task(&task_id, &actor))
-            .map(|task| format!("{} 已确认落地。Mamba Out.", task.id));
+            .map(|task| format!("{} 已确认落地。", task.id));
         self.finish_action(app, result);
     }
 
     fn open_demand_modal(&mut self) {
         if self.active_planning.is_some() {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "已有 PRD 规划任务运行中，请等待规划结果".to_string(),
             ));
             return;
@@ -983,9 +1022,9 @@ impl UiState {
         });
     }
 
-    fn launch_planning(&mut self, app: &MambaApp, summary: String, actor: String) {
+    fn launch_planning(&mut self, app: &RelayApp, summary: String, actor: String) {
         if self.active_planning.is_some() {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "已有 PRD 规划任务运行中".to_string(),
             ));
             return;
@@ -1007,7 +1046,7 @@ impl UiState {
         let tx = self.planning_tx.clone();
         tokio::spawn(async move {
             let outcome = async {
-                let mut worker = MambaApp::open(data_dir).map_err(|error| error.to_string())?;
+                let mut worker = RelayApp::open(data_dir).map_err(|error| error.to_string())?;
                 worker
                     .create_demand(&summary, &actor, planner, &workspace, 300)
                     .await
@@ -1022,7 +1061,7 @@ impl UiState {
         });
     }
 
-    fn poll_planning(&mut self, app: &mut MambaApp) {
+    fn poll_planning(&mut self, app: &mut RelayApp) {
         while let Ok(result) = self.planning_rx.try_recv() {
             self.active_planning = None;
             if let Err(error) = app.reload() {
@@ -1040,13 +1079,13 @@ impl UiState {
                     self.success(format!("{} 已生成：{}", flow.flow_id, flow.title));
                 }
                 Err(error) => {
-                    self.failure(MambaError::Validation(format!("PRD 规划失败：{error}")))
+                    self.failure(RelayError::Validation(format!("PRD 规划失败：{error}")))
                 }
             }
         }
     }
 
-    fn poll_tracking(&mut self, app: &mut MambaApp) {
+    fn poll_tracking(&mut self, app: &mut RelayApp) {
         if app.state().organization.is_none() {
             return;
         }
@@ -1059,7 +1098,7 @@ impl UiState {
         self.scan_tracker(app, false);
     }
 
-    fn scan_tracker(&mut self, app: &mut MambaApp, announce: bool) {
+    fn scan_tracker(&mut self, app: &mut RelayApp, announce: bool) {
         self.last_tracking_scan = Some(Instant::now());
         match app.scan_tracking(24, "tower://local") {
             Ok(scan) => {
@@ -1090,7 +1129,7 @@ impl UiState {
         }
     }
 
-    fn poll_notification_outbox(&mut self, app: &mut MambaApp) {
+    fn poll_notification_outbox(&mut self, app: &mut RelayApp) {
         while let Ok(result) = self.notification_rx.try_recv() {
             self.active_notification = None;
             let delivered = result.attempt.delivered;
@@ -1103,7 +1142,7 @@ impl UiState {
                     if delivered {
                         self.success(format!("{} 通知安全落地", delivery.id));
                     } else {
-                        self.failure(MambaError::Validation(format!(
+                        self.failure(RelayError::Validation(format!(
                             "{} 通知坠机：{}",
                             delivery.id,
                             delivery.last_error.as_deref().unwrap_or("未知错误")
@@ -1123,15 +1162,15 @@ impl UiState {
         }
     }
 
-    fn dispatch_notification_now(&mut self, app: &MambaApp) {
+    fn dispatch_notification_now(&mut self, app: &RelayApp) {
         if self.active_notification.is_some() {
-            self.failure(MambaError::InvalidTransition("已有通知正在投递".into()));
+            self.failure(RelayError::InvalidTransition("已有通知正在投递".into()));
         } else if !self.launch_notification(app, true) {
             self.success("Notification Outbox 当前没有待投递记录");
         }
     }
 
-    fn launch_notification(&mut self, app: &MambaApp, manual: bool) -> bool {
+    fn launch_notification(&mut self, app: &RelayApp, manual: bool) -> bool {
         let Some((endpoint, delivery)) = app.notification_attempts(1, manual).into_iter().next()
         else {
             self.last_notification_dispatch = Instant::now();
@@ -1151,9 +1190,9 @@ impl UiState {
         true
     }
 
-    fn acknowledge_next_inbox(&mut self, app: &mut MambaApp) {
+    fn acknowledge_next_inbox(&mut self, app: &mut RelayApp) {
         let Some(actor) = self.actor_name(app).map(str::to_string) else {
-            self.failure(MambaError::Validation("没有可用的 Human 操作人".into()));
+            self.failure(RelayError::Validation("没有可用的 Human 操作人".into()));
             return;
         };
         let message_id = self
@@ -1177,7 +1216,7 @@ impl UiState {
             .find(|escalation| escalation.needs_acknowledgement())
             .map(|escalation| escalation.id.clone());
         let Some(escalation_id) = escalation_id else {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "当前没有等待确认的指令或 Tower Call".into(),
             ));
             return;
@@ -1191,13 +1230,13 @@ impl UiState {
         }
     }
 
-    fn open_message_input(&mut self, app: &MambaApp) {
+    fn open_message_input(&mut self, app: &RelayApp) {
         let Some(actor) = self.actor_name(app) else {
-            self.failure(MambaError::Validation("没有可用的 Human 操作人".into()));
+            self.failure(RelayError::Validation("没有可用的 Human 操作人".into()));
             return;
         };
         let Some((flow, task)) = self.selected_task_context(app) else {
-            self.failure(MambaError::Validation("请先选择一个任务再传球".into()));
+            self.failure(RelayError::Validation("请先选择一个任务再发送消息".into()));
             return;
         };
         let requester = app.state().principal(&flow.demand.requester).ok();
@@ -1223,8 +1262,8 @@ impl UiState {
             )
         };
         if recipients.is_empty() {
-            self.failure(MambaError::Validation(
-                "当前任务没有可以接球的其他成员".into(),
+            self.failure(RelayError::Validation(
+                "当前任务没有可以接手的其他成员".into(),
             ));
             return;
         }
@@ -1240,9 +1279,9 @@ impl UiState {
         });
     }
 
-    fn open_estimate_input(&mut self, app: &MambaApp) {
+    fn open_estimate_input(&mut self, app: &RelayApp) {
         let Some((_, task)) = self.selected_task_context(app) else {
-            self.failure(MambaError::Validation("请先选择一个任务再调整工时".into()));
+            self.failure(RelayError::Validation("请先选择一个任务再调整工时".into()));
             return;
         };
         self.modal = Some(InputModal {
@@ -1254,13 +1293,13 @@ impl UiState {
         });
     }
 
-    fn open_reassign_input(&mut self, app: &MambaApp) {
+    fn open_reassign_input(&mut self, app: &RelayApp) {
         let Some(actor) = self.actor_name(app) else {
-            self.failure(MambaError::Validation("没有可用的 Human 操作人".into()));
+            self.failure(RelayError::Validation("没有可用的 Human 操作人".into()));
             return;
         };
         let Some((_, task)) = self.selected_task_context(app) else {
-            self.failure(MambaError::Validation("请先选择一个任务再换防".into()));
+            self.failure(RelayError::Validation("请先选择一个任务再改派".into()));
             return;
         };
         match app.reassignment_candidates(&task.id, actor) {
@@ -1274,20 +1313,20 @@ impl UiState {
                     value: String::new(),
                 });
             }
-            Ok(_) => self.failure(MambaError::Validation(
-                "当前没有满足能力约束的换防候选人".into(),
+            Ok(_) => self.failure(RelayError::Validation(
+                "当前没有满足能力约束的改派候选人".into(),
             )),
             Err(error) => self.failure(error),
         }
     }
 
-    fn open_flow_change_input(&mut self, app: &MambaApp) {
+    fn open_flow_change_input(&mut self, app: &RelayApp) {
         let Some(flow) = self.selected_flow(app) else {
-            self.failure(MambaError::Validation("请先选择一条 Flow".into()));
+            self.failure(RelayError::Validation("请先选择一条 Flow".into()));
             return;
         };
         if let Some(change) = app.pending_flow_change(&flow.id) {
-            self.failure(MambaError::InvalidTransition(format!(
+            self.failure(RelayError::InvalidTransition(format!(
                 "{} 正在等待处理；请使用底部的批准或驳回变更",
                 change.id
             )));
@@ -1301,13 +1340,13 @@ impl UiState {
         });
     }
 
-    fn open_reject_change_input(&mut self, app: &MambaApp) {
+    fn open_reject_change_input(&mut self, app: &RelayApp) {
         let Some(flow) = self.selected_flow(app) else {
-            self.failure(MambaError::Validation("请先选择一条 Flow".into()));
+            self.failure(RelayError::Validation("请先选择一条 Flow".into()));
             return;
         };
         let Some(change) = app.pending_flow_change(&flow.id) else {
-            self.failure(MambaError::Validation("当前 Flow 没有待处理的变更".into()));
+            self.failure(RelayError::Validation("当前 Flow 没有待处理的变更".into()));
             return;
         };
         self.modal = Some(InputModal {
@@ -1318,9 +1357,9 @@ impl UiState {
         });
     }
 
-    fn open_task_input(&mut self, app: &MambaApp, evidence: bool) {
+    fn open_task_input(&mut self, app: &RelayApp, evidence: bool) {
         let Some((_, task)) = self.selected_task_context(app) else {
-            self.failure(MambaError::Validation("没有选中的任务".to_string()));
+            self.failure(RelayError::Validation("没有选中的任务".to_string()));
             return;
         };
         self.modal = Some(InputModal {
@@ -1337,22 +1376,22 @@ impl UiState {
         });
     }
 
-    fn open_run_confirmation(&mut self, app: &MambaApp, mode: ExecutorMode) {
+    fn open_run_confirmation(&mut self, app: &RelayApp, mode: ExecutorMode) {
         if !self.active_flights.is_empty() {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "当前已有航班在空中；v0 空域一次只允许一个执行终端".to_string(),
             ));
             return;
         }
         let Some((_, task)) = self.selected_task_context(app) else {
-            self.failure(MambaError::Validation("没有选中的任务".to_string()));
+            self.failure(RelayError::Validation("没有选中的任务".to_string()));
             return;
         };
         if !matches!(
             task.status,
             TaskStatus::Accepted | TaskStatus::InProgress | TaskStatus::Blocked
         ) {
-            self.failure(MambaError::Validation(format!(
+            self.failure(RelayError::Validation(format!(
                 "任务 {} 必须先接单，当前状态为 {:?}",
                 task.id, task.status
             )));
@@ -1369,14 +1408,14 @@ impl UiState {
             .map(|dependency| dependency.key.as_str())
             .collect::<Vec<_>>();
         if !incomplete.is_empty() {
-            self.failure(MambaError::Validation(format!(
+            self.failure(RelayError::Validation(format!(
                 "仍在等待前置任务：{}",
                 incomplete.join(", ")
             )));
             return;
         }
         if !task_has_executor(app, task) {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "当前 Assignment 没有 Claude Code 或 Codex 副驾".to_string(),
             ));
             return;
@@ -1390,21 +1429,21 @@ impl UiState {
         });
     }
 
-    fn open_recovery_input(&mut self, app: &MambaApp, action: RecoveryAction) {
+    fn open_recovery_input(&mut self, app: &RelayApp, action: RecoveryAction) {
         let Some(flight) = self.selected_flight(app) else {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "请先在 Flight Deck 选择一架航班".into(),
             ));
             return;
         };
         if flight.status != FlightLeaseStatus::Crashed {
-            self.failure(MambaError::InvalidTransition(
+            self.failure(RelayError::InvalidTransition(
                 "只有坠机航班可以进入这条恢复航线".into(),
             ));
             return;
         }
         let Some(actor) = self.actor_name(app) else {
-            self.failure(MambaError::Validation("请先选择 Human 操作人".into()));
+            self.failure(RelayError::Validation("请先选择 Human 操作人".into()));
             return;
         };
         match app.recovery_options(&flight.id, actor) {
@@ -1417,7 +1456,7 @@ impl UiState {
                     value: String::new(),
                 });
             }
-            Ok(_) => self.failure(MambaError::PermissionDenied(
+            Ok(_) => self.failure(RelayError::PermissionDenied(
                 "FlightManifest 不允许这项恢复动作".into(),
             )),
             Err(error) => self.failure(error),
@@ -1426,13 +1465,13 @@ impl UiState {
 
     fn launch_flight(
         &mut self,
-        app: &MambaApp,
+        app: &RelayApp,
         task_id: String,
         actor: String,
         mode: ExecutorMode,
     ) {
         let Some((flow, _)) = app.state().find_task(&task_id).ok() else {
-            self.failure(MambaError::NotFound {
+            self.failure(RelayError::NotFound {
                 entity: "task",
                 id: task_id,
             });
@@ -1457,7 +1496,7 @@ impl UiState {
         let tx = self.flight_tx.clone();
         tokio::spawn(async move {
             let outcome = async {
-                let mut worker = MambaApp::open(data_dir).map_err(|error| error.to_string())?;
+                let mut worker = RelayApp::open(data_dir).map_err(|error| error.to_string())?;
                 worker
                     .run_task(&task_id, &actor, None, mode, 900)
                     .await
@@ -1473,7 +1512,7 @@ impl UiState {
         });
     }
 
-    fn poll_flights(&mut self, app: &mut MambaApp) {
+    fn poll_flights(&mut self, app: &mut RelayApp) {
         let mut changed = false;
         while let Ok(result) = self.flight_rx.try_recv() {
             self.active_flights.remove(&result.task_id);
@@ -1485,7 +1524,7 @@ impl UiState {
                     compact_summary(&flight.summary, 48),
                     flight.log_path.display()
                 )),
-                Err(error) => self.failure(MambaError::Validation(format!(
+                Err(error) => self.failure(RelayError::Validation(format!(
                     "{} 坠机：{}",
                     result.task_id, error
                 ))),
@@ -1512,14 +1551,14 @@ impl UiState {
         if self.active_flights.is_empty() && self.active_planning.is_none() {
             true
         } else {
-            self.failure(MambaError::Validation(
+            self.failure(RelayError::Validation(
                 "仍有规划或执行任务运行中；请等待结果写入 Flow Ledger".to_string(),
             ));
             false
         }
     }
 
-    fn finish_action<T>(&mut self, app: &MambaApp, result: Result<T>)
+    fn finish_action<T>(&mut self, app: &RelayApp, result: Result<T>)
     where
         T: Into<String>,
     {
@@ -1533,13 +1572,13 @@ impl UiState {
         }
     }
 
-    fn selected_flow<'a>(&self, app: &'a MambaApp) -> Option<&'a Flow> {
+    fn selected_flow<'a>(&self, app: &'a RelayApp) -> Option<&'a Flow> {
         flow_ids(app)
             .get(self.flow_index)
             .and_then(|id| app.state().flows.get(id))
     }
 
-    fn remote_flights<'a>(&self, app: &'a MambaApp) -> Vec<&'a FlightLease> {
+    fn remote_flights<'a>(&self, app: &'a RelayApp) -> Vec<&'a FlightLease> {
         let selected_flow = self.selected_flow(app).map(|flow| flow.id.as_str());
         let mut flights = app
             .state()
@@ -1558,17 +1597,17 @@ impl UiState {
         flights
     }
 
-    fn selected_flight<'a>(&self, app: &'a MambaApp) -> Option<&'a FlightLease> {
+    fn selected_flight<'a>(&self, app: &'a RelayApp) -> Option<&'a FlightLease> {
         self.remote_flights(app).get(self.flight_index).copied()
     }
 
-    fn inbox_items<'a>(&self, app: &'a MambaApp) -> Vec<(&'a Flow, &'a Task)> {
+    fn inbox_items<'a>(&self, app: &'a RelayApp) -> Vec<(&'a Flow, &'a Task)> {
         self.actor_name(app)
             .and_then(|actor| app.inbox(actor).ok())
             .unwrap_or_default()
     }
 
-    fn actor_escalations<'a>(&self, app: &'a MambaApp) -> Vec<&'a TrackingEscalation> {
+    fn actor_escalations<'a>(&self, app: &'a RelayApp) -> Vec<&'a TrackingEscalation> {
         let Some(actor_id) = &self.actor_id else {
             return Vec::new();
         };
@@ -1586,13 +1625,13 @@ impl UiState {
         escalations
     }
 
-    fn actor_messages(&self, app: &MambaApp) -> Vec<MessageInboxItem> {
+    fn actor_messages(&self, app: &RelayApp) -> Vec<MessageInboxItem> {
         self.actor_name(app)
             .and_then(|actor| app.message_inbox(actor, false).ok())
             .unwrap_or_default()
     }
 
-    fn selected_task_context<'a>(&self, app: &'a MambaApp) -> Option<(&'a Flow, &'a Task)> {
+    fn selected_task_context<'a>(&self, app: &'a RelayApp) -> Option<(&'a Flow, &'a Task)> {
         if self.view == View::Inbox {
             return self.inbox_items(app).get(self.inbox_index).copied();
         }
@@ -1600,14 +1639,14 @@ impl UiState {
             .and_then(|flow| flow.tasks.get(self.task_index).map(|task| (flow, task)))
     }
 
-    fn actor_name<'a>(&self, app: &'a MambaApp) -> Option<&'a str> {
+    fn actor_name<'a>(&self, app: &'a RelayApp) -> Option<&'a str> {
         self.actor_id
             .as_deref()
             .and_then(|id| app.state().principals.get(id))
             .map(|principal| principal.name.as_str())
     }
 
-    fn refresh_timeline(&mut self, app: &MambaApp) {
+    fn refresh_timeline(&mut self, app: &RelayApp) {
         self.timeline = self
             .selected_flow(app)
             .and_then(|flow| app.timeline(&flow.id).ok())
@@ -1617,7 +1656,7 @@ impl UiState {
             .min(self.timeline.len().saturating_sub(1));
     }
 
-    fn clamp_selection(&mut self, app: &MambaApp) {
+    fn clamp_selection(&mut self, app: &RelayApp) {
         self.flow_index = self.flow_index.min(flow_ids(app).len().saturating_sub(1));
         self.task_index = self.task_index.min(
             self.selected_flow(app)
@@ -1635,23 +1674,34 @@ impl UiState {
     fn success(&mut self, message: impl Into<String>) {
         self.message = message.into();
         self.message_is_error = false;
+        self.push_log();
     }
 
-    fn failure(&mut self, error: MambaError) {
+    fn failure(&mut self, error: RelayError) {
         self.message = error.to_string();
         self.message_is_error = true;
+        self.push_log();
+    }
+
+    fn push_log(&mut self) {
+        self.log.push((self.message.clone(), self.message_is_error));
+        if self.log.len() > 100 {
+            self.log.remove(0);
+        }
     }
 }
 
-fn render(frame: &mut Frame, app: &MambaApp, state: &mut UiState) {
+fn render(frame: &mut Frame, app: &RelayApp, state: &mut UiState) {
     state.hit_regions.clear();
     frame.render_widget(Block::default().style(Style::new().bg(BG)), frame.area());
-    let [header, tabs, content, status, actions] = Layout::vertical([
+    let roomy = frame.area().height >= 30;
+    let [header, tabs, content, actions, log, composer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Min(10),
         Constraint::Length(3),
-        Constraint::Length(3),
+        Constraint::Length(if roomy { 3 } else { 2 }),
+        Constraint::Length(if roomy { 4 } else { 1 }),
     ])
     .areas(frame.area());
 
@@ -1664,15 +1714,12 @@ fn render(frame: &mut Frame, app: &MambaApp, state: &mut UiState) {
         View::Roster => render_roster(frame, app, state, content),
         View::Timeline => render_timeline(frame, app, state, content),
     }
-    render_status(frame, state, status);
     render_actions(frame, app, state, actions);
-
-    if let Some(modal) = state.modal.clone() {
-        render_input_modal(frame, &modal, state);
-    }
+    render_log(frame, state, log);
+    render_composer(frame, state, composer);
 }
 
-fn render_header(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+fn render_header(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: Rect) {
     let organization = app
         .state()
         .organization
@@ -1690,7 +1737,7 @@ fn render_header(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
     state.register_hit(context, HitTarget::Action(MouseAction::CycleActor));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" MAMBA", Style::new().fg(GOLD).bold()),
+            Span::styled(" RELAY", Style::new().fg(GOLD).bold()),
             Span::styled("FLOW ", Style::new().fg(TEXT).bold()),
             Span::styled("TOWER", Style::new().fg(PURPLE).bold()),
         ]))
@@ -1705,7 +1752,7 @@ fn render_header(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(organization, Style::new().fg(TEXT).bold()),
-            Span::styled("  /  球权 ", Style::new().fg(MUTED)),
+            Span::styled("  /  操作人 ", Style::new().fg(MUTED)),
             Span::styled(actor, Style::new().fg(CYAN).bold()),
             Span::styled("  /  航班 ", Style::new().fg(MUTED)),
             Span::styled(
@@ -1789,7 +1836,7 @@ fn render_tabs(frame: &mut Frame, state: &mut UiState, area: Rect) {
     frame.render_widget(tabs, area);
 }
 
-fn render_overview(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+fn render_overview(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: Rect) {
     let compact = area.height < 20;
     let [metrics, main] = Layout::vertical([
         Constraint::Length(if compact { 4 } else { 5 }),
@@ -1907,7 +1954,7 @@ fn render_metric(frame: &mut Frame, area: Rect, label: &str, value: String, colo
 
 fn render_flow_table(
     frame: &mut Frame,
-    app: &MambaApp,
+    app: &RelayApp,
     state: &mut UiState,
     area: Rect,
     focused: bool,
@@ -2005,10 +2052,10 @@ fn render_flow_table(
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
-fn render_tower_brief(frame: &mut Frame, app: &MambaApp, flow: Option<&Flow>, area: Rect) {
+fn render_tower_brief(frame: &mut Frame, app: &RelayApp, flow: Option<&Flow>, area: Rect) {
     let Some(flow) = flow else {
         frame.render_widget(
-            Paragraph::new("点击 SHOWCASE 装载演示机队，或点击底部的新需求。")
+            Paragraph::new("点击 SHOWCASE 装载演示机队，或在底部输入框直接描述需求。")
                 .style(Style::new().fg(MUTED))
                 .alignment(Alignment::Center)
                 .block(panel_block("TOWER BRIEF", false)),
@@ -2127,7 +2174,7 @@ fn render_tower_brief(frame: &mut Frame, app: &MambaApp, flow: Option<&Flow>, ar
     );
 }
 
-fn render_action_queue(frame: &mut Frame, app: &MambaApp, area: Rect) {
+fn render_action_queue(frame: &mut Frame, app: &RelayApp, area: Rect) {
     let dashboard = build_dashboard(app.state());
     let max_items = usize::from(area.height.saturating_sub(2) / 2).max(1);
     let mut items = dashboard
@@ -2263,19 +2310,29 @@ fn render_action_queue(frame: &mut Frame, app: &MambaApp, area: Rect) {
             })
             .collect::<Vec<_>>(),
     );
+    let pending = items.len();
     if items.is_empty() {
         items.push(ListItem::new(Line::styled(
             "当前没有需要管理者介入的事项",
             Style::new().fg(GREEN),
         )));
     }
-    frame.render_widget(
-        List::new(items).block(panel_block("ACTION QUEUE / 管理动作", false)),
-        area,
-    );
+    let block = if pending == 0 {
+        panel_block("ACTION QUEUE / 管理动作", false)
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(ORANGE))
+            .style(Style::new().bg(PANEL).fg(TEXT))
+            .title(Span::styled(
+                format!(" ACTION QUEUE / 待处理 {pending} 项 "),
+                Style::new().fg(ORANGE).bold(),
+            ))
+    };
+    frame.render_widget(List::new(items).block(block), area);
 }
 
-fn render_flows(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+fn render_flows(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: Rect) {
     if area.width < 92 {
         if area.height < 18 {
             let [flows, tasks] = Layout::vertical([Constraint::Length(6), Constraint::Min(6)])
@@ -2339,7 +2396,7 @@ fn render_prd(
     area: Rect,
 ) {
     let text = flow.map_or_else(
-        || Text::from("还没有 Flow。点击 SHOWCASE 装载演示，或点击底部的新需求。"),
+        || Text::from("还没有 Flow。在底部输入框描述需求，或到总览点击 SHOWCASE 装载演示。"),
         |flow| {
             let mut lines = vec![
                 Line::styled(flow.prd.title.clone(), Style::new().fg(GOLD).bold()),
@@ -2381,7 +2438,7 @@ fn render_prd(
 
 fn render_flow_selector(
     frame: &mut Frame,
-    app: &MambaApp,
+    app: &RelayApp,
     state: &mut UiState,
     area: Rect,
     focused: bool,
@@ -2439,7 +2496,7 @@ fn render_flow_selector(
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
-fn render_tasks(frame: &mut Frame, state: &mut UiState, app: &MambaApp, area: Rect, focused: bool) {
+fn render_tasks(frame: &mut Frame, state: &mut UiState, app: &RelayApp, area: Rect, focused: bool) {
     let tasks = state
         .selected_flow(app)
         .map(|flow| flow.tasks.as_slice())
@@ -2471,7 +2528,7 @@ fn render_tasks(frame: &mut Frame, state: &mut UiState, app: &MambaApp, area: Re
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
-fn render_inbox(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+fn render_inbox(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: Rect) {
     let escalations = state.actor_escalations(app);
     let messages = state.actor_messages(app);
     let (comms_area, table_area, detail_area) = if escalations.is_empty() && messages.is_empty() {
@@ -2543,7 +2600,7 @@ fn render_inbox(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Re
 
 fn render_inbox_comms(
     frame: &mut Frame,
-    app: &MambaApp,
+    app: &RelayApp,
     messages: &[MessageInboxItem],
     escalations: &[&TrackingEscalation],
     area: Rect,
@@ -2597,7 +2654,7 @@ fn render_inbox_comms(
     frame.render_widget(
         List::new(items).block(panel_block(
             &format!(
-                "TOWER COMMS / {} 指令 · {} 呼叫 · g 收到",
+                "TOWER COMMS / {} 指令 · {} 呼叫 · 点击底部收到确认",
                 messages.len(),
                 escalations.len()
             ),
@@ -2730,7 +2787,7 @@ fn render_task_detail(frame: &mut Frame, task: Option<&Task>, area: Rect) {
     );
 }
 
-fn render_roster(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+fn render_roster(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: Rect) {
     let [teams, principals] =
         Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
             .spacing(1)
@@ -2854,10 +2911,10 @@ fn render_roster(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
                 .bottom_margin(1),
         )
         .row_highlight_style(Style::new().bg(PANEL_ALT).fg(TEXT).bold())
-        .highlight_symbol("24 ")
+        .highlight_symbol("▶ ")
         .highlight_spacing(HighlightSpacing::Always)
         .column_spacing(1)
-        .block(panel_block("ROSTER / 轮换阵容", true));
+        .block(panel_block("ROSTER / 团队成员", true));
     let mut table_state = TableState::default();
     table_state.select((!principals_vec.is_empty()).then_some(state.roster_index));
     register_table_rows(
@@ -2870,7 +2927,7 @@ fn render_roster(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: R
     frame.render_stateful_widget(table, principals, &mut table_state);
 }
 
-fn render_timeline(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+fn render_timeline(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: Rect) {
     let (ledger_area, flights_area) = if area.width >= 96 {
         let [ledger, flights] =
             Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
@@ -2923,7 +2980,7 @@ fn render_timeline(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area:
     render_flights(frame, app, state, flights_area);
 }
 
-fn render_flights(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+fn render_flights(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: Rect) {
     let selected_flow = state.selected_flow(app).map(|flow| flow.id.as_str());
     let mut items = Vec::new();
     if let Some(planning) = &state.active_planning {
@@ -3134,7 +3191,7 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
     if items.is_empty() {
         items.push(ListItem::new(Text::from(vec![
             Line::styled("机队待命", Style::new().fg(MUTED)),
-            Line::styled("选中任务后点击底部的规划", Style::new().fg(TEXT)),
+            Line::styled("选中任务后点击底部的规划（只读）", Style::new().fg(TEXT)),
             Line::styled("需要写入时点击执行", Style::new().fg(TEXT)),
         ])));
     }
@@ -3158,29 +3215,44 @@ fn render_flights(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
     );
 }
 
-fn render_status(frame: &mut Frame, state: &UiState, area: Rect) {
-    let (label, color) = if state.message_is_error {
-        ("CRASH", RED)
-    } else {
-        ("TOWER", GREEN)
-    };
+fn render_log(frame: &mut Frame, state: &UiState, area: Rect) {
+    let capacity = usize::from(area.height.saturating_sub(1)).max(1);
+    let mut lines = state
+        .log
+        .iter()
+        .rev()
+        .take(capacity)
+        .rev()
+        .map(|(message, is_error)| {
+            let (label, color) = if *is_error {
+                ("CRASH", RED)
+            } else {
+                ("TOWER", GREEN)
+            };
+            Line::from(vec![
+                Span::styled(format!(" {label} "), Style::new().fg(BG).bg(color).bold()),
+                Span::raw(" "),
+                Span::styled(message.clone(), Style::new().fg(TEXT)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            " 塔台回执会出现在这里。",
+            Style::new().fg(MUTED),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {label} "), Style::new().fg(BG).bg(color).bold()),
-            Span::raw("  "),
-            Span::styled(state.message.clone(), Style::new().fg(TEXT)),
-        ]))
-        .block(
+        Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::TOP)
                 .border_style(dim_border()),
-        )
-        .alignment(Alignment::Left),
+        ),
         area,
     );
 }
 
-fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: Rect) {
+fn action_bar_items(app: &RelayApp, state: &UiState) -> Vec<(&'static str, MouseAction)> {
     let mut actions = match state.view {
         View::Overview => vec![
             ("新需求", MouseAction::NewDemand),
@@ -3193,18 +3265,18 @@ fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
             ("批准/接单", MouseAction::ApproveOrAccept),
             ("变更", MouseAction::RequestChange),
             ("推进", MouseAction::Advance),
-            ("传球", MouseAction::SendMessage),
+            ("发消息", MouseAction::SendMessage),
             ("调时", MouseAction::NegotiateEstimate),
-            ("换防", MouseAction::Reassign),
+            ("改派", MouseAction::Reassign),
             ("规划", MouseAction::Plan),
             ("执行", MouseAction::Execute),
         ],
         View::Inbox => vec![
             ("接单", MouseAction::ApproveOrAccept),
             ("收到", MouseAction::AcknowledgeEscalation),
-            ("传球", MouseAction::SendMessage),
+            ("发消息", MouseAction::SendMessage),
             ("调时", MouseAction::NegotiateEstimate),
-            ("换防", MouseAction::Reassign),
+            ("改派", MouseAction::Reassign),
             ("推进", MouseAction::Advance),
             ("规划", MouseAction::Plan),
             ("执行", MouseAction::Execute),
@@ -3212,7 +3284,7 @@ fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
             ("阻塞", MouseAction::Block),
             ("验收", MouseAction::Complete),
         ],
-        View::Roster => vec![("切换球权", MouseAction::CycleActor)],
+        View::Roster => vec![("切换操作人", MouseAction::CycleActor)],
         View::Timeline => state
             .selected_flight(app)
             .filter(|flight| flight.status == FlightLeaseStatus::Crashed)
@@ -3277,6 +3349,11 @@ fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
     }) {
         actions.insert(0, ("核对后复飞", MouseAction::RetryGitLabWrite));
     }
+    actions
+}
+
+fn render_actions(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: Rect) {
+    let actions = action_bar_items(app, state);
     frame.render_widget(Block::default().style(Style::new().bg(PANEL)), area);
     let mut x = area.x;
     let mut y = area.y;
@@ -3300,13 +3377,157 @@ fn render_actions(frame: &mut Frame, app: &MambaApp, state: &mut UiState, area: 
     }
 }
 
-fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState) {
-    let is_demand = matches!(&modal.purpose, InputPurpose::Demand);
-    let is_reassign = matches!(&modal.purpose, InputPurpose::Reassign { .. });
-    let has_selector = is_demand || is_reassign;
-    let area = centered(frame.area(), 72, if has_selector { 11 } else { 9 });
-    frame.render_widget(Clear, area);
-    let (title, prompt, color): (&str, String, Color) = match &modal.purpose {
+fn render_composer(frame: &mut Frame, state: &mut UiState, area: Rect) {
+    let modal = state.modal.clone();
+    let (title, prompt, color) = match &modal {
+        Some(modal) => composer_meta(&modal.purpose),
+        None => (
+            "NEW DEMAND / 描述需求",
+            if state.active_planning.is_some() {
+                "PRD 规划进行中；等待落地后再提交下一个需求".to_string()
+            } else {
+                "直接输入业务目标，Enter 发起 PRD 规划；点击右侧胶囊切换规划器".to_string()
+            },
+            GOLD,
+        ),
+    };
+    let flat = area.height < 3;
+    let inner = if flat {
+        frame.render_widget(Block::default().style(Style::new().bg(PANEL)), area);
+        area
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(color))
+            .style(Style::new().bg(PANEL))
+            .title(Span::styled(
+                format!(" {title} "),
+                Style::new().fg(color).bold(),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
+    };
+    if inner.height == 0 {
+        return;
+    }
+    let two_rows = inner.height >= 2;
+    let show_planner = matches!(
+        &modal,
+        None | Some(InputModal {
+            purpose: InputPurpose::Demand,
+            ..
+        })
+    );
+    let is_reassign = matches!(
+        &modal,
+        Some(InputModal {
+            purpose: InputPurpose::Reassign { .. },
+            ..
+        })
+    );
+    let widget_width = if show_planner {
+        45.min(inner.width / 2)
+    } else if is_reassign {
+        36.min(inner.width / 2)
+    } else {
+        0
+    };
+
+    let input_row = if two_rows {
+        let [hint_row, input_row] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+        let [hint_area, widget_area] =
+            Layout::horizontal([Constraint::Min(12), Constraint::Length(widget_width)])
+                .spacing(1)
+                .areas(hint_row);
+        frame.render_widget(
+            Paragraph::new(prompt.clone()).style(Style::new().fg(MUTED)),
+            hint_area,
+        );
+        if show_planner {
+            render_planner_selector(frame, widget_area, state);
+        } else if let Some(modal) = modal.as_ref().filter(|_| is_reassign) {
+            render_assignee_selector(frame, widget_area, modal, state);
+        }
+        input_row
+    } else {
+        let [input_row, widget_area] =
+            Layout::horizontal([Constraint::Min(16), Constraint::Length(widget_width)])
+                .spacing(1)
+                .areas(inner);
+        if show_planner {
+            render_planner_selector(frame, widget_area, state);
+        } else if let Some(modal) = modal.as_ref().filter(|_| is_reassign) {
+            render_assignee_selector(frame, widget_area, modal, state);
+        }
+        input_row
+    };
+
+    let confirm_width = 10u16;
+    let cancel_width = if modal.is_some() { 10u16 } else { 0 };
+    let [input_area, confirm, cancel] = Layout::horizontal([
+        Constraint::Min(16),
+        Constraint::Length(confirm_width),
+        Constraint::Length(cancel_width),
+    ])
+    .spacing(1)
+    .areas(input_row);
+    let value = modal
+        .as_ref()
+        .map(|modal| modal.value.as_str())
+        .unwrap_or(state.composer.as_str());
+    let mut spans = Vec::new();
+    if flat {
+        let short_title = title.split('/').next().unwrap_or(title).trim();
+        spans.push(Span::styled(
+            format!(" {short_title} "),
+            Style::new().fg(BG).bg(color).bold(),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled("› ", Style::new().fg(color).bold()));
+    if value.is_empty() {
+        let placeholder = if !two_rows {
+            prompt
+        } else if modal.is_none() {
+            "例如：为 LLM Gateway 增加限流告警与演练脚本…".to_string()
+        } else {
+            String::new()
+        };
+        if placeholder.is_empty() {
+            spans.push(Span::styled("█", Style::new().fg(TEXT)));
+        } else {
+            spans.push(Span::styled(placeholder, Style::new().fg(MUTED)));
+        }
+    } else {
+        spans.push(Span::styled(format!("{value}█"), Style::new().fg(TEXT)));
+    }
+    let input_line = Line::from(spans);
+    frame.render_widget(
+        Paragraph::new(input_line).style(Style::new().bg(PANEL_ALT)),
+        input_area,
+    );
+    state.register_hit(confirm, HitTarget::Action(MouseAction::ConfirmModal));
+    frame.render_widget(
+        Paragraph::new("↵ 发送")
+            .style(Style::new().fg(BG).bg(color).bold())
+            .alignment(Alignment::Center),
+        confirm,
+    );
+    if modal.is_some() {
+        state.register_hit(cancel, HitTarget::Action(MouseAction::CancelModal));
+        frame.render_widget(
+            Paragraph::new("✕ 取消")
+                .style(Style::new().fg(TEXT).bg(PANEL_ALT))
+                .alignment(Alignment::Center),
+            cancel,
+        );
+    }
+}
+
+fn composer_meta(purpose: &InputPurpose) -> (&'static str, String, Color) {
+    match purpose {
         InputPurpose::Demand => (
             "NEW DEMAND / 管理需求",
             "描述目标；点击选择 PRD 规划器".into(),
@@ -3344,9 +3565,9 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
             selected,
             ..
         } => (
-            "LINEUP / 任务换防",
+            "LINEUP / 任务改派",
             format!(
-                "换防给 {}；输入原因，点击候选条切换人选",
+                "改派给 {}；输入原因，点击候选条切换人选",
                 candidates
                     .get(*selected)
                     .map(|target| target.name.as_str())
@@ -3371,7 +3592,7 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
                     "只读规划会调用已分配终端并产生模型费用；输入 PASS 放行".into()
                 }
                 ExecutorMode::Execute => {
-                    "执行模式允许终端修改注册工作区；确认仓库状态后输入 MAMBA 放行".into()
+                    "执行模式允许终端修改注册工作区；确认仓库状态后输入 RELAY 放行".into()
                 }
             },
             match mode {
@@ -3392,74 +3613,7 @@ fn render_input_modal(frame: &mut Frame, modal: &InputModal, state: &mut UiState
                 RecoveryAction::SwitchExecutor | RecoveryAction::Fork => PURPLE,
             },
         ),
-    };
-    let (hint, selector_area, input, footer) = if has_selector {
-        let [hint, selector, input, footer] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Length(2),
-        ])
-        .margin(1)
-        .areas(area);
-        (hint, Some(selector), input, footer)
-    } else {
-        let [hint, input, footer] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Length(2),
-        ])
-        .margin(1)
-        .areas(area);
-        (hint, None, input, footer)
-    };
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(color))
-            .style(Style::new().bg(PANEL))
-            .title(Span::styled(
-                format!(" {title} "),
-                Style::new().fg(color).bold(),
-            )),
-        area,
-    );
-    frame.render_widget(Paragraph::new(prompt).style(Style::new().fg(MUTED)), hint);
-    if let Some(selector_area) = selector_area {
-        if is_demand {
-            render_planner_selector(frame, selector_area, state);
-        } else {
-            render_assignee_selector(frame, selector_area, modal, state);
-        }
     }
-    let visible = format!("{}█", modal.value);
-    frame.render_widget(
-        Paragraph::new(visible)
-            .style(Style::new().fg(TEXT).bg(PANEL_ALT))
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::new().fg(color)),
-            ),
-        input,
-    );
-    let [confirm, cancel] = Layout::horizontal([Constraint::Ratio(1, 2); 2])
-        .spacing(1)
-        .areas(footer);
-    state.register_hit(confirm, HitTarget::Action(MouseAction::ConfirmModal));
-    state.register_hit(cancel, HitTarget::Action(MouseAction::CancelModal));
-    frame.render_widget(
-        Paragraph::new("[ 确认 ]")
-            .style(Style::new().fg(BG).bg(color).bold())
-            .alignment(Alignment::Center),
-        confirm,
-    );
-    frame.render_widget(
-        Paragraph::new("[ 取消 ]")
-            .style(Style::new().fg(TEXT).bg(PANEL_ALT))
-            .alignment(Alignment::Center),
-        cancel,
-    );
 }
 
 fn render_assignee_selector(
@@ -3521,16 +3675,6 @@ fn render_planner_selector(frame: &mut Frame, area: Rect, state: &mut UiState) {
             areas[index],
         );
     }
-}
-
-fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
-    let [vertical] = Layout::vertical([Constraint::Length(height.min(area.height))])
-        .flex(Flex::Center)
-        .areas(area);
-    let [horizontal] = Layout::horizontal([Constraint::Percentage(width_percent)])
-        .flex(Flex::Center)
-        .areas(vertical);
-    horizontal
 }
 
 fn panel_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
@@ -3666,13 +3810,13 @@ fn action_color(action: MouseAction) -> Color {
     }
 }
 
-fn flow_ids(app: &MambaApp) -> Vec<String> {
+fn flow_ids(app: &RelayApp) -> Vec<String> {
     let mut flows = app.state().flows.values().collect::<Vec<_>>();
     flows.sort_by_key(|flow| Reverse(flow.created_at));
     flows.into_iter().map(|flow| flow.id.clone()).collect()
 }
 
-fn initial_flow_index(app: &MambaApp) -> usize {
+fn initial_flow_index(app: &RelayApp) -> usize {
     let ids = flow_ids(app);
     let dashboard = build_dashboard(app.state());
     ids.iter()
@@ -3701,7 +3845,7 @@ fn flow_health_priority(health: FlowHealth) -> u8 {
     }
 }
 
-fn human_ids(app: &MambaApp) -> Vec<String> {
+fn human_ids(app: &RelayApp) -> Vec<String> {
     let mut humans = app
         .state()
         .principals
@@ -3712,7 +3856,7 @@ fn human_ids(app: &MambaApp) -> Vec<String> {
     humans.into_iter().map(|human| human.id.clone()).collect()
 }
 
-fn task_has_executor(app: &MambaApp, task: &Task) -> bool {
+fn task_has_executor(app: &RelayApp, task: &Task) -> bool {
     let Some(assignment) = &task.assignment else {
         return false;
     };
@@ -3746,7 +3890,7 @@ fn planner_color(planner: PlannerKind) -> Color {
 fn confirmation_token(mode: &ExecutorMode) -> &'static str {
     match mode {
         ExecutorMode::Plan => "PASS",
-        ExecutorMode::Execute => "MAMBA",
+        ExecutorMode::Execute => "RELAY",
     }
 }
 
@@ -3781,7 +3925,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn flight_selection_summary(app: &MambaApp, flight: &FlightLease) -> String {
+fn flight_selection_summary(app: &RelayApp, flight: &FlightLease) -> String {
     let objective = flight
         .manifest
         .as_ref()
@@ -3807,7 +3951,7 @@ fn recovery_action_label(action: RecoveryAction) -> &'static str {
         RecoveryAction::Retry => "沿原航线复飞",
         RecoveryAction::SwitchExecutor => "更换执行终端复飞",
         RecoveryAction::ReduceScope => "缩小目标与上下文后复飞",
-        RecoveryAction::HumanHandoff => "把球权交还 Human",
+        RecoveryAction::HumanHandoff => "交还给 Human",
         RecoveryAction::Ground => "永久停飞",
         RecoveryAction::Fork => "从黑匣子分叉新航班",
     }
@@ -3958,13 +4102,13 @@ mod tests {
     #[tokio::test]
     async fn overview_renders_organization_and_flow() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
-        app.init_organization("Mamba Labs", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Relay Labs", "admin").unwrap();
         let team = app
             .create_team("Platform", "product,delivery", "admin")
             .unwrap();
         app.register_principal(
-            "牢大",
+            "陈静",
             PrincipalKind::Human,
             Some(&team.id),
             None,
@@ -3976,7 +4120,7 @@ mod tests {
         .unwrap();
         app.create_demand(
             "Prepare launch brief",
-            "牢大",
+            "陈静",
             PlannerKind::Local,
             directory.path(),
             10,
@@ -3988,7 +4132,7 @@ mod tests {
             &app,
             TuiOptions {
                 workspace: directory.path().to_path_buf(),
-                actor: Some("牢大".to_string()),
+                actor: Some("陈静".to_string()),
             },
         );
         let backend = TestBackend::new(120, 36);
@@ -4004,8 +4148,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(content.contains("MAMBAFLOW"));
-        assert!(content.contains("Mamba Labs"));
+        assert!(content.contains("RELAY"));
+        assert!(content.contains("Relay Labs"));
         assert!(content.contains("Prepare launch brief"));
         assert!(content.contains("TOWER BRIEF"));
         assert!(content.contains("AT RISK"));
@@ -4119,18 +4263,18 @@ mod tests {
     #[tokio::test]
     async fn showcase_renders_admin_metrics_actions_and_remote_flight() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
-        app.init_organization("Mamba Labs", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Relay Labs", "admin").unwrap();
         let team = app
             .create_team(
-                "洛杉矶研发队",
+                "平台研发组",
                 "product,delivery,backend,rust,llm-platform,security,quality,observability,operations",
                 "admin",
             )
             .unwrap();
         let human = app
             .register_principal(
-                "牢大",
+                "陈静",
                 PrincipalKind::Human,
                 Some(&team.id),
                 None,
@@ -4331,7 +4475,7 @@ mod tests {
     #[tokio::test]
     async fn empty_tower_loads_showcase_from_mouse_and_focuses_risk() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
         let mut state = UiState::new(
             &app,
             TuiOptions {
@@ -4365,9 +4509,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(app.state().organization().unwrap().name, "Mamba Labs");
+        assert_eq!(app.state().organization().unwrap().name, "Relay Labs");
         assert_eq!(app.state().flows.len(), 3);
-        assert_eq!(state.actor_name(&app), Some("牢大"));
+        assert_eq!(state.actor_name(&app), Some("陈静"));
         assert!(
             state
                 .selected_flow(&app)
@@ -4396,7 +4540,7 @@ mod tests {
         );
 
         state.cycle_actor(&app);
-        assert_eq!(state.actor_name(&app), Some("佐巴扬"));
+        assert_eq!(state.actor_name(&app), Some("李伟"));
         state.switch_view(&app, View::Inbox);
         terminal
             .draw(|frame| render(frame, &app, &mut state))
@@ -4448,7 +4592,7 @@ mod tests {
         }
         state.acknowledge_next_inbox(&mut app);
         assert!(state.message.contains("已收到指令"));
-        assert!(app.message_inbox("佐巴扬", false).unwrap().is_empty());
+        assert!(app.message_inbox("李伟", false).unwrap().is_empty());
         state.open_message_input(&app);
         let Some(modal) = &mut state.modal else {
             panic!("message modal should open for an assigned task");
@@ -4457,7 +4601,7 @@ mod tests {
         modal.value = "Secret 边界已确认，可以恢复执行".into();
         state.submit_modal(&mut app).await;
         assert!(
-            app.message_inbox("牢大", false)
+            app.message_inbox("陈静", false)
                 .unwrap()
                 .iter()
                 .any(|item| item.message.body.contains("恢复执行"))
@@ -4478,14 +4622,14 @@ mod tests {
     #[tokio::test]
     async fn inbox_renders_and_acknowledges_tower_calls() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
-        app.init_organization("Mamba Labs", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Relay Labs", "admin").unwrap();
         let team = app
             .create_team("Product", "product,delivery", "admin")
             .unwrap();
         let human = app
             .register_principal(
-                "牢大",
+                "陈静",
                 PrincipalKind::Human,
                 Some(&team.id),
                 None,
@@ -4557,8 +4701,8 @@ mod tests {
     #[tokio::test]
     async fn tui_reassigns_and_reschedules_a_task_from_mouse_controls() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
-        app.init_organization("Mamba Labs", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Relay Labs", "admin").unwrap();
         let team = app
             .create_team(
                 "Platform",
@@ -4776,7 +4920,7 @@ mod tests {
             task_count + 1
         );
         assert!(app.pending_flow_change(&flow.id).is_none());
-        assert!(state.message.contains("新增任务完成传球"));
+        assert!(state.message.contains("新增任务完成派发"));
 
         state.open_flow_change_input(&app);
         state.modal.as_mut().unwrap().value = "Add an optional launch survey".into();
@@ -4835,12 +4979,12 @@ printf '%s\n' '{"thread_id":"fake-planner"}'
         permissions.set_mode(0o755);
         fs::set_permissions(&executable, permissions).unwrap();
 
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
-        app.init_organization("Mamba Labs", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Relay Labs", "admin").unwrap();
         let team = app.create_team("Product", "product", "admin").unwrap();
         let human = app
             .register_principal(
-                "牢大",
+                "陈静",
                 PrincipalKind::Human,
                 Some(&team.id),
                 None,
@@ -4922,14 +5066,14 @@ printf '%s\n' '{"thread_id":"fake-thread"}'
         permissions.set_mode(0o755);
         fs::set_permissions(&executable, permissions).unwrap();
 
-        let mut app = MambaApp::open(directory.path().join("data")).unwrap();
-        app.init_organization("Mamba Labs", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path().join("data")).unwrap();
+        app.init_organization("Relay Labs", "admin").unwrap();
         let team = app
             .create_team("Platform", "product,delivery", "admin")
             .unwrap();
         let human = app
             .register_principal(
-                "牢大",
+                "陈静",
                 PrincipalKind::Human,
                 Some(&team.id),
                 None,

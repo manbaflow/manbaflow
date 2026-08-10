@@ -1,9 +1,9 @@
-use super::MambaApp;
-use crate::error::{MambaError, Result};
+use super::RelayApp;
+use crate::error::{RelayError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 use crate::store::EventStore;
 
-impl MambaApp {
+impl RelayApp {
     pub(super) fn commit(
         &mut self,
         actor: &str,
@@ -32,7 +32,7 @@ impl MambaApp {
         }
 
         if let Err(error) = self.store.append_prepared(expected_sequence, &envelopes) {
-            if matches!(error, MambaError::ConcurrentModification { .. }) {
+            if matches!(error, RelayError::ConcurrentModification { .. }) {
                 self.reload()?;
             }
             return Err(error);
@@ -53,8 +53,8 @@ mod tests {
     #[test]
     fn invalid_projection_never_reaches_the_event_store() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path()).unwrap();
-        app.init_organization("Mamba", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path()).unwrap();
+        app.init_organization("Relay", "admin").unwrap();
         let sequence_before = app.state.last_sequence;
 
         let error = app
@@ -70,7 +70,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(matches!(error, MambaError::OrganizationAlreadyInitialized));
+        assert!(matches!(error, RelayError::OrganizationAlreadyInitialized));
         assert_eq!(app.state.last_sequence, sequence_before);
         assert_eq!(app.store.current_sequence().unwrap(), sequence_before);
     }
@@ -79,9 +79,9 @@ mod tests {
     fn stale_application_instance_cannot_skip_concurrent_events() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path();
-        let mut first = MambaApp::open(data_dir).unwrap();
-        first.init_organization("Mamba", "admin").unwrap();
-        let mut stale = MambaApp::open(data_dir).unwrap();
+        let mut first = RelayApp::open(data_dir).unwrap();
+        first.init_organization("Relay", "admin").unwrap();
+        let mut stale = RelayApp::open(data_dir).unwrap();
         let stale_sequence = stale.state.last_sequence;
 
         first
@@ -93,7 +93,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            MambaError::ConcurrentModification { expected, actual }
+            RelayError::ConcurrentModification { expected, actual }
                 if expected == stale_sequence && actual == stale_sequence + 1
         ));
         assert_eq!(stale.state.last_sequence, stale_sequence + 1);

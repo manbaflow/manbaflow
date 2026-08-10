@@ -3,16 +3,16 @@ use std::fmt::Write as _;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::MambaApp;
+use super::RelayApp;
 use crate::domain::{
     ExternalArtifact, GitLabWritePayload, GitLabWriteRequest, GitLabWriteResult, GitLabWriteStatus,
     PrincipalKind, TaskStatus,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 
-impl MambaApp {
+impl RelayApp {
     pub fn request_gitlab_write(
         &mut self,
         task_id: &str,
@@ -22,7 +22,7 @@ impl MambaApp {
         let principal = self.state.principal(actor)?.clone();
         let (flow, task) = self.task_snapshot(task_id)?;
         if !matches!(task.status, TaskStatus::InProgress | TaskStatus::Submitted) {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "task {} is {:?}, expected in_progress or submitted",
                 task.id, task.status
             )));
@@ -73,7 +73,7 @@ impl MambaApp {
         if let Some(flow_id) = flow_id {
             let flow = self.state.flow(flow_id)?;
             if !self.principal_has_flow_access(flow, principal) {
-                return Err(MambaError::PermissionDenied(format!(
+                return Err(RelayError::PermissionDenied(format!(
                     "{} cannot access flow {}",
                     principal.name, flow.id
                 )));
@@ -104,7 +104,7 @@ impl MambaApp {
     ) -> Result<GitLabWriteRequest> {
         let (request, reviewer) = self.gitlab_review_context(write_id, actor)?;
         if request.status != GitLabWriteStatus::Requested {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "GitLab write {} is {:?}, expected requested",
                 request.id, request.status
             )));
@@ -131,7 +131,7 @@ impl MambaApp {
         let reason = validate_required_text(reason, "GitLab rejection reason", 500)?;
         let (request, reviewer) = self.gitlab_review_context(write_id, actor)?;
         if request.status != GitLabWriteStatus::Requested {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "GitLab write {} is {:?}, expected requested",
                 request.id, request.status
             )));
@@ -160,7 +160,7 @@ impl MambaApp {
             request.status,
             GitLabWriteStatus::Failed | GitLabWriteStatus::Indeterminate
         ) {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "GitLab write {} is {:?}, expected failed or indeterminate",
                 request.id, request.status
             )));
@@ -253,7 +253,7 @@ impl MambaApp {
             .gitlab_writes
             .get(write_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "GitLab write",
                 id: write_id.to_string(),
             })?;
@@ -300,7 +300,7 @@ impl MambaApp {
             .gitlab_writes
             .get(write_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "GitLab write",
                 id: write_id.to_string(),
             })?;
@@ -310,7 +310,7 @@ impl MambaApp {
             || !reviewer.active
             || (flow.demand.requester != reviewer.id && flow.demand.requester != reviewer.name)
         {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "only the Human Demand Requester can release GitLab writes".into(),
             ));
         }
@@ -348,7 +348,7 @@ fn validate_payload(payload: &GitLabWritePayload) -> Result<()> {
             validate_branch(source_branch, "source branch")?;
             validate_branch(target_branch, "target branch")?;
             if source_branch == target_branch {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "GitLab source and target branches must differ".into(),
                 ));
             }
@@ -381,7 +381,7 @@ fn validate_result(request: &GitLabWriteRequest, result: &GitLabWriteResult) -> 
         GitLabWritePayload::CommentMergeRequest { .. } => "merge_request_note",
     };
     if result.kind != expected_kind {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "GitLab write result kind {} does not match {expected_kind}",
             result.kind
         )));
@@ -390,14 +390,14 @@ fn validate_result(request: &GitLabWriteRequest, result: &GitLabWriteResult) -> 
     validate_required_text(&result.title, "GitLab result title", 1_000)?;
     validate_required_text(&result.status, "GitLab result status", 100)?;
     if !(200..300).contains(&result.response_status) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "GitLab successful result must contain a 2xx response status".into(),
         ));
     }
     let url = reqwest::Url::parse(&result.url)
-        .map_err(|_| MambaError::Validation("GitLab result URL is invalid".into()))?;
+        .map_err(|_| RelayError::Validation("GitLab result URL is invalid".into()))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "GitLab result URL must be an absolute HTTP(S) URL".into(),
         ));
     }
@@ -416,7 +416,7 @@ fn validate_project(value: &str) -> Result<()> {
                 })
         });
     if value.len() > 500 || value != value.trim() || (!valid_numeric && !valid_path) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "GitLab project must be a numeric ID or namespace/project path".into(),
         ));
     }
@@ -425,7 +425,7 @@ fn validate_project(value: &str) -> Result<()> {
 
 fn validate_iid(value: u64, label: &str) -> Result<()> {
     if value == 0 {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "GitLab {label} IID must be greater than zero"
         )));
     }
@@ -445,21 +445,21 @@ fn validate_branch(value: &str, label: &str) -> Result<()> {
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
     {
-        return Err(MambaError::Validation(format!("invalid GitLab {label}")));
+        return Err(RelayError::Validation(format!("invalid GitLab {label}")));
     }
     Ok(())
 }
 
 fn validate_labels(labels: &[String]) -> Result<()> {
     if labels.len() > 50 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "GitLab write cannot contain more than 50 labels".into(),
         ));
     }
     for label in labels {
         validate_required_text(label, "GitLab label", 255)?;
         if label.contains(',') {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "GitLab labels must not contain commas".into(),
             ));
         }
@@ -473,7 +473,7 @@ fn validate_required_text(value: &str, label: &str, max: usize) -> Result<String
         || value.chars().count() > max
         || value.chars().any(|character| character.is_control())
     {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} must contain 1 to {max} printable characters"
         )));
     }
@@ -487,7 +487,7 @@ fn validate_body(value: &str, label: &str, max: usize, allow_empty: bool) -> Res
             .chars()
             .any(|character| character.is_control() && !matches!(character, '\r' | '\n' | '\t'))
     {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} must contain at most {max} safe text characters"
         )));
     }

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use chrono::{Duration, Utc};
 
-use super::MambaApp;
+use super::RelayApp;
 use crate::capability::CapabilityAdapter;
 use crate::domain::{
     CapabilityPack, ExecutorKind, FlightDeliverable, FlightLease, FlightLeaseStatus,
@@ -10,11 +10,11 @@ use crate::domain::{
     Principal, PrincipalKind, RecoveryAction, RecoveryPolicy, RemoteFlightReport, ResourceClaim,
     ResourceKind, ResourceLease, ResourceLeaseStatus, Task, ToolAccess, ToolPermission,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 
-impl MambaApp {
+impl RelayApp {
     pub(super) fn build_flight_manifest(
         &self,
         flow: &Flow,
@@ -77,7 +77,7 @@ impl MambaApp {
             draft.tool_permissions
         };
         if tool_permissions.len() > 64 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "a flight can declare at most 64 tool permissions".into(),
             ));
         }
@@ -96,7 +96,7 @@ impl MambaApp {
 
         let recovery = draft.recovery.unwrap_or_default();
         if !(1..=10).contains(&recovery.max_attempts) || recovery.allowed_actions.is_empty() {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "recovery policy requires 1 to 10 attempts and at least one action".into(),
             ));
         }
@@ -106,7 +106,7 @@ impl MambaApp {
             .iter()
             .any(|action| !seen_actions.insert(*action as u8))
         {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "recovery policy contains duplicate actions".into(),
             ));
         }
@@ -154,7 +154,7 @@ impl MambaApp {
                 .values()
                 .find(|lease| lease.conflicts_with(claim, now))
             {
-                return Err(MambaError::InvalidTransition(format!(
+                return Err(RelayError::InvalidTransition(format!(
                     "resource {:?}:{} is leased by flight {} until {}",
                     claim.kind, claim.key, existing.flight_lease_id, existing.expires_at
                 )));
@@ -340,7 +340,7 @@ impl MambaApp {
             .state
             .flight_leases
             .get(lease_id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flight lease",
                 id: lease_id.to_string(),
             })?;
@@ -350,7 +350,7 @@ impl MambaApp {
                 flow.demand.requester == principal.id || flow.demand.requester == principal.name
             })
         {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "principal cannot inspect recovery options for this flight".into(),
             ));
         }
@@ -386,13 +386,13 @@ impl MambaApp {
         let reason = reason.trim();
         validate_text(reason, "recovery reason", 1_000)?;
         if !(60..=86_400).contains(&ttl_seconds) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "recovery lease TTL must be between 60 and 86400 seconds".into(),
             ));
         }
         let human = self.state.principal(actor)?.clone();
         if human.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "flight recovery requires a Human decision".into(),
             ));
         }
@@ -401,7 +401,7 @@ impl MambaApp {
             .flight_leases
             .get(lease_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flight lease",
                 id: lease_id.to_string(),
             })?;
@@ -409,18 +409,18 @@ impl MambaApp {
             flow.demand.requester == human.id || flow.demand.requester == human.name
         });
         if parent.authorized_by != human.name && !is_requester {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "only the authorizing Human or Demand Requester can recover a flight".into(),
             ));
         }
         if action == RecoveryAction::Fork {
             if !parent.status.is_terminal() {
-                return Err(MambaError::InvalidTransition(
+                return Err(RelayError::InvalidTransition(
                     "a fork requires a terminal parent flight".into(),
                 ));
             }
         } else if parent.status != FlightLeaseStatus::Crashed {
-            return Err(MambaError::InvalidTransition(
+            return Err(RelayError::InvalidTransition(
                 "only a crashed flight can enter recovery".into(),
             ));
         }
@@ -443,7 +443,7 @@ impl MambaApp {
             declared_at: Utc::now(),
         });
         if !parent_manifest.recovery.allowed_actions.contains(&action) {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "recovery action {action:?} is not allowed by the manifest"
             )));
         }
@@ -453,7 +453,7 @@ impl MambaApp {
                 RecoveryAction::Ground | RecoveryAction::HumanHandoff
             )
         {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flight recovery exhausted {} attempts",
                 parent_manifest.recovery.max_attempts
             )));
@@ -506,10 +506,10 @@ impl MambaApp {
         let selected_executor = match action {
             RecoveryAction::SwitchExecutor => {
                 let selected = executor.ok_or_else(|| {
-                    MambaError::Validation("switch_executor requires an executor".into())
+                    RelayError::Validation("switch_executor requires an executor".into())
                 })?;
                 if selected == parent.executor {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "switch_executor must select a different executor".into(),
                     ));
                 }
@@ -550,7 +550,7 @@ fn validate_text(value: &str, label: &str, max_chars: usize) -> Result<()> {
     let value = value.trim();
     if value.is_empty() || value.chars().count() > max_chars || value.chars().any(char::is_control)
     {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} must contain 1 to {max_chars} printable characters"
         )));
     }
@@ -559,7 +559,7 @@ fn validate_text(value: &str, label: &str, max_chars: usize) -> Result<()> {
 
 fn validate_list(values: &[String], label: &str, max_items: usize, max_chars: usize) -> Result<()> {
     if values.is_empty() || values.len() > max_items {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} must contain 1 to {max_items} entries"
         )));
     }
@@ -571,17 +571,17 @@ fn validate_list(values: &[String], label: &str, max_items: usize, max_chars: us
 
 fn validate_fuel(fuel: &FuelBudget, ttl_seconds: u64) -> Result<()> {
     if fuel.max_duration_seconds == 0 || fuel.max_duration_seconds > ttl_seconds {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "fuel duration must be positive and no greater than the flight TTL".into(),
         ));
     }
     if fuel.max_context_bytes == 0 || fuel.max_context_bytes > 67_108_864 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "fuel context budget must be between 1 byte and 64 MiB".into(),
         ));
     }
     if fuel.max_tokens == Some(0) || fuel.max_tool_calls == Some(0) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "optional token and tool-call budgets must be greater than zero".into(),
         ));
     }
@@ -589,7 +589,7 @@ fn validate_fuel(fuel: &FuelBudget, ttl_seconds: u64) -> Result<()> {
         .max_cost_usd
         .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 100_000.0)
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "fuel cost budget must be positive and at most 100000 USD".into(),
         ));
     }
@@ -598,7 +598,7 @@ fn validate_fuel(fuel: &FuelBudget, ttl_seconds: u64) -> Result<()> {
 
 fn validate_resources(resources: &[ResourceClaim]) -> Result<()> {
     if resources.is_empty() || resources.len() > 32 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "a flight must claim between 1 and 32 resources".into(),
         ));
     }
@@ -606,7 +606,7 @@ fn validate_resources(resources: &[ResourceClaim]) -> Result<()> {
     for resource in resources {
         validate_text(&resource.key, "resource key", 512)?;
         if !seen.insert((resource.kind, resource.key.clone())) {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "duplicate resource claim {:?}:{}",
                 resource.kind, resource.key
             )));
@@ -617,7 +617,7 @@ fn validate_resources(resources: &[ResourceClaim]) -> Result<()> {
 
 fn validate_output_contract(pack: CapabilityPack, contract: &OutputContract) -> Result<()> {
     if contract.min_deliverables > 100 || contract.allowed_extensions.len() > 64 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "output contract exceeds deliverable or extension limits".into(),
         ));
     }
@@ -629,18 +629,18 @@ fn validate_output_contract(pack: CapabilityPack, contract: &OutputContract) -> 
             || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
             || !seen.insert(extension.to_ascii_lowercase())
         {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "output contract contains an invalid or duplicate file extension".into(),
             ));
         }
     }
     if pack == CapabilityPack::Office && contract.allowed_extensions.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "office flights require an explicit artifact extension allowlist".into(),
         ));
     }
     if pack == CapabilityPack::Office && !contract.requires_human_release {
-        return Err(MambaError::PermissionDenied(
+        return Err(RelayError::PermissionDenied(
             "office artifacts require Human release in this version".into(),
         ));
     }

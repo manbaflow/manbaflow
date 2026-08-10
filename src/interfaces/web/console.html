@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MambaFlow Tower</title>
+  <title>Relay Tower</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/console/assets/console.css">
 </head>
 <body>
   <div class="shell">
     <aside class="rail">
-      <div class="brand"><span class="brand-mark">24</span><div><strong>MambaFlow</strong><small>ORGANIZATION TOWER</small></div></div>
+      <div class="brand"><span class="brand-mark">24</span><div><strong>Relay</strong><small>ORGANIZATION TOWER</small></div></div>
       <nav aria-label="控制台导航">
         <a href="#overview" class="active">组织总览</a>
         <a href="#actions">待办处置</a>
@@ -22,7 +22,7 @@
 
     <div class="workspace">
       <header class="topbar">
-        <div><p class="eyebrow">塔台工作台</p><h1 id="org-name">MambaFlow</h1></div>
+        <div><p class="eyebrow">塔台工作台</p><h1 id="org-name">Relay</h1></div>
         <div class="top-actions">
           <span id="identity" class="identity">未连接</span>
           <button id="refresh" type="button">刷新</button>
@@ -67,12 +67,14 @@
 
   <dialog id="auth-dialog">
     <form id="auth-form" method="dialog" class="dialog-form">
-      <p class="eyebrow">BEARER IDENTITY</p><h2>连接组织塔台</h2>
+      <p class="eyebrow">登录</p><h2>连接组织塔台</h2>
+      <button id="feishu-login" type="button" class="primary">用飞书登录</button>
+      <p class="dialog-note">本企业员工首次登录自动开通账号，无需管理员预先添加。</p>
       <label><span>Tenant ID（SSO 可选）</span><input id="sso-tenant" autocomplete="organization" placeholder="TEN-xxxxxxxx"></label>
       <button id="oidc-login" type="button">企业 SSO</button>
-      <label><span>Principal Token</span><input id="token" type="password" autocomplete="off" required placeholder="mmb_..."></label>
-      <p class="dialog-note">Token 仅保留在当前浏览器标签页。</p>
-      <button type="submit" class="primary">进入塔台</button>
+      <label><span>Principal Token</span><input id="token" type="password" autocomplete="off" required placeholder="rly_..."></label>
+      <p class="dialog-note">Token 仅保留在当前浏览器标签页，适合 Agent 与自动化。</p>
+      <button type="submit">进入塔台</button>
     </form>
   </dialog>
 

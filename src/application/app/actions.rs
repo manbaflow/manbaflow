@@ -1,15 +1,15 @@
 use chrono::{DateTime, Utc};
 
-use super::MambaApp;
+use super::RelayApp;
 use super::policy::ensure_status;
 use crate::domain::{
     FlowMessage, MessageAcknowledgement, Principal, PrincipalKind, Task, TaskStatus,
     TrackingEscalation,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 
-impl MambaApp {
+impl RelayApp {
     pub fn accept_task(&mut self, task_id: &str, actor: &str) -> Result<Task> {
         let (_, task_id, event) = self.prepare_task_accept(task_id, actor, Utc::now())?;
         self.commit(actor, vec![event])?;
@@ -48,7 +48,7 @@ impl MambaApp {
             .escalations
             .get(escalation_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "tracking escalation",
                 id: escalation_id.to_string(),
             })
@@ -86,7 +86,7 @@ impl MambaApp {
         let reason = reason.trim();
         if reason.is_empty() || reason.chars().count() > 500 || reason.chars().any(char::is_control)
         {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "task rejection reason must contain 1 to 500 printable characters".into(),
             ));
         }
@@ -118,19 +118,19 @@ impl MambaApp {
             .messages
             .get(message_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flow message",
                 id: message_id.to_string(),
             })?;
         if !message.requires_ack {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flow message {} does not require acknowledgement",
                 message.id
             )));
         }
         let represented = self.message_recipient_ids(&message, principal);
         if represented.is_empty() {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "{} is not a recipient of flow message {}",
                 principal.name, message.id
             )));
@@ -161,7 +161,7 @@ impl MambaApp {
         acknowledged_at: DateTime<Utc>,
     ) -> Result<(String, DomainEvent)> {
         if principal.kind != PrincipalKind::Human {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "tracking escalation acknowledgement requires a human".into(),
             ));
         }
@@ -170,24 +170,24 @@ impl MambaApp {
             .escalations
             .get(escalation_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "tracking escalation",
                 id: escalation_id.to_string(),
             })?;
         if escalation.recipient_id != principal.id {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "{} is not the recipient of escalation {}",
                 principal.name, escalation.id
             )));
         }
         if !escalation.is_active() {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "escalation {} is already resolved",
                 escalation.id
             )));
         }
         if escalation.acknowledged_at.is_some() {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "escalation {} is already acknowledged",
                 escalation.id
             )));

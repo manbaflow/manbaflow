@@ -1,16 +1,17 @@
 [package]
-name = "manbaflow"
+name = "relay"
 version = "0.1.0"
 edition = "2024"
 autobins = false
 description = "Enterprise Human-Agent Flow control plane"
-license = "MIT"
-repository = "https://github.com/manbaflow/manbaflow"
+publish = false
+license-file = "LICENSE"
+repository = "https://gitlab.edumind.ai/platform/relay"
 readme = "README.md"
 
 [[bin]]
-name = "mamba"
-path = "src/bin/mamba/main.rs"
+name = "relay"
+path = "src/bin/relay/main.rs"
 
 [dependencies]
 axum = "0.8"

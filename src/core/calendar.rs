@@ -3,23 +3,23 @@ use std::str::FromStr;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc, Weekday};
 
 use crate::domain::{WorkCalendar, Workday};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 const MAX_SEARCH_DAYS: usize = 3_660;
 
 pub fn validate(calendar: &WorkCalendar) -> Result<()> {
     if !(-14 * 60..=14 * 60).contains(&calendar.utc_offset_minutes) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "calendar UTC offset must be between -14:00 and +14:00".into(),
         ));
     }
     if calendar.working_days.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "calendar must contain at least one working day".into(),
         ));
     }
     if calendar.day_start_minute >= calendar.day_end_minute || calendar.day_end_minute > 24 * 60 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "calendar work window must be within 00:00..24:00 and start before end".into(),
         ));
     }
@@ -56,12 +56,12 @@ pub fn next_available(calendar: &WorkCalendar, start: DateTime<Utc>) -> Result<D
         }
         cursor = local_minute_to_utc(
             date.succ_opt()
-                .ok_or_else(|| MambaError::Validation("calendar date overflow".into()))?,
+                .ok_or_else(|| RelayError::Validation("calendar date overflow".into()))?,
             0,
             offset,
         );
     }
-    Err(MambaError::Validation(
+    Err(RelayError::Validation(
         "calendar has no availability within ten years".into(),
     ))
 }
@@ -72,7 +72,7 @@ pub fn add_working_hours(
     hours: f64,
 ) -> Result<DateTime<Utc>> {
     if !hours.is_finite() || hours < 0.0 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "working hours must be a finite non-negative number".into(),
         ));
     }
@@ -115,7 +115,7 @@ pub fn add_working_hours(
             next_block.map(|block| block.ends_at).unwrap_or(work_end),
         )?;
     }
-    Err(MambaError::Validation(
+    Err(RelayError::Validation(
         "working duration exceeds calendar search limit".into(),
     ))
 }
@@ -146,7 +146,7 @@ pub fn parse_workdays(value: &str) -> Result<Vec<Workday>> {
     days.sort();
     days.dedup();
     if days.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "working days cannot be empty".into(),
         ));
     }
@@ -182,7 +182,7 @@ impl From<Weekday> for Workday {
 }
 
 impl FromStr for Workday {
-    type Err = MambaError;
+    type Err = RelayError;
 
     fn from_str(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -193,7 +193,7 @@ impl FromStr for Workday {
             "fri" | "friday" | "周五" => Ok(Self::Friday),
             "sat" | "saturday" | "周六" => Ok(Self::Saturday),
             "sun" | "sunday" | "周日" | "周天" => Ok(Self::Sunday),
-            _ => Err(MambaError::Validation(format!("unknown workday `{value}`"))),
+            _ => Err(RelayError::Validation(format!("unknown workday `{value}`"))),
         }
     }
 }

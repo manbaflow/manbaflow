@@ -1,8 +1,8 @@
-# MambaFlow Human Interaction Gateway
+# Relay Human Interaction Gateway
 
-Interaction Gateway 把聊天工具里的按钮动作还原为一个经过验证的 MambaFlow Human 操作。它不会相信请求
+Interaction Gateway 把聊天工具里的按钮动作还原为一个经过验证的 Relay Human 操作。它不会相信请求
 Body 自报的用户名：供应商请求先验签，外部用户 ID 再通过 append-only 身份绑定解析为 Human Principal，
-最后继续执行 MambaFlow 原有的 Assignment、Recipient 和 Escalation 权限检查。
+最后继续执行 Relay 原有的 Assignment、Recipient 和 Escalation 权限检查。
 
 ## 身份绑定
 
@@ -10,14 +10,14 @@ Body 自报的用户名：供应商请求先验签，外部用户 ID 再通过 a
 同时代表多个人：
 
 ```bash
-mamba principal identity bind \
-  --for 佐巴扬 \
+relay principal identity bind \
+  --for 李伟 \
   --provider slack \
   --external-user U0123456789 \
   --by admin
 
-mamba principal identity list --for 佐巴扬
-mamba principal identity unbind XID-xxxxxxxx --by admin
+relay principal identity list --for 李伟
+relay principal identity unbind XID-xxxxxxxx --by admin
 ```
 
 解绑不会删除历史。每条 `external_interaction.processed` 回执都保留当时解析出的 Principal、动作、目标和
@@ -27,24 +27,24 @@ Provider Delivery ID。
 
 Slack Connector 会在以下 Block Kit 消息中加入按钮：
 
-- `work_request.sent`：`接球`，执行 `task.accept`；
+- `work_request.sent`：`接单`，执行 `task.accept`；
 - 要求回执的 `flow_message.posted`：`确认收到`，执行 `message.ack`；
 - `tracking.escalation_raised`：`接手处理`，执行 `escalation.ack`。
 
 在 Slack App 的 Interactivity 中把 Request URL 设置为：
 
 ```text
-https://mamba.example.com/api/v1/connectors/slack/actions
+https://relay.example.com/api/v1/connectors/slack/actions
 ```
 
 然后在 Control Plane 进程配置同一个 App 的 Signing Secret：
 
 ```bash
-export MAMBA_SLACK_SIGNING_SECRET='replace-with-slack-signing-secret'
-mamba serve --bind 127.0.0.1:7777
+export RELAY_SLACK_SIGNING_SECRET='replace-with-slack-signing-secret'
+relay serve --bind 127.0.0.1:7777
 ```
 
-MambaFlow 使用原始 `application/x-www-form-urlencoded` Body 验证 `X-Slack-Signature`，签名原文为
+Relay 使用原始 `application/x-www-form-urlencoded` Body 验证 `X-Slack-Signature`，签名原文为
 `v0:{timestamp}:{raw_body}`，并拒绝超过五分钟的请求。同一请求的稳定摘要作为 Delivery ID，因此 Slack
 重试不会重复执行按钮动作。
 
@@ -74,19 +74,19 @@ POST /api/v1/connectors/interactions
 允许的动作是 `task.accept`、`task.reject`、`message.ack` 和 `escalation.ack`。`task.reject` 必须提供非空
 `reason`。最终验收、Flow 批准、改派和 Agent 写入授权没有放进聊天按钮允许列表。
 
-Bridge 与 MambaFlow 之间使用独立密钥：
+Bridge 与 Relay 之间使用独立密钥：
 
 ```bash
-export MAMBA_INTERACTION_WEBHOOK_SECRET='replace-with-a-random-secret'
+export RELAY_INTERACTION_WEBHOOK_SECRET='replace-with-a-random-secret'
 ```
 
 请求头：
 
 ```text
-x-mamba-provider: feishu
-x-mamba-delivery-id: feishu-event-xxxxxxxx
-x-mamba-timestamp: 1784278800
-x-mamba-signature: v1,<base64-hmac-sha256>
+x-relay-provider: feishu
+x-relay-delivery-id: feishu-event-xxxxxxxx
+x-relay-timestamp: 1784278800
+x-relay-signature: v1,<base64-hmac-sha256>
 ```
 
 签名原文是：
@@ -95,7 +95,7 @@ x-mamba-signature: v1,<base64-hmac-sha256>
 provider + "." + delivery_id + "." + timestamp + "." + raw_request_body
 ```
 
-Bridge 必须为每个供应商事件使用稳定且唯一的 Delivery ID。MambaFlow 在五分钟窗口内验签，并将动作事件与
+Bridge 必须为每个供应商事件使用稳定且唯一的 Delivery ID。Relay 在五分钟窗口内验签，并将动作事件与
 回执放进同一个 SQLite 事务；重放返回原回执且不产生新事件。
 
 ## 可见性

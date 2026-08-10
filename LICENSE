@@ -1,21 +1,16 @@
-MIT License
+内部项目授权声明
 
-Copyright (c) 2026 MambaFlow contributors
+版权所有 (c) 2026
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+本仓库为公司内部项目，包含源代码、文档、配置与部署脚本。
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+授权范围：
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. 仅授权公司在册员工及经书面批准的合作方，为公司内部业务目的使用、复制和修改本项目。
+2. 未经书面批准，不得向公司外部分发、发布、转授权本项目的任何部分，也不得将其用于
+   公司业务之外的目的。
+3. 本项目可能包含内部服务地址、组织结构、业务流程等非公开信息，处理时按公司信息分级
+   要求执行。凭据与密钥不得写入本仓库。
+4. 员工离职或合作方合作终止后，上述授权自动失效。
+
+本项目按“现状”提供，不附带任何明示或默示担保。

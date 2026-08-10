@@ -1,4 +1,4 @@
-name: manbaflow
+name: relay
 
 services:
   postgres:
@@ -20,8 +20,8 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  mamba:
-    image: ${MAMBA_IMAGE:-manbaflow:local}
+  relay:
+    image: ${RELAY_IMAGE:-relay:local}
     build:
       context: .
       dockerfile: Dockerfile
@@ -29,18 +29,18 @@ services:
     env_file:
       - .env
     environment:
-      MAMBA_DATABASE_URL_FILE: /run/secrets/mamba-database-url
+      RELAY_DATABASE_URL_FILE: /run/secrets/relay-database-url
     secrets:
-      - mamba-database-url
+      - relay-database-url
     command:
       - serve
       - --bind
       - 0.0.0.0:7777
       - --allow-insecure-public-http
     ports:
-      - 127.0.0.1:${MAMBA_PORT:-7777}:7777
+      - 127.0.0.1:${RELAY_PORT:-7777}:7777
     volumes:
-      - mamba-data:/var/lib/manbaflow
+      - relay-data:/var/lib/relay
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
@@ -55,9 +55,9 @@ services:
     profiles: ["hosted"]
     restart: unless-stopped
     environment:
-      MAMBA_DOMAIN: ${MAMBA_DOMAIN:-localhost}
+      RELAY_DOMAIN: ${RELAY_DOMAIN:-localhost}
     depends_on:
-      mamba:
+      relay:
         condition: service_healthy
     ports:
       - 80:80
@@ -72,10 +72,10 @@ services:
 
 volumes:
   postgres-data:
-  mamba-data:
+  relay-data:
   caddy-data:
   caddy-config:
 
 secrets:
-  mamba-database-url:
-    file: ${MAMBA_DATABASE_URL_SECRET_FILE:-./deploy/secrets/database-url}
+  relay-database-url:
+    file: ${RELAY_DATABASE_URL_SECRET_FILE:-./deploy/secrets/database-url}

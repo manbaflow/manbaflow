@@ -19,13 +19,13 @@ compose() {
 }
 
 start_stack() {
-    domain=$(env_value MAMBA_DOMAIN)
-    database_mode=$(env_value MAMBA_DATABASE_MODE)
+    domain=$(env_value RELAY_DOMAIN)
+    database_mode=$(env_value RELAY_DATABASE_MODE)
     profiles=
     if [ "$database_mode" = local ]; then
         profiles="--profile local-db"
     elif [ "$database_mode" != external ]; then
-        printf '%s\n' 'MAMBA_DATABASE_MODE must be local or external' >&2
+        printf '%s\n' 'RELAY_DATABASE_MODE must be local or external' >&2
         exit 1
     fi
     if [ -n "$domain" ]; then
@@ -38,7 +38,7 @@ start_stack() {
 }
 
 backup_database() {
-    database_mode=$(env_value MAMBA_DATABASE_MODE)
+    database_mode=$(env_value RELAY_DATABASE_MODE)
     if [ "$database_mode" != local ]; then
         printf '%s\n' 'external PostgreSQL backups must be created and verified with the database provider' >&2
         exit 1
@@ -47,7 +47,7 @@ backup_database() {
     database=$(env_value POSTGRES_DB)
     timestamp=$(date -u +%Y%m%dT%H%M%SZ)
     directory="$ROOT/backups"
-    output=${1:-"$directory/manbaflow-$timestamp.dump"}
+    output=${1:-"$directory/relay-$timestamp.dump"}
     mkdir -p "$(dirname -- "$output")"
     [ ! -e "$output" ] || { printf 'backup already exists: %s\n' "$output" >&2; exit 1; }
     compose --profile local-db exec -T postgres pg_dump -U "$user" -d "$database" --format=custom >"$output"
@@ -74,7 +74,7 @@ case "$command" in
         backup_database "${2:-}"
         ;;
     upgrade)
-        database_mode=$(env_value MAMBA_DATABASE_MODE)
+        database_mode=$(env_value RELAY_DATABASE_MODE)
         case "$database_mode" in
             local)
                 backup_database
@@ -86,15 +86,15 @@ case "$command" in
                 fi
                 ;;
             *)
-                printf '%s\n' 'MAMBA_DATABASE_MODE must be local or external' >&2
+                printf '%s\n' 'RELAY_DATABASE_MODE must be local or external' >&2
                 exit 1
                 ;;
         esac
-        image=$(env_value MAMBA_IMAGE)
-        if [ "$image" = "manbaflow:local" ]; then
-            compose build --pull mamba
+        image=$(env_value RELAY_IMAGE)
+        if [ "$image" = "relay:local" ]; then
+            compose build --pull relay
         else
-            compose pull mamba
+            compose pull relay
         fi
         start_stack
         ;;

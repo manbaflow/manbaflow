@@ -1,6 +1,6 @@
 const API = "/api/v1";
 const state = {
-  token: sessionStorage.getItem("mambaflow_token") || "",
+  token: sessionStorage.getItem("relay_token") || "",
   authenticated: false,
   dashboard: null,
   recoveryFlight: null,
@@ -346,7 +346,7 @@ async function approveFlow(flowId) {
     setStatus(`正在批准 ${flowId}...`);
     await api(`/flows/${encodeURIComponent(flowId)}/approve`, { method: "POST" });
     await loadDashboard(false);
-    setStatus(`${flowId} 已批准并完成传球`);
+    setStatus(`${flowId} 已批准并完成派发`);
   } catch (error) { setStatus(error.message, true); }
 }
 
@@ -402,7 +402,7 @@ function formatBytes(value) {
 $("#auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   state.token = $("#token").value.trim();
-  sessionStorage.setItem("mambaflow_token", state.token);
+  sessionStorage.setItem("relay_token", state.token);
   $("#auth-dialog").close();
   await loadDashboard();
 });
@@ -411,19 +411,22 @@ $("#auth-dialog").addEventListener("cancel", (event) => {
   if (!state.authenticated) event.preventDefault();
 });
 
-$("#oidc-login").addEventListener("click", () => {
+function startLogin(path) {
   const tenant = $("#sso-tenant").value.trim();
   const query = new URLSearchParams({ return_to: "/console" });
   if (tenant) query.set("tenant", tenant);
-  window.location.assign(`/auth/oidc/login?${query}`);
-});
+  window.location.assign(`${path}?${query}`);
+}
+
+$("#feishu-login").addEventListener("click", () => startLogin("/auth/feishu/login"));
+$("#oidc-login").addEventListener("click", () => startLogin("/auth/oidc/login"));
 
 $("#refresh").addEventListener("click", () => loadDashboard());
 $("#logout").addEventListener("click", async () => {
   await fetch("/auth/logout", { method: "POST" });
   state.token = "";
   state.authenticated = false;
-  sessionStorage.removeItem("mambaflow_token");
+  sessionStorage.removeItem("relay_token");
   $("#identity").textContent = "未连接";
   openAuth();
 });

@@ -1,16 +1,16 @@
 use chrono::Utc;
 
-use super::MambaApp;
+use super::RelayApp;
 use super::authority::Permission;
 use crate::domain::{
     ExternalIdentityBinding, ExternalInteractionAction, ExternalInteractionReceipt,
     ExternalInteractionResult, PrincipalKind,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 
-impl MambaApp {
+impl RelayApp {
     pub fn bind_external_identity(
         &mut self,
         provider: &str,
@@ -29,7 +29,7 @@ impl MambaApp {
             self.ensure_permission(actor, Permission::PrincipalManage)?;
         }
         if principal.kind != PrincipalKind::Human || !principal.active {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "external identities can only bind to an active Human principal".into(),
             ));
         }
@@ -39,7 +39,7 @@ impl MambaApp {
                 && (binding.external_user_id == external_user_id
                     || binding.principal_id == principal.id)
         }) {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "active {provider} identity is already bound"
             )));
         }
@@ -72,7 +72,7 @@ impl MambaApp {
             .external_identities
             .get(binding_id)
             .filter(|binding| binding.is_active())
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "active external identity binding",
                 id: binding_id.to_string(),
             })?
@@ -121,7 +121,7 @@ impl MambaApp {
                 || receipt.target_id != target_id
                 || receipt.reason != reason
             {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "external interaction delivery ID collision: {key}"
                 )));
             }
@@ -136,7 +136,7 @@ impl MambaApp {
             .clone();
         let principal = self.state.principal(&binding.principal_id)?.clone();
         if principal.kind != PrincipalKind::Human || !principal.active {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "external interaction requires an active Human binding".into(),
             ));
         }
@@ -151,7 +151,7 @@ impl MambaApp {
             }
             ExternalInteractionAction::TaskReject => {
                 let reason = reason.as_deref().ok_or_else(|| {
-                    MambaError::Validation("task.reject requires a reason".into())
+                    RelayError::Validation("task.reject requires a reason".into())
                 })?;
                 let (flow_id, _, event) =
                     self.prepare_task_reject(&target_id, &principal.name, reason)?;
@@ -202,7 +202,7 @@ fn normalize_external_provider(value: &str) -> Result<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "external provider must contain only letters, digits, _ or -".into(),
         ));
     }
@@ -213,7 +213,7 @@ fn validate_external_value(value: &str, label: &str, max_chars: usize) -> Result
     let value = value.trim();
     if value.is_empty() || value.chars().count() > max_chars || value.chars().any(char::is_control)
     {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} must contain 1 to {max_chars} printable characters"
         )));
     }

@@ -1,16 +1,16 @@
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::MambaApp;
+use super::RelayApp;
 use crate::domain::{
     FlightLeaseStatus, OfficeProvider, OfficeReleasePayload, OfficeReleaseRequest,
     OfficeReleaseResult, OfficeReleaseStatus, PrincipalKind, TaskStatus,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 
-impl MambaApp {
+impl RelayApp {
     pub fn request_office_release(
         &mut self,
         task_id: &str,
@@ -21,7 +21,7 @@ impl MambaApp {
         let principal = self.state.principal(actor)?.clone();
         let (flow, task) = self.task_snapshot(task_id)?;
         if !matches!(task.status, TaskStatus::InProgress | TaskStatus::Submitted) {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "task {} is {:?}, expected in_progress or submitted",
                 task.id, task.status
             )));
@@ -74,7 +74,7 @@ impl MambaApp {
         if let Some(flow_id) = flow_id {
             let flow = self.state.flow(flow_id)?;
             if !self.principal_has_flow_access(flow, principal) {
-                return Err(MambaError::PermissionDenied(format!(
+                return Err(RelayError::PermissionDenied(format!(
                     "{} cannot access flow {}",
                     principal.name, flow.id
                 )));
@@ -234,7 +234,7 @@ impl MambaApp {
             .office_releases
             .get(release_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "Office release",
                 id: release_id.to_string(),
             })?;
@@ -270,7 +270,7 @@ impl MambaApp {
             .office_releases
             .get(release_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "Office release",
                 id: release_id.to_string(),
             })?;
@@ -280,7 +280,7 @@ impl MambaApp {
             || !reviewer.active
             || (flow.demand.requester != reviewer.id && flow.demand.requester != reviewer.name)
         {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "only the Human Demand Requester can release Office side effects".into(),
             ));
         }
@@ -306,7 +306,7 @@ fn validate_office_payload(
             validate_text(parent_id, "drive parent", 500)?;
             let file_name = validate_text(file_name, "drive file name", 200)?;
             if file_name.contains(['/', '\\']) || matches!(file_name.as_str(), "." | "..") {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "drive file name must not contain path separators".into(),
                 ));
             }
@@ -314,7 +314,7 @@ fn validate_office_payload(
                 validate_text(file_id, "drive file ID", 500)?;
             }
             if provider == OfficeProvider::Microsoft365 && file_id.is_some() {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "Microsoft 365 drive uploads target the approved parent and file name".into(),
                 ));
             }
@@ -322,24 +322,24 @@ fn validate_office_payload(
                 state
                     .staged_artifacts
                     .get(artifact_id)
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "staged artifact",
                         id: artifact_id.clone(),
                     })?;
             if artifact.task_id != task_id {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "Office release artifact belongs to another task".into(),
                 ));
             }
             let lease = state
                 .flight_leases
                 .get(&artifact.flight_lease_id)
-                .ok_or_else(|| MambaError::NotFound {
+                .ok_or_else(|| RelayError::NotFound {
                     entity: "flight lease",
                     id: artifact.flight_lease_id.clone(),
                 })?;
             if lease.status != FlightLeaseStatus::Landed {
-                return Err(MambaError::InvalidTransition(
+                return Err(RelayError::InvalidTransition(
                     "Office artifact can only be released after its flight landed".into(),
                 ));
             }
@@ -360,7 +360,7 @@ fn validate_office_payload(
             validate_text(subject, "email subject", 500)?;
             validate_body(body, "email body", 100_000)?;
             if to.len() + cc.len() + bcc.len() > 100 {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "email release cannot contain more than 100 recipients".into(),
                 ));
             }
@@ -384,13 +384,13 @@ fn validate_office_payload(
             validate_body(body, "calendar body", 100_000)?;
             validate_text(time_zone, "calendar time zone", 100)?;
             if end <= start || end.signed_duration_since(*start) > chrono::Duration::days(31) {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "calendar event must end after it starts and last at most 31 days".into(),
                 ));
             }
             validate_addresses(attendees, "calendar attendee", false)?;
             if attendees.len() > 100 {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "calendar release cannot contain more than 100 attendees".into(),
                 ));
             }
@@ -404,7 +404,7 @@ fn validate_office_payload(
 
 fn validate_addresses(values: &[String], label: &str, required: bool) -> Result<()> {
     if required && values.is_empty() {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} requires at least one address"
         )));
     }
@@ -416,7 +416,7 @@ fn validate_addresses(values: &[String], label: &str, required: bool) -> Result<
             || parts.next().is_some()
             || value.chars().any(char::is_whitespace)
         {
-            return Err(MambaError::Validation(format!("invalid {label}: {value}")));
+            return Err(RelayError::Validation(format!("invalid {label}: {value}")));
         }
     }
     Ok(())
@@ -425,7 +425,7 @@ fn validate_addresses(values: &[String], label: &str, required: bool) -> Result<
 fn validate_text(value: &str, label: &str, max: usize) -> Result<String> {
     let value = value.trim();
     if value.is_empty() || value.chars().count() > max || value.chars().any(char::is_control) {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} must contain 1 to {max} printable characters"
         )));
     }
@@ -439,7 +439,7 @@ fn validate_body(value: &str, label: &str, max: usize) -> Result<()> {
             .chars()
             .any(|character| character.is_control() && !matches!(character, '\r' | '\n' | '\t'))
     {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} must contain 1 to {max} safe text characters"
         )));
     }

@@ -1,7 +1,6 @@
 .git
-.github
-.mambaflow
-.mambaflow-showcase
+.relay
+.relay-showcase
 .env
 backups
 deploy/secrets

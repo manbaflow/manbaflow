@@ -5,10 +5,10 @@ use std::process::Command as StdCommand;
 use tokio::process::Command;
 
 use crate::domain::ExecutionSandboxReport;
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
-pub const CONTAINER_OUTPUT: &str = "/mamba-output";
+pub const CONTAINER_OUTPUT: &str = "/relay-output";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxBackend {
@@ -74,16 +74,16 @@ impl DockerSandboxConfig {
             .output()
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    MambaError::ExecutorUnavailable(self.runtime.display().to_string())
+                    RelayError::ExecutorUnavailable(self.runtime.display().to_string())
                 } else {
-                    MambaError::ExternalConnector(format!(
+                    RelayError::ExternalConnector(format!(
                         "could not inspect Docker sandbox image: {error}"
                     ))
                 }
             })?;
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr);
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "Docker sandbox image {} is unavailable locally (--pull=never): {}",
                 self.image,
                 message.trim()
@@ -91,7 +91,7 @@ impl DockerSandboxConfig {
         }
         let image_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !valid_sha256_id(&image_id) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "Docker image inspect did not return a sha256 image ID".into(),
             ));
         }
@@ -106,7 +106,7 @@ impl DockerSandboxConfig {
 
     fn validate(&self) -> Result<()> {
         if self.runtime.as_os_str().is_empty() {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "Docker runtime command cannot be empty".into(),
             ));
         }
@@ -116,39 +116,39 @@ impl DockerSandboxConfig {
             || self.image.chars().any(char::is_whitespace)
             || self.image.chars().any(char::is_control)
         {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "Docker sandbox image reference is invalid".into(),
             ));
         }
         if !(100..=64_000).contains(&self.cpus_millis) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "Docker CPU limit must be between 100 and 64000 millicores".into(),
             ));
         }
         if !(128..=262_144).contains(&self.memory_mb) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "Docker memory limit must be between 128 and 262144 MiB".into(),
             ));
         }
         if !(16..=32_768).contains(&self.pids_limit) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "Docker PID limit must be between 16 and 32768".into(),
             ));
         }
         if !(16..=16_384).contains(&self.tmpfs_mb) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "Docker tmpfs limit must be between 16 and 16384 MiB".into(),
             ));
         }
         if self.environment.len() > 64 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "Docker sandbox can forward at most 64 environment variables".into(),
             ));
         }
         for name in &self.environment {
             validate_environment_name(name)?;
             if std::env::var_os(name).is_none() {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "sandbox environment variable is not set: {name}"
                 )));
             }
@@ -198,7 +198,7 @@ impl ResolvedDockerSandbox {
             .arg("--name")
             .arg(spec.name)
             .arg("--label")
-            .arg(format!("io.manbaflow.flight={}", spec.name))
+            .arg(format!("io.relay.flight={}", spec.name))
             .arg("--read-only")
             .arg("--cap-drop=ALL")
             .arg("--security-opt=no-new-privileges=true")
@@ -223,11 +223,11 @@ impl ResolvedDockerSandbox {
             .arg("--mount")
             .arg(output_mount)
             .arg("--env")
-            .arg("HOME=/tmp/mamba-home")
+            .arg("HOME=/tmp/relay-home")
             .arg("--env")
-            .arg("XDG_CONFIG_HOME=/tmp/mamba-home/.config")
+            .arg("XDG_CONFIG_HOME=/tmp/relay-home/.config")
             .arg("--env")
-            .arg("CODEX_HOME=/tmp/mamba-home/.codex")
+            .arg("CODEX_HOME=/tmp/relay-home/.codex")
             .arg("--env")
             .arg("DISABLE_AUTOUPDATER=1")
             .arg("--env")
@@ -271,7 +271,7 @@ impl Drop for DockerContainerGuard {
         let runtime = self.runtime.clone();
         let name = self.name.clone();
         let _ = std::thread::Builder::new()
-            .name("mamba-container-reaper".into())
+            .name("relay-container-reaper".into())
             .spawn(move || {
                 let _ = StdCommand::new(runtime)
                     .args(["container", "rm", "--force"])
@@ -283,11 +283,11 @@ impl Drop for DockerContainerGuard {
 
 fn canonical_mount(path: &Path, label: &str) -> Result<PathBuf> {
     let path = path.canonicalize().map_err(|_| {
-        MambaError::Validation(format!("{label} does not exist: {}", path.display()))
+        RelayError::Validation(format!("{label} does not exist: {}", path.display()))
     })?;
     let display = path.to_string_lossy();
     if display.contains(',') || display.contains(['\n', '\r']) {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} contains characters unsupported by Docker --mount"
         )));
     }
@@ -296,7 +296,7 @@ fn canonical_mount(path: &Path, label: &str) -> Result<PathBuf> {
 
 fn validate_environment_name(name: &str) -> Result<()> {
     const DENIED: &[&str] = &[
-        "MAMBA_TOKEN",
+        "RELAY_TOKEN",
         "DOCKER_HOST",
         "DOCKER_TLS_VERIFY",
         "DOCKER_CERT_PATH",
@@ -311,7 +311,7 @@ fn validate_environment_name(name: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         || DENIED.contains(&name)
     {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "sandbox environment name is invalid or denied: {name}"
         )));
     }
@@ -320,14 +320,14 @@ fn validate_environment_name(name: &str) -> Result<()> {
 
 fn validate_user(user: &str) -> Result<()> {
     let Some((uid, gid)) = user.split_once(':') else {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "Docker sandbox user must use numeric UID:GID".into(),
         ));
     };
     let valid = uid.parse::<u32>().is_ok_and(|value| value > 0)
         && gid.parse::<u32>().is_ok_and(|value| value > 0);
     if !valid {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "Docker sandbox user must use non-root numeric UID:GID".into(),
         ));
     }
@@ -344,12 +344,12 @@ fn current_user() -> Result<String> {
 
 fn id_value(flag: &str) -> Result<String> {
     let output = StdCommand::new("id").arg(flag).output().map_err(|_| {
-        MambaError::Validation(
+        RelayError::Validation(
             "could not determine host UID/GID; pass --sandbox-user UID:GID".into(),
         )
     })?;
     if !output.status.success() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "could not determine host UID/GID; pass --sandbox-user UID:GID".into(),
         ));
     }
@@ -363,7 +363,7 @@ fn validate_container_name(name: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "invalid Docker sandbox container name".into(),
         ));
     }
@@ -402,7 +402,7 @@ mod tests {
         };
         let command = sandbox
             .command(DockerRunSpec {
-                name: "mamba-WRUN-1",
+                name: "relay-WRUN-1",
                 workspace: &workspace,
                 workspace_writable: false,
                 output_dir: &output,
@@ -421,16 +421,16 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
         assert!(args.iter().any(|arg| arg.ends_with(",readonly")));
         assert!(args.contains(&format!("sha256:{}", "a".repeat(64))));
-        assert!(!args.iter().any(|arg| arg.contains("MAMBA_TOKEN")));
+        assert!(!args.iter().any(|arg| arg.contains("RELAY_TOKEN")));
         assert!(!args.iter().any(|arg| arg.contains("docker.sock")));
     }
 
     #[test]
     fn sensitive_or_implicit_environment_is_rejected() {
         let mut config = config();
-        config.environment = vec!["MAMBA_TOKEN".into()];
+        config.environment = vec!["RELAY_TOKEN".into()];
         assert!(config.validate().is_err());
-        config.environment = vec!["NOT_SET_FOR_MAMBA_SANDBOX_TEST".into()];
+        config.environment = vec!["NOT_SET_FOR_RELAY_SANDBOX_TEST".into()];
         assert!(config.validate().is_err());
     }
 
@@ -452,26 +452,30 @@ mod tests {
 
         drop(DockerContainerGuard {
             runtime,
-            name: "mamba-WRUN-cancelled".into(),
+            name: "relay-WRUN-cancelled".into(),
         });
 
-        for _ in 0..100 {
+        // Drop 里是异步起清理进程，这里只能轮询。窗口给到 5 秒：全量测试并行跑满 CPU 时，
+        // 原来的 1 秒会偶发超时，在 CI 上尤其明显。成功路径仍然立刻返回，不影响耗时。
+        for _ in 0..500 {
             if marker.is_file() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let invocation = std::fs::read_to_string(marker).unwrap();
+        let invocation = std::fs::read_to_string(&marker).unwrap_or_else(|error| {
+            panic!("清理进程没有在 5 秒内写出 {}：{error}", marker.display())
+        });
         assert_eq!(
             invocation.lines().collect::<Vec<_>>(),
-            ["container", "rm", "--force", "mamba-WRUN-cancelled"]
+            ["container", "rm", "--force", "relay-WRUN-cancelled"]
         );
     }
 
     fn config() -> DockerSandboxConfig {
         DockerSandboxConfig {
             runtime: "docker".into(),
-            image: "manbaflow-agent-runtime:0.1.0".into(),
+            image: "relay-agent-runtime:0.1.0".into(),
             network: SandboxNetwork::None,
             cpus_millis: 2_000,
             memory_mb: 4_096,

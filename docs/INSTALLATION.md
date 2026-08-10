@@ -1,7 +1,7 @@
-# MambaFlow 团队安装
+# Relay 团队安装
 
 这套安装路径只创建真实的组织、首个团队、Tenant 管理员和登录 Token，不写入任何 Showcase Flow。
-默认部署包含 PostgreSQL 18、MambaFlow Control Plane 和持久卷；公网模式额外启动 Caddy，自动申请和续期
+默认部署包含 PostgreSQL 18、Relay Control Plane 和持久卷；公网模式额外启动 Caddy，自动申请和续期
 TLS 证书。
 
 ## 1. 前置条件
@@ -12,7 +12,7 @@ TLS 证书。
 - 建议至少 2 CPU、4 GiB 内存和 20 GiB 可用磁盘。
 
 公网部署还需要一台有公网地址的服务器、一个已经指向该服务器的域名，以及开放入站 `80/tcp`、
-`443/tcp` 和 `443/udp`。MambaFlow 的 `7777` 端口始终只绑定宿主机 loopback。
+`443/tcp` 和 `443/udp`。Relay 的 `7777` 端口始终只绑定宿主机 loopback。
 
 ## 2. 一条命令安装
 
@@ -38,6 +38,19 @@ TLS 证书。
   --utc-offset +08:00
 ```
 
+如果目标是一台远程服务器，可以直接在本地开发机运行一键远程部署脚本，它会自动安装服务器依赖
+（Docker / Compose / rsync）、同步仓库、执行上述安装器，并给出浏览器访问用的 SSH 隧道命令：
+
+```bash
+./deploy/remote-install.sh            # 交互式一键安装（幂等）
+./deploy/remote-install.sh upgrade    # 同步代码并滚动升级
+./deploy/remote-install.sh tunnel     # 打开 http://127.0.0.1:7777/console 的访问隧道
+./deploy/remote-install.sh status     # 代理到服务器上的 manage.sh
+```
+
+服务器地址、SSH 私钥与组织参数首次交互输入后保存在 `deploy/.remote-install.env`（0600，Git 忽略），
+也可用同名环境变量覆盖。
+
 浏览器打开 `http://127.0.0.1:7777/console`，输入安装时只显示一次的 Token。`.env` 包含数据库 Secret，
 安装器会创建为 `0600` 且 Git 默认忽略；仍应把 Token 放进密码管理器，不要放进聊天、Issue 或仓库。
 
@@ -54,11 +67,11 @@ TLS 证书。
   --utc-offset +08:00
 ```
 
-Caddy 监听 `80/443` 并反向代理到仅容器网络可见的 Control Plane。安装器只等待 MambaFlow 内部健康；
+Caddy 监听 `80/443` 并反向代理到仅容器网络可见的 Control Plane。安装器只等待 Relay 内部健康；
 首次证书签发还可能需要几十秒，可通过 `./deploy/manage.sh logs caddy` 查看。公网地址为
 `https://flow.example.com/console`。
 
-不要把 Compose 中的 MambaFlow 端口改成 `0.0.0.0:7777`。如果使用云负载均衡器、Kubernetes Ingress
+不要把 Compose 中的 Relay 端口改成 `0.0.0.0:7777`。如果使用云负载均衡器、Kubernetes Ingress
 或公司现有网关，可以不启用 Caddy profile，但必须在可信 TLS 入口后转发到 `7777`。
 
 ## 4. 使用远程 PostgreSQL
@@ -67,13 +80,13 @@ RDS、Cloud SQL、Azure Database for PostgreSQL、Supabase 或公司 PostgreSQL 
 先把经过 URL 编码的连接串写入权限为 `0600` 的单行文件，生产环境应要求 TLS：
 
 ```bash
-install -m 0600 /dev/null /secure/manbaflow-database-url
+install -m 0600 /dev/null /secure/relay-database-url
 printf '%s\n' \
-  'postgresql://mamba:ENCODED_PASSWORD@db.example.com/manbaflow?sslmode=require' \
-  > /secure/manbaflow-database-url
+  'postgresql://relay:ENCODED_PASSWORD@db.example.com/relay?sslmode=require' \
+  > /secure/relay-database-url
 
 ./deploy/install.sh \
-  --database-url-file /secure/manbaflow-database-url \
+  --database-url-file /secure/relay-database-url \
   --organization "Acme" \
   --administrator "Alice" \
   --team "Platform" \
@@ -81,14 +94,14 @@ printf '%s\n' \
 ```
 
 安装器把内容复制到 Git 和 Docker build context 都会忽略的 `deploy/secrets/database-url`，以只读 Docker
-Secret 挂载到 `/run/secrets/mamba-database-url`。应用只获得文件路径，不把连接串放进容器环境列表或
+Secret 挂载到 `/run/secrets/relay-database-url`。应用只获得文件路径，不把连接串放进容器环境列表或
 命令参数。Secret 目录权限为 `0700`；其中的文件需要让容器内非 root UID `10001` 可读，但宿主机其他
 用户无法穿过父目录。`--database-url URL` 也受支持，但会留在 shell history，生产环境优先使用文件参数。
 
 远程数据库必须满足：
 
-- 从 MambaFlow 容器网络可达；连接串中的 `127.0.0.1` 指向容器自身，通常不是数据库宿主机；
-- 使用独立数据库和最小权限账号，允许 MambaFlow 创建/修改自己的表、索引和事务锁；
+- 从 Relay 容器网络可达；连接串中的 `127.0.0.1` 指向容器自身，通常不是数据库宿主机；
+- 使用独立数据库和最小权限账号，允许 Relay 创建/修改自己的表、索引和事务锁；
 - 启用服务端证书校验，并按供应商要求设置 `sslmode=require` 或更严格模式；
 - 在启用前配置自动快照、PITR、保留期、监控和连接数上限。
 
@@ -108,19 +121,19 @@ Secret 挂载到 `/run/secrets/mamba-database-url`。应用只获得文件路径
 一次性 CLI 容器添加成员：
 
 ```bash
-docker compose run --rm mamba team add \
+docker compose run --rm relay team add \
   --name Engineering \
   --capabilities "backend,rust,quality" \
   --by Alice
 
-docker compose run --rm mamba principal add \
+docker compose run --rm relay principal add \
   --name Bob \
   --kind human \
   --team Engineering \
   --capabilities "backend,rust" \
   --by Alice
 
-docker compose run --rm mamba principal token issue \
+docker compose run --rm relay principal token issue \
   --for Bob \
   --label browser \
   --ttl-days 30 \
@@ -132,10 +145,10 @@ docker compose run --rm mamba principal token issue \
 组织看板时，由 Tenant Admin 明确授予 `manager`：
 
 ```bash
-docker compose run --rm mamba principal role grant \
+docker compose run --rm relay principal role grant \
   --for Bob --role manager --by Alice
 
-docker compose run --rm mamba principal calendar set \
+docker compose run --rm relay principal calendar set \
   --for Bob --utc-offset +08:00 \
   --days mon,tue,wed,thu,fri --start 09:00 --end 18:00 \
   --by Alice
@@ -144,8 +157,8 @@ docker compose run --rm mamba principal calendar set \
 Token 丢失或成员离开时先列出 Credential ID，再撤销；Ledger 只保存摘要，无法找回原 Token：
 
 ```bash
-docker compose run --rm mamba principal token list --for Bob
-docker compose run --rm mamba principal token revoke CRED-xxxxxxxx --by Alice
+docker compose run --rm relay principal token list --for Bob
+docker compose run --rm relay principal token revoke CRED-xxxxxxxx --by Alice
 ```
 
 小团队可以按上述方式逐人加入。企业目录应接入 [OIDC / SCIM](IDENTITY.md)：SCIM 创建、调组和停用 Human，
@@ -155,7 +168,7 @@ Session 失效。
 个人 Agent 也使用独立身份：
 
 ```bash
-docker compose run --rm mamba principal add \
+docker compose run --rm relay principal add \
   --name "Bob 的 Codex" \
   --kind agent \
   --team Engineering \
@@ -163,7 +176,7 @@ docker compose run --rm mamba principal add \
   --capabilities "backend,rust,quality" \
   --by Alice
 
-docker compose run --rm mamba principal token issue \
+docker compose run --rm relay principal token issue \
   --for "Bob 的 Codex" \
   --label workstation \
   --ttl-days 30 \
@@ -179,7 +192,7 @@ Human Token 混用。Remote Worker 的 Docker Runtime、模型凭据和启动方
 ```bash
 ./deploy/manage.sh status
 ./deploy/manage.sh logs
-./deploy/manage.sh logs mamba
+./deploy/manage.sh logs relay
 ./deploy/manage.sh backup
 ./deploy/manage.sh stop
 ./deploy/manage.sh start
@@ -197,18 +210,25 @@ git pull --ff-only
 ./deploy/manage.sh upgrade
 ```
 
-`upgrade` 会先备份，再拉取基础镜像、重新构建并滚动重启。未来发布预构建镜像后，可在首次安装时传
-`--image registry.example.com/manbaflow/manbaflow:VERSION`；安装器和升级命令会改为 pull，不在服务器编译。
+`upgrade` 会先备份，再拉取基础镜像、重新构建并滚动重启。CI 已经把镜像推到内部 registry，因此更推荐
+在首次安装时直接指定镜像，让安装器和升级命令改为 pull，不在服务器上编译：
+
+```bash
+./deploy/install.sh --image registry.edumind.ai/platform/relay/main:latest ...
+```
+
+镜像标签规则见 [.gitlab-ci.yml](../.gitlab-ci.yml)：`main` / `master` / `release` 分支产出
+`<分支>:<版本>` 和 `<分支>:latest`，其余分支产出 `dev:<版本>`。
 
 `./deploy/manage.sh stop` 保留所有卷。只有明确确认永久删除内置数据库、Artifact 和 TLS 状态时，才手工
 执行 `docker compose --profile local-db --profile hosted down --volumes`。外部数据库不会被该命令删除。
 
 ## 7. Connector 与企业身份
 
-把实际启用的环境变量追加到 `.env`，再重新创建 MambaFlow 容器：
+把实际启用的环境变量追加到 `.env`，再重新创建 Relay 容器：
 
 ```bash
-docker compose up -d --force-recreate mamba
+docker compose up -d --force-recreate relay
 ```
 
 不要保留空的 Connector 变量；空值会被配置校验拒绝。示例名称见 [.env.example](../.env.example)。
@@ -223,14 +243,14 @@ docker compose up -d --force-recreate mamba
 
 ## 8. 托管服务模式
 
-当前仓库没有运行中的官方 MambaFlow SaaS，但同一二进制已经支持 PostgreSQL 多副本和 Tenant 隔离，
+当前仓库没有运行中的官方 Relay SaaS，但同一二进制已经支持 PostgreSQL 多副本和 Tenant 隔离，
 运营方可以在一套 Control Plane 中为客户创建独立 Tenant：
 
 ```bash
-docker compose run --rm mamba tenant create \
+docker compose run --rm relay tenant create \
   --name "Customer A" --slug customer-a
 
-docker compose run --rm mamba --tenant customer-a setup \
+docker compose run --rm relay --tenant customer-a setup \
   --organization "Customer A" \
   --administrator "Customer Admin" \
   --team "Core Team" \

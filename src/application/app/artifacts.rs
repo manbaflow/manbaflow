@@ -3,16 +3,16 @@ use std::path::{Component, Path};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::MambaApp;
+use super::RelayApp;
 use crate::domain::{CapabilityPack, FlightDeliverable, FlightLeaseStatus, StagedArtifact};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 use crate::store::ArtifactBlob;
 
 pub const MAX_ARTIFACT_BYTES: usize = 25 * 1024 * 1024;
 
-impl MambaApp {
+impl RelayApp {
     pub fn stage_flight_artifact(
         &mut self,
         lease_id: &str,
@@ -27,34 +27,34 @@ impl MambaApp {
             .flight_leases
             .get(lease_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flight lease",
                 id: lease_id.to_string(),
             })?;
         if lease.principal_id != principal.id {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "flight lease {} belongs to another agent",
                 lease.id
             )));
         }
         if lease.status != FlightLeaseStatus::Active {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "flight lease {} is {:?}, expected active",
                 lease.id, lease.status
             )));
         }
         let manifest = lease.manifest.as_ref().ok_or_else(|| {
-            MambaError::Validation("artifact staging requires a FlightManifest".into())
+            RelayError::Validation("artifact staging requires a FlightManifest".into())
         })?;
         if manifest.capability_pack != CapabilityPack::Office {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "artifact staging is only available to Office flights".into(),
             ));
         }
         let path = validate_artifact_path(path)?;
         let media_type = validate_media_type(media_type)?;
         if content.is_empty() || content.len() > MAX_ARTIFACT_BYTES {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "artifact content must contain 1 to {MAX_ARTIFACT_BYTES} bytes"
             )));
         }
@@ -63,7 +63,7 @@ impl MambaApp {
             .extension()
             .and_then(|value| value.to_str())
             .map(str::to_ascii_lowercase)
-            .ok_or_else(|| MambaError::Validation("artifact path requires an extension".into()))?;
+            .ok_or_else(|| RelayError::Validation("artifact path requires an extension".into()))?;
         if !manifest.output_contract.allowed_extensions.is_empty()
             && !manifest
                 .output_contract
@@ -71,7 +71,7 @@ impl MambaApp {
                 .iter()
                 .any(|allowed| allowed.eq_ignore_ascii_case(&extension))
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "artifact extension .{extension} is outside the FlightManifest output contract"
             )));
         }
@@ -85,7 +85,7 @@ impl MambaApp {
             if existing.sha256 == sha256 && existing.media_type == media_type {
                 return Ok(existing.clone());
             }
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "artifact path {path} is already staged with immutable content"
             )));
         }
@@ -100,24 +100,24 @@ impl MambaApp {
                     .ok()
                     .and_then(|size| total.checked_add(size))
             })
-            .ok_or_else(|| MambaError::Validation("artifact staging budget overflow".into()))?;
+            .ok_or_else(|| RelayError::Validation("artifact staging budget overflow".into()))?;
         if staged_bytes
             .checked_add(content.len())
             .is_none_or(|total| total > MAX_ARTIFACT_BYTES)
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "Office flight artifacts exceed the {MAX_ARTIFACT_BYTES} byte staging budget"
             )));
         }
 
         let staged_at = Utc::now();
         let size_bytes = u64::try_from(content.len())
-            .map_err(|_| MambaError::Validation("artifact is too large".into()))?;
+            .map_err(|_| RelayError::Validation("artifact is too large".into()))?;
         self.store.put_artifact(&ArtifactBlob {
             sha256: sha256.clone(),
             media_type: media_type.clone(),
             size_bytes: i64::try_from(size_bytes)
-                .map_err(|_| MambaError::Validation("artifact is too large".into()))?,
+                .map_err(|_| RelayError::Validation("artifact is too large".into()))?,
             content,
             created_at: staged_at.to_rfc3339(),
         })?;
@@ -148,7 +148,7 @@ impl MambaApp {
             .state
             .flight_leases
             .get(lease_id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "flight lease",
                 id: lease_id.to_string(),
             })?;
@@ -174,13 +174,13 @@ impl MambaApp {
             .staged_artifacts
             .get(artifact_id)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "staged artifact",
                 id: artifact_id.to_string(),
             })?;
         self.ensure_flow_access(&artifact.flow_id, actor)?;
         let blob = self.store.load_artifact(&artifact.sha256)?.ok_or_else(|| {
-            MambaError::Validation(format!(
+            RelayError::Validation(format!(
                 "artifact {} content is missing from storage",
                 artifact.id
             ))
@@ -188,7 +188,7 @@ impl MambaApp {
         if blob.content.len() as u64 != artifact.size_bytes
             || sha256_hex(&blob.content) != artifact.sha256
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "artifact {} failed content integrity verification",
                 artifact.id
             )));
@@ -202,7 +202,7 @@ impl MambaApp {
         if self.principal_has_flow_access(flow, principal) {
             Ok(())
         } else {
-            Err(MambaError::PermissionDenied(format!(
+            Err(RelayError::PermissionDenied(format!(
                 "{} cannot access flow {}",
                 principal.name, flow.id
             )))
@@ -224,7 +224,7 @@ fn validate_artifact_path(value: &str) -> Result<String> {
             )
         })
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "artifact path must be a safe relative path of at most 240 characters".into(),
         ));
     }
@@ -240,7 +240,7 @@ fn validate_media_type(value: &str) -> Result<String> {
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "!#$&^_.+-/".contains(character))
     {
-        return Err(MambaError::Validation("invalid artifact media type".into()));
+        return Err(RelayError::Validation("invalid artifact media type".into()));
     }
     Ok(value)
 }

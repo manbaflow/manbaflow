@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::domain::ExternalArtifact;
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 pub const DEFAULT_GITLAB_URL: &str = "https://gitlab.com";
 const WEBHOOK_TOLERANCE_SECONDS: u64 = 300;
@@ -74,7 +74,7 @@ impl GitLabWebhookAuth {
         let legacy_token_hash = legacy_token
             .map(|token| {
                 if token.trim().is_empty() {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "GitLab legacy webhook token cannot be empty".into(),
                     ));
                 }
@@ -162,12 +162,12 @@ impl GitLabWebhookAuth {
 
 pub fn parse_webhook_event(body: &[u8], occurred_at: DateTime<Utc>) -> Result<GitLabWebhookEvent> {
     let envelope: WebhookEnvelope = serde_json::from_slice(body).map_err(|_| {
-        MambaError::Validation("GitLab webhook body is not a recognized JSON event".into())
+        RelayError::Validation("GitLab webhook body is not a recognized JSON event".into())
     })?;
     match envelope.object_kind.as_str() {
         "merge_request" => {
             let payload: MergeRequestWebhook = serde_json::from_slice(body).map_err(|_| {
-                MambaError::Validation("invalid GitLab merge request webhook payload".into())
+                RelayError::Validation("invalid GitLab merge request webhook payload".into())
             })?;
             let iid = payload.object_attributes.iid.to_string();
             let project_id = payload.project.id.to_string();
@@ -203,7 +203,7 @@ pub fn parse_webhook_event(body: &[u8], occurred_at: DateTime<Utc>) -> Result<Gi
         }
         "pipeline" => {
             let payload: PipelineWebhook = serde_json::from_slice(body).map_err(|_| {
-                MambaError::Validation("invalid GitLab pipeline webhook payload".into())
+                RelayError::Validation("invalid GitLab pipeline webhook payload".into())
             })?;
             let Some(merge_request) = payload.merge_request else {
                 return Ok(GitLabWebhookEvent::Ignored {
@@ -269,14 +269,14 @@ impl GitLabClient {
     pub fn new(base_url: &str, token: Option<&str>) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut api_base = Url::parse(base_url.trim())
-            .map_err(|_| MambaError::Validation("invalid GitLab URL".into()))?;
+            .map_err(|_| RelayError::Validation("invalid GitLab URL".into()))?;
         if !matches!(api_base.scheme(), "http" | "https") {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "GitLab URL must use http or https".into(),
             ));
         }
         if !api_base.username().is_empty() || api_base.password().is_some() {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "GitLab URL must not contain credentials; use GITLAB_TOKEN".into(),
             ));
         }
@@ -285,7 +285,7 @@ impl GitLabClient {
         let already_api = api_base.path().trim_end_matches('/').ends_with("/api/v4");
         if !already_api {
             let mut segments = api_base.path_segments_mut().map_err(|_| {
-                MambaError::Validation("GitLab URL cannot be used as an API base".into())
+                RelayError::Validation("GitLab URL cannot be used as an API base".into())
             })?;
             segments.pop_if_empty().push("api").push("v4");
         }
@@ -293,10 +293,10 @@ impl GitLabClient {
             api_base.set_path(&format!("{}/", api_base.path()));
         }
         let client = Client::builder()
-            .user_agent(concat!("MambaFlow/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("Relay/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| {
-                MambaError::ExternalConnector("could not initialize GitLab client".into())
+                RelayError::ExternalConnector("could not initialize GitLab client".into())
             })?;
         Ok(Self {
             client,
@@ -318,7 +318,7 @@ impl GitLabClient {
     ) -> Result<GitLabSnapshot> {
         validate_project(project)?;
         if merge_request_iid == 0 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "merge request IID must be greater than zero".into(),
             ));
         }
@@ -390,7 +390,7 @@ impl GitLabClient {
     fn endpoint(&self, segments: &[&str]) -> Result<Url> {
         let mut url = self.api_base.clone();
         let mut path = url.path_segments_mut().map_err(|_| {
-            MambaError::Validation("GitLab URL cannot be used as an API endpoint".into())
+            RelayError::Validation("GitLab URL cannot be used as an API endpoint".into())
         })?;
         path.pop_if_empty();
         for segment in segments {
@@ -406,14 +406,14 @@ impl GitLabClient {
             request = request.header("PRIVATE-TOKEN", token);
         }
         let response = request.send().await.map_err(|error| {
-            MambaError::ExternalConnector(format!("GitLab {operation} request failed: {error}"))
+            RelayError::ExternalConnector(format!("GitLab {operation} request failed: {error}"))
         })?;
         let status = response.status();
         if !status.is_success() {
             return Err(gitlab_status_error(operation, status));
         }
         response.json().await.map_err(|_| {
-            MambaError::ExternalConnector(format!(
+            RelayError::ExternalConnector(format!(
                 "GitLab {operation} returned an invalid JSON response"
             ))
         })
@@ -504,7 +504,7 @@ struct GitLabPipeline {
 
 fn validate_project(project: &str) -> Result<()> {
     if project.trim().is_empty() || project.trim() != project {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "GitLab project must be a numeric ID or namespace/project path".into(),
         ));
     }
@@ -513,13 +513,13 @@ fn validate_project(project: &str) -> Result<()> {
 
 fn parse_signing_token(token: &str) -> Result<Vec<u8>> {
     let encoded = token.strip_prefix("whsec_").ok_or_else(|| {
-        MambaError::Validation("GitLab webhook signing token must use the whsec_ format".into())
+        RelayError::Validation("GitLab webhook signing token must use the whsec_ format".into())
     })?;
     let key = BASE64_STANDARD.decode(encoded).map_err(|_| {
-        MambaError::Validation("GitLab webhook signing token is not valid base64".into())
+        RelayError::Validation("GitLab webhook signing token is not valid base64".into())
     })?;
     if key.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "GitLab webhook signing token cannot be empty".into(),
         ));
     }
@@ -553,8 +553,8 @@ fn body_delivery_id(body: &[u8]) -> String {
     id
 }
 
-fn webhook_denied() -> MambaError {
-    MambaError::PermissionDenied("invalid GitLab webhook authentication".into())
+fn webhook_denied() -> RelayError {
+    RelayError::PermissionDenied("invalid GitLab webhook authentication".into())
 }
 
 fn artifact_id(provider: &str, kind: &str, project: &str, external_id: &str) -> String {
@@ -566,14 +566,14 @@ fn artifact_id(provider: &str, kind: &str, project: &str, external_id: &str) -> 
     id
 }
 
-fn gitlab_status_error(operation: &str, status: StatusCode) -> MambaError {
+fn gitlab_status_error(operation: &str, status: StatusCode) -> RelayError {
     let hint = match status {
         StatusCode::UNAUTHORIZED => "check GITLAB_TOKEN",
         StatusCode::FORBIDDEN => "the token lacks project access",
         StatusCode::NOT_FOUND => "check the project path, MR IID, and token access",
         _ => "check the GitLab server and project",
     };
-    MambaError::ExternalConnector(format!(
+    RelayError::ExternalConnector(format!(
         "GitLab {operation} returned HTTP {} ({hint})",
         status.as_u16()
     ))

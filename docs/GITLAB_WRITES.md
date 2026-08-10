@@ -1,6 +1,6 @@
 # GitLab Human Write Gate
 
-MambaFlow 把 GitLab 读取和写入拆成两套凭据。只读 Connector 用于 MR/Pipeline 交付同步；Writer 只在
+Relay 把 GitLab 读取和写入拆成两套凭据。只读 Connector 用于 MR/Pipeline 交付同步；Writer 只在
 任务执行者提交具体 Payload、Flow 的 Human Demand Requester 放行后，才创建或评论外部对象。Agent
 看不到写 Token，Tower 也不提供 merge 动作。
 
@@ -15,7 +15,7 @@ MambaFlow 把 GitLab 读取和写入拆成两套凭据。只读 Connector 用于
 
 字段和路径遵循 GitLab 官方的 [Issues API](https://docs.gitlab.com/api/issues/)、
 [Notes API](https://docs.gitlab.com/api/notes/) 和
-[Merge requests API](https://docs.gitlab.com/api/merge_requests/)。MambaFlow 没有实现 merge endpoint，
+[Merge requests API](https://docs.gitlab.com/api/merge_requests/)。Relay 没有实现 merge endpoint，
 MR 最终合并继续受 GitLab 自身审批、保护分支和 Human 操作约束。
 
 ## Tenant Token
@@ -27,14 +27,14 @@ MR 最终合并继续受 GitLab 自身审批、保护分支和 Human 操作约�
 最低项目角色，并设置到期与轮换策略。
 
 ```bash
-export MAMBA_GITLAB_WRITE_URL='https://gitlab.example.com'
-export MAMBA_GITLAB_WRITE_TOKENS_JSON='{
+export RELAY_GITLAB_WRITE_URL='https://gitlab.example.com'
+export RELAY_GITLAB_WRITE_TOKENS_JSON='{
   "TEN-aaaaaaaa": "glpat-tenant-a-token",
   "TEN-bbbbbbbb": "glpat-tenant-b-token"
 }'
 ```
 
-单 Tenant 测试环境可用 `MAMBA_GITLAB_WRITE_TOKEN`。Writer 不读取 `GITLAB_TOKEN`，因此只读凭据不会
+单 Tenant 测试环境可用 `RELAY_GITLAB_WRITE_TOKEN`。Writer 不读取 `GITLAB_TOKEN`，因此只读凭据不会
 意外升级为写凭据。一旦配置 Tenant JSON 映射，未命中的 Tenant 不会回退到通用 Token。Secret 只保留
 在服务进程内存，不进入 Flow Ledger、Dashboard 或错误消息。
 
@@ -44,7 +44,7 @@ export MAMBA_GITLAB_WRITE_TOKENS_JSON='{
 Agent。下面的请求只写入一个待审批 Gate，不会立即调用 GitLab：
 
 ```bash
-curl -X POST "$MAMBA_SERVER/api/v1/gitlab/writes" \
+curl -X POST "$RELAY_SERVER/api/v1/gitlab/writes" \
   -H "Authorization: Bearer $AGENT_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -56,7 +56,7 @@ curl -X POST "$MAMBA_SERVER/api/v1/gitlab/writes" \
       "target_branch": "main",
       "title": "Add provider routing",
       "description": "Implements the approved gateway task.",
-      "labels": ["delivery", "mambaflow"],
+      "labels": ["delivery", "relay"],
       "remove_source_branch": true,
       "draft": true
     }

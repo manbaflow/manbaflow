@@ -5,7 +5,7 @@ use chrono::Utc;
 use crate::domain::{
     Assignment, AssignmentTarget, Principal, PrincipalKind, TargetKind, TaskDraft,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::ids::normalize_capability;
 use crate::state::OrganizationState;
 
@@ -101,7 +101,7 @@ impl<'a> Matcher<'a> {
             });
         }
 
-        Err(MambaError::NoEligibleAssignee(task.title.clone()))
+        Err(RelayError::NoEligibleAssignee(task.title.clone()))
     }
 
     fn score_principal(
@@ -229,7 +229,7 @@ mod tests {
         let mut state = OrganizationState {
             organization: Some(Organization {
                 id: "ORG-1".into(),
-                name: "Mamba".into(),
+                name: "Relay".into(),
                 created_at: Utc::now(),
             }),
             ..OrganizationState::default()

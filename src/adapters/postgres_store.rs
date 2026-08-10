@@ -7,7 +7,7 @@ use postgres::Client;
 use postgres_native_tls::MakeTlsConnector;
 use serde::Serialize;
 
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::{CURRENT_EVENT_VERSION, EventEnvelope};
 use crate::store::{ArtifactBlob, CredentialSnapshot, StorageHealth, decode_event_payload};
 
@@ -22,7 +22,7 @@ pub(crate) struct PostgresDatabase {
 impl PostgresDatabase {
     pub(crate) fn connect(database_url: &str, worker_name: &str) -> Result<Self> {
         if database_url.trim().is_empty() {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "PostgreSQL database URL cannot be empty".into(),
             ));
         }
@@ -73,8 +73,8 @@ impl PostgresDatabase {
     }
 }
 
-fn database_worker_stopped() -> MambaError {
-    MambaError::ExternalConnector("PostgreSQL connection worker stopped".into())
+fn database_worker_stopped() -> RelayError {
+    RelayError::ExternalConnector("PostgreSQL connection worker stopped".into())
 }
 
 #[derive(Serialize)]
@@ -92,18 +92,18 @@ impl PostgresEventStore {
     pub(crate) fn connect(database_url: &str, tenant_id: &str) -> Result<Self> {
         validate_tenant_id(tenant_id)?;
         let database =
-            PostgresDatabase::connect(database_url, &format!("mamba-pg-events-{tenant_id}"))?;
+            PostgresDatabase::connect(database_url, &format!("relay-pg-events-{tenant_id}"))?;
         database.call(|client| {
             client.batch_execute(
-                "CREATE TABLE IF NOT EXISTS mamba_metadata (
+                "CREATE TABLE IF NOT EXISTS relay_metadata (
                      key TEXT PRIMARY KEY,
                      value TEXT NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS mamba_streams (
+                 CREATE TABLE IF NOT EXISTS relay_streams (
                      tenant_id TEXT PRIMARY KEY,
                      current_sequence BIGINT NOT NULL DEFAULT 0
                  );
-                 CREATE TABLE IF NOT EXISTS mamba_events (
+                 CREATE TABLE IF NOT EXISTS relay_events (
                      tenant_id       TEXT NOT NULL,
                      sequence        BIGINT NOT NULL,
                      id              TEXT NOT NULL,
@@ -116,11 +116,11 @@ impl PostgresEventStore {
                      PRIMARY KEY (tenant_id, sequence),
                      UNIQUE (tenant_id, id)
                  );
-                 CREATE INDEX IF NOT EXISTS idx_mamba_events_flow
-                     ON mamba_events(tenant_id, flow_id, sequence);
-                 CREATE INDEX IF NOT EXISTS idx_mamba_events_kind
-                     ON mamba_events(tenant_id, kind, sequence);
-                 CREATE TABLE IF NOT EXISTS mamba_api_credentials (
+                 CREATE INDEX IF NOT EXISTS idx_relay_events_flow
+                     ON relay_events(tenant_id, flow_id, sequence);
+                 CREATE INDEX IF NOT EXISTS idx_relay_events_kind
+                     ON relay_events(tenant_id, kind, sequence);
+                 CREATE TABLE IF NOT EXISTS relay_api_credentials (
                      tenant_id    TEXT NOT NULL,
                      id           TEXT NOT NULL,
                      principal_id TEXT NOT NULL,
@@ -130,9 +130,9 @@ impl PostgresEventStore {
                      revoked_at   TEXT,
                      PRIMARY KEY (tenant_id, id)
                  );
-                 CREATE INDEX IF NOT EXISTS idx_mamba_credentials_principal
-                     ON mamba_api_credentials(tenant_id, principal_id, revoked_at);
-                 CREATE TABLE IF NOT EXISTS mamba_artifacts (
+                 CREATE INDEX IF NOT EXISTS idx_relay_credentials_principal
+                     ON relay_api_credentials(tenant_id, principal_id, revoked_at);
+                 CREATE TABLE IF NOT EXISTS relay_artifacts (
                      tenant_id  TEXT NOT NULL,
                      sha256     TEXT NOT NULL,
                      media_type TEXT NOT NULL,
@@ -143,23 +143,23 @@ impl PostgresEventStore {
                  );",
             )?;
             client.execute(
-                "INSERT INTO mamba_metadata(key, value) VALUES ('schema_version', $1)
+                "INSERT INTO relay_metadata(key, value) VALUES ('schema_version', $1)
                  ON CONFLICT(key) DO NOTHING",
                 &[&POSTGRES_SCHEMA_VERSION.to_string()],
             )?;
             let schema_version = client
                 .query_one(
-                    "SELECT CAST(value AS BIGINT) FROM mamba_metadata WHERE key = 'schema_version'",
+                    "SELECT CAST(value AS BIGINT) FROM relay_metadata WHERE key = 'schema_version'",
                     &[],
                 )?
                 .get::<_, i64>(0);
             if schema_version == 1 {
                 client.execute(
-                    "UPDATE mamba_metadata SET value = $1 WHERE key = 'schema_version'",
+                    "UPDATE relay_metadata SET value = $1 WHERE key = 'schema_version'",
                     &[&POSTGRES_SCHEMA_VERSION.to_string()],
                 )?;
             } else if schema_version != POSTGRES_SCHEMA_VERSION {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "unsupported PostgreSQL schema version {schema_version}; this binary requires {POSTGRES_SCHEMA_VERSION}"
                 )));
             }
@@ -168,7 +168,7 @@ impl PostgresEventStore {
         let stream_tenant = tenant_id.to_string();
         database.call(move |client| {
             client.execute(
-                "INSERT INTO mamba_streams(tenant_id, current_sequence) VALUES ($1, 0)
+                "INSERT INTO relay_streams(tenant_id, current_sequence) VALUES ($1, 0)
                  ON CONFLICT(tenant_id) DO NOTHING",
                 &[&stream_tenant],
             )?;
@@ -198,20 +198,20 @@ impl PostgresEventStore {
             let mut transaction = client.transaction()?;
             let current_sequence = transaction
                 .query_one(
-                    "SELECT current_sequence FROM mamba_streams
+                    "SELECT current_sequence FROM relay_streams
                      WHERE tenant_id = $1 FOR UPDATE",
                     &[&tenant_id],
                 )?
                 .get::<_, i64>(0);
             let credential_count = transaction
                 .query_one(
-                    "SELECT COUNT(*) FROM mamba_api_credentials WHERE tenant_id = $1",
+                    "SELECT COUNT(*) FROM relay_api_credentials WHERE tenant_id = $1",
                     &[&tenant_id],
                 )?
                 .get::<_, i64>(0);
             let artifact_count = transaction
                 .query_one(
-                    "SELECT COUNT(*) FROM mamba_artifacts WHERE tenant_id = $1",
+                    "SELECT COUNT(*) FROM relay_artifacts WHERE tenant_id = $1",
                     &[&tenant_id],
                 )?
                 .get::<_, i64>(0);
@@ -219,35 +219,35 @@ impl PostgresEventStore {
                 let expected_sequence = events.last().map_or(0, |event| event.sequence);
                 let actual_events = transaction
                     .query_one(
-                        "SELECT COUNT(*) FROM mamba_events WHERE tenant_id = $1",
+                        "SELECT COUNT(*) FROM relay_events WHERE tenant_id = $1",
                         &[&tenant_id],
                     )?
                     .get::<_, i64>(0);
                 let expected_events = i64::try_from(events.len()).map_err(|_| {
-                    MambaError::Validation("SQLite event stream is too large to migrate".into())
+                    RelayError::Validation("SQLite event stream is too large to migrate".into())
                 })?;
                 let actual_credentials = transaction
                     .query_one(
-                        "SELECT COUNT(*) FROM mamba_api_credentials WHERE tenant_id = $1",
+                        "SELECT COUNT(*) FROM relay_api_credentials WHERE tenant_id = $1",
                         &[&tenant_id],
                     )?
                     .get::<_, i64>(0);
                 let expected_credentials = i64::try_from(credentials.len()).map_err(|_| {
-                    MambaError::Validation("SQLite credential set is too large to migrate".into())
+                    RelayError::Validation("SQLite credential set is too large to migrate".into())
                 })?;
                 let actual_artifacts = transaction
                     .query_one(
-                        "SELECT COUNT(*) FROM mamba_artifacts WHERE tenant_id = $1",
+                        "SELECT COUNT(*) FROM relay_artifacts WHERE tenant_id = $1",
                         &[&tenant_id],
                     )?
                     .get::<_, i64>(0);
                 let expected_artifacts = i64::try_from(artifacts.len()).map_err(|_| {
-                    MambaError::Validation("SQLite artifact set is too large to migrate".into())
+                    RelayError::Validation("SQLite artifact set is too large to migrate".into())
                 })?;
                 let stored_artifacts = transaction
                     .query(
                         "SELECT sha256, media_type, size_bytes, content, created_at
-                         FROM mamba_artifacts WHERE tenant_id = $1
+                         FROM relay_artifacts WHERE tenant_id = $1
                          ORDER BY created_at, sha256",
                         &[&tenant_id],
                     )?
@@ -269,7 +269,7 @@ impl PostgresEventStore {
                     transaction.commit()?;
                     return Ok(false);
                 }
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "PostgreSQL tenant {tenant_id} already contains a different event or credential snapshot"
                 )));
             }
@@ -281,7 +281,7 @@ impl PostgresEventStore {
                 })?;
                 let occurred_at = event.occurred_at.to_rfc3339();
                 transaction.execute(
-                    "INSERT INTO mamba_events(
+                    "INSERT INTO relay_events(
                         tenant_id, sequence, id, organization_id, flow_id, actor, kind, payload, occurred_at
                      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                     &[
@@ -299,7 +299,7 @@ impl PostgresEventStore {
             }
             for credential in &credentials {
                 transaction.execute(
-                    "INSERT INTO mamba_api_credentials(
+                    "INSERT INTO relay_api_credentials(
                         tenant_id, id, principal_id, token_hash, created_at, expires_at, revoked_at
                      ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
                     &[
@@ -315,7 +315,7 @@ impl PostgresEventStore {
             }
             for artifact in &artifacts {
                 transaction.execute(
-                    "INSERT INTO mamba_artifacts(
+                    "INSERT INTO relay_artifacts(
                         tenant_id, sha256, media_type, size_bytes, content, created_at
                      ) VALUES ($1, $2, $3, $4, $5, $6)",
                     &[
@@ -330,7 +330,7 @@ impl PostgresEventStore {
             }
             let final_sequence = events.last().map_or(0, |event| event.sequence);
             transaction.execute(
-                "UPDATE mamba_streams SET current_sequence = $2 WHERE tenant_id = $1",
+                "UPDATE relay_streams SET current_sequence = $2 WHERE tenant_id = $1",
                 &[&tenant_id, &final_sequence],
             )?;
             transaction.commit()?;
@@ -344,7 +344,7 @@ impl PostgresEventStore {
         self.database.call(move |client| {
             Ok(client
                 .query_one(
-                    "SELECT current_sequence FROM mamba_streams WHERE tenant_id = $1",
+                    "SELECT current_sequence FROM relay_streams WHERE tenant_id = $1",
                     &[&tenant_id],
                 )?
                 .get(0))
@@ -356,20 +356,20 @@ impl PostgresEventStore {
         self.database.call(move |client| {
             let schema_version = client
                 .query_one(
-                    "SELECT CAST(value AS BIGINT) FROM mamba_metadata WHERE key = 'schema_version'",
+                    "SELECT CAST(value AS BIGINT) FROM relay_metadata WHERE key = 'schema_version'",
                     &[],
                 )?
                 .get(0);
             let event_count = client
                 .query_one(
-                    "SELECT COUNT(*) FROM mamba_events WHERE tenant_id = $1",
+                    "SELECT COUNT(*) FROM relay_events WHERE tenant_id = $1",
                     &[&tenant_id],
                 )?
                 .get(0);
             let now = Utc::now().to_rfc3339();
             let active_credentials = client
                 .query_one(
-                    "SELECT COUNT(*) FROM mamba_api_credentials
+                    "SELECT COUNT(*) FROM relay_api_credentials
                      WHERE tenant_id = $1 AND revoked_at IS NULL
                        AND (expires_at IS NULL OR expires_at > $2)",
                     &[&tenant_id, &now],
@@ -402,31 +402,31 @@ impl PostgresEventStore {
             let mut transaction = client.transaction()?;
             let actual_sequence = transaction
                 .query_one(
-                    "SELECT current_sequence FROM mamba_streams
+                    "SELECT current_sequence FROM relay_streams
                      WHERE tenant_id = $1 FOR UPDATE",
                     &[&tenant_id],
                 )?
                 .get::<_, i64>(0);
             if actual_sequence != expected_sequence {
-                return Err(MambaError::ConcurrentModification {
+                return Err(RelayError::ConcurrentModification {
                     expected: expected_sequence,
                     actual: actual_sequence,
                 });
             }
             for (index, envelope) in envelopes.iter().enumerate() {
                 let offset = i64::try_from(index)
-                    .map_err(|_| MambaError::Validation("event batch is too large".into()))?;
+                    .map_err(|_| RelayError::Validation("event batch is too large".into()))?;
                 let required_sequence = expected_sequence
                     .checked_add(offset)
                     .and_then(|value| value.checked_add(1))
                     .ok_or_else(|| {
-                        MambaError::Validation("event sequence exceeded the supported range".into())
+                        RelayError::Validation("event sequence exceeded the supported range".into())
                     })?;
                 if envelope.sequence != required_sequence
                     || envelope.event_version != CURRENT_EVENT_VERSION
                     || envelope.kind != envelope.event.kind()
                 {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "prepared event does not match its sequence, version or kind".into(),
                     ));
                 }
@@ -436,7 +436,7 @@ impl PostgresEventStore {
                 })?;
                 let occurred_at = envelope.occurred_at.to_rfc3339();
                 transaction.execute(
-                    "INSERT INTO mamba_events(
+                    "INSERT INTO relay_events(
                         tenant_id, sequence, id, organization_id, flow_id, actor, kind, payload, occurred_at
                      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                     &[
@@ -454,7 +454,7 @@ impl PostgresEventStore {
             }
             let final_sequence = envelopes.last().expect("non-empty checked above").sequence;
             transaction.execute(
-                "UPDATE mamba_streams SET current_sequence = $2 WHERE tenant_id = $1",
+                "UPDATE relay_streams SET current_sequence = $2 WHERE tenant_id = $1",
                 &[&tenant_id, &final_sequence],
             )?;
             transaction.commit()?;
@@ -476,7 +476,7 @@ impl PostgresEventStore {
             client
                 .query(
                     "SELECT sequence, id, organization_id, flow_id, actor, kind, payload, occurred_at
-                     FROM mamba_events
+                     FROM relay_events
                      WHERE tenant_id = $1 AND sequence > $2 ORDER BY sequence",
                     &[&tenant_id, &sequence],
                 )?
@@ -493,13 +493,13 @@ impl PostgresEventStore {
             let rows = if let Some(flow_id) = flow_id {
                 client.query(
                     "SELECT sequence, id, organization_id, flow_id, actor, kind, payload, occurred_at
-                     FROM mamba_events WHERE tenant_id = $1 AND flow_id = $2 ORDER BY sequence",
+                     FROM relay_events WHERE tenant_id = $1 AND flow_id = $2 ORDER BY sequence",
                     &[&tenant_id, &flow_id],
                 )?
             } else {
                 client.query(
                     "SELECT sequence, id, organization_id, flow_id, actor, kind, payload, occurred_at
-                     FROM mamba_events WHERE tenant_id = $1 ORDER BY sequence",
+                     FROM relay_events WHERE tenant_id = $1 ORDER BY sequence",
                     &[&tenant_id],
                 )?
             };
@@ -523,7 +523,7 @@ impl PostgresEventStore {
         let expires_at = expires_at.map(|value| value.to_rfc3339());
         self.database.call(move |client| {
             client.execute(
-                "INSERT INTO mamba_api_credentials(
+                "INSERT INTO relay_api_credentials(
                     tenant_id, id, principal_id, token_hash, created_at, expires_at
                  ) VALUES ($1, $2, $3, $4, $5, $6)",
                 &[
@@ -544,7 +544,7 @@ impl PostgresEventStore {
         let id = id.to_string();
         self.database.call(move |client| {
             client.execute(
-                "DELETE FROM mamba_api_credentials WHERE tenant_id = $1 AND id = $2",
+                "DELETE FROM relay_api_credentials WHERE tenant_id = $1 AND id = $2",
                 &[&tenant_id, &id],
             )?;
             Ok(())
@@ -556,7 +556,7 @@ impl PostgresEventStore {
         let artifact = artifact.clone();
         self.database.call(move |client| {
             let inserted = client.execute(
-                "INSERT INTO mamba_artifacts(
+                "INSERT INTO relay_artifacts(
                     tenant_id, sha256, media_type, size_bytes, content, created_at
                  ) VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT(tenant_id, sha256) DO NOTHING",
@@ -571,12 +571,12 @@ impl PostgresEventStore {
             )?;
             if inserted == 0 {
                 let existing = client.query_opt(
-                    "SELECT media_type, size_bytes, content FROM mamba_artifacts
+                    "SELECT media_type, size_bytes, content FROM relay_artifacts
                      WHERE tenant_id = $1 AND sha256 = $2",
                     &[&tenant_id, &artifact.sha256],
                 )?;
                 let Some(existing) = existing else {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "artifact disappeared after a hash conflict".into(),
                     ));
                 };
@@ -584,7 +584,7 @@ impl PostgresEventStore {
                     || existing.get::<_, i64>(1) != artifact.size_bytes
                     || existing.get::<_, Vec<u8>>(2) != artifact.content
                 {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "artifact hash already exists with different content or metadata".into(),
                     ));
                 }
@@ -599,7 +599,7 @@ impl PostgresEventStore {
         self.database.call(move |client| {
             let row = client.query_opt(
                 "SELECT sha256, media_type, size_bytes, content, created_at
-                 FROM mamba_artifacts WHERE tenant_id = $1 AND sha256 = $2",
+                 FROM relay_artifacts WHERE tenant_id = $1 AND sha256 = $2",
                 &[&tenant_id, &sha256],
             )?;
             Ok(row.map(|row| ArtifactBlob {
@@ -618,12 +618,12 @@ impl PostgresEventStore {
         let revoked_at = revoked_at.to_rfc3339();
         self.database.call(move |client| {
             let updated = client.execute(
-                "UPDATE mamba_api_credentials SET revoked_at = $3
+                "UPDATE relay_api_credentials SET revoked_at = $3
                  WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL",
                 &[&tenant_id, &id, &revoked_at],
             )?;
             if updated == 0 {
-                return Err(MambaError::NotFound {
+                return Err(RelayError::NotFound {
                     entity: "active API credential",
                     id,
                 });
@@ -641,7 +641,7 @@ impl PostgresEventStore {
         self.database.call(move |client| {
             let now = Utc::now().to_rfc3339();
             let row = client.query_opt(
-                "SELECT id, principal_id FROM mamba_api_credentials
+                "SELECT id, principal_id FROM relay_api_credentials
                  WHERE tenant_id = $1 AND token_hash = $2 AND revoked_at IS NULL
                    AND (expires_at IS NULL OR expires_at > $3)",
                 &[&tenant_id, &token_hash, &now],
@@ -657,13 +657,13 @@ fn decode_row(row: postgres::Row) -> Result<EventEnvelope> {
     let payload: String = row.get(6);
     let (event_version, event) = decode_event_payload(&payload)?;
     if kind != event.kind() {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "stored event kind `{kind}` does not match payload kind `{}` at sequence {sequence}",
             event.kind()
         )));
     }
     let occurred_at = DateTime::parse_from_rfc3339(row.get::<_, String>(7).as_str())
-        .map_err(|error| MambaError::Validation(error.to_string()))?
+        .map_err(|error| RelayError::Validation(error.to_string()))?
         .with_timezone(&Utc);
     Ok(EventEnvelope {
         event_version,
@@ -685,7 +685,7 @@ fn validate_tenant_id(tenant_id: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "invalid PostgreSQL tenant ID".into(),
         ));
     }

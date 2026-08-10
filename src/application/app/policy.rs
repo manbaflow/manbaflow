@@ -1,10 +1,10 @@
-use super::MambaApp;
+use super::RelayApp;
 use crate::domain::{
     AssignmentTarget, Flow, FlowMessage, Principal, PrincipalKind, TargetKind, Task, TaskStatus,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
-impl MambaApp {
+impl RelayApp {
     pub(super) fn principal_has_flow_access(&self, flow: &Flow, principal: &Principal) -> bool {
         self.principal_is_flow_participant(flow, principal)
             || self.state.messages.values().any(|message| {
@@ -100,13 +100,13 @@ impl MambaApp {
 
     pub(super) fn ensure_task_actor(&self, task: &Task, actor: &str) -> Result<()> {
         if task.assignment.is_none() {
-            return Err(MambaError::NoEligibleAssignee(task.title.clone()));
+            return Err(RelayError::NoEligibleAssignee(task.title.clone()));
         }
         let principal = self.state.principal(actor)?;
         if self.principal_is_task_actor(task, principal) {
             Ok(())
         } else {
-            Err(MambaError::PermissionDenied(format!(
+            Err(RelayError::PermissionDenied(format!(
                 "{} is not assigned to task {}",
                 principal.name, task.id
             )))
@@ -124,7 +124,7 @@ impl MambaApp {
         if incomplete.is_empty() {
             Ok(())
         } else {
-            Err(MambaError::InvalidTransition(format!(
+            Err(RelayError::InvalidTransition(format!(
                 "task {} is waiting for: {}",
                 task.key,
                 incomplete.join(", ")
@@ -137,7 +137,7 @@ pub(super) fn ensure_status(task: &Task, expected: &[TaskStatus]) -> Result<()> 
     if expected.contains(&task.status) {
         Ok(())
     } else {
-        Err(MambaError::InvalidTransition(format!(
+        Err(RelayError::InvalidTransition(format!(
             "task {} is {:?}, expected one of {:?}",
             task.id, task.status, expected
         )))

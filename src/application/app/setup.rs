@@ -1,11 +1,11 @@
 use serde::Serialize;
 
-use super::MambaApp;
+use super::RelayApp;
 use crate::domain::{
     ApiCredential, IssuedCredential, Organization, OrganizationRole, Principal, PrincipalKind,
     Team, Tenant,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 const BOOTSTRAP_CREDENTIAL_LABEL: &str = "bootstrap-admin";
 
@@ -39,7 +39,7 @@ pub struct InstallationSetup {
     pub created: SetupCreated,
 }
 
-impl MambaApp {
+impl RelayApp {
     pub fn setup_installation(
         &mut self,
         options: InstallationSetupOptions,
@@ -48,7 +48,7 @@ impl MambaApp {
         let team_name = required_name(&options.team_name, "team")?;
         let administrator_name = required_name(&options.administrator_name, "administrator")?;
         if !(1..=365).contains(&options.token_ttl_days) {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "credential TTL must be between 1 and 365 days".into(),
             ));
         }
@@ -56,7 +56,7 @@ impl MambaApp {
         let (organization, organization_created) =
             if let Some(organization) = self.state.organization.clone() {
                 if organization.name != organization_name {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "installation already belongs to organization {}; requested {}",
                         organization.name, organization_name
                     )));
@@ -74,7 +74,7 @@ impl MambaApp {
             .cloned()
         {
             if !team.active {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "installation team is inactive: {}",
                     team.name
                 )));
@@ -95,13 +95,13 @@ impl MambaApp {
             .cloned()
         {
             if administrator.kind != PrincipalKind::Human || !administrator.active {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "installation administrator must be an active Human: {}",
                     administrator.name
                 )));
             }
             if administrator.team_id.as_deref() != Some(team.id.as_str()) {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "installation administrator {} is not assigned to team {}",
                     administrator.name, team.name
                 )));
@@ -165,7 +165,7 @@ impl MambaApp {
                     .into_iter()
                     .max_by_key(|credential| credential.created_at)
                     .ok_or_else(|| {
-                        MambaError::Validation(
+                        RelayError::Validation(
                             "installation has no active bootstrap credential".into(),
                         )
                     })?;
@@ -193,7 +193,7 @@ impl MambaApp {
 fn required_name(value: &str, label: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() || value.chars().count() > 120 {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} name must contain 1 to 120 characters"
         )));
     }
@@ -210,7 +210,7 @@ mod tests {
     fn installation_setup_is_idempotent_and_rotates_only_on_request() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
         let setup_options = options(false);
         let first = app.setup_installation(setup_options.clone()).unwrap();
         let first_token = first.token.clone().unwrap();
@@ -244,7 +244,7 @@ mod tests {
         );
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert_eq!(replayed.state().flows.len(), 0);
         assert_eq!(replayed.state().principals.len(), 1);
         assert!(
@@ -257,25 +257,25 @@ mod tests {
     #[test]
     fn installation_setup_rejects_a_different_existing_organization() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path()).unwrap();
+        let mut app = RelayApp::open(directory.path()).unwrap();
         app.setup_installation(options(false)).unwrap();
         let mut changed = options(false);
         changed.organization_name = "Another Company".into();
         assert!(matches!(
             app.setup_installation(changed),
-            Err(MambaError::Validation(_))
+            Err(RelayError::Validation(_))
         ));
     }
 
     #[test]
     fn installation_setup_validates_credentials_before_writing_state() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path()).unwrap();
+        let mut app = RelayApp::open(directory.path()).unwrap();
         let mut invalid = options(false);
         invalid.token_ttl_days = 0;
         assert!(matches!(
             app.setup_installation(invalid),
-            Err(MambaError::Validation(_))
+            Err(RelayError::Validation(_))
         ));
         assert!(app.state().organization.is_none());
         assert_eq!(app.state().last_sequence, 0);

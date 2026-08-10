@@ -13,7 +13,7 @@ use openidconnect::{
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 const LOGIN_TTL_MINUTES: i64 = 10;
 
@@ -56,12 +56,12 @@ pub struct OidcIdentity {
 
 impl OidcProvider {
     pub async fn from_env() -> Result<Option<Self>> {
-        let Some(issuer) = env_value("MAMBA_OIDC_ISSUER")? else {
+        let Some(issuer) = env_value("RELAY_OIDC_ISSUER")? else {
             return Ok(None);
         };
-        let client_id = required_env("MAMBA_OIDC_CLIENT_ID")?;
-        let client_secret = required_env("MAMBA_OIDC_CLIENT_SECRET")?;
-        let redirect_url = required_env("MAMBA_OIDC_REDIRECT_URL")?;
+        let client_id = required_env("RELAY_OIDC_CLIENT_ID")?;
+        let client_secret = required_env("RELAY_OIDC_CLIENT_SECRET")?;
+        let redirect_url = required_env("RELAY_OIDC_REDIRECT_URL")?;
         Self::discover(issuer, client_id, client_secret, redirect_url)
             .await
             .map(Some)
@@ -86,7 +86,7 @@ impl OidcProvider {
             .await
             .map_err(|error| oidc_error("discovery failed", error))?;
         let mut key_material = client_secret.as_bytes().to_vec();
-        key_material.extend_from_slice(b"\0mambaflow-oidc-state\0");
+        key_material.extend_from_slice(b"\0relay-oidc-state\0");
         key_material.extend_from_slice(issuer.as_bytes());
         let state_key = Sha256::digest(&key_material).into();
         Ok(Self {
@@ -156,10 +156,10 @@ impl OidcProvider {
     ) -> Result<OidcIdentity> {
         let pending = self.decode_state(state_cookie)?;
         if !bool::from(pending.state.as_bytes().ct_eq(state.as_bytes())) {
-            return Err(MambaError::PermissionDenied("invalid OIDC state".into()));
+            return Err(RelayError::PermissionDenied("invalid OIDC state".into()));
         }
         if pending.expires_at <= Utc::now() {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "OIDC login state expired".into(),
             ));
         }
@@ -180,7 +180,7 @@ impl OidcProvider {
             .await
             .map_err(|error| oidc_error("token exchange failed", error))?;
         let id_token = token_response.id_token().ok_or_else(|| {
-            MambaError::PermissionDenied("OIDC provider did not return an ID token".into())
+            RelayError::PermissionDenied("OIDC provider did not return an ID token".into())
         })?;
         let verifier = client.id_token_verifier();
         let nonce = Nonce::new(pending.nonce);
@@ -199,7 +199,7 @@ impl OidcProvider {
             )
             .map_err(|error| oidc_error("access token hash could not be verified", error))?;
             if &actual_hash != expected_hash {
-                return Err(MambaError::PermissionDenied(
+                return Err(RelayError::PermissionDenied(
                     "OIDC access token hash mismatch".into(),
                 ));
             }
@@ -215,7 +215,7 @@ impl OidcProvider {
     fn encode_state(&self, state: &PendingLogin) -> Result<String> {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(state)?);
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.state_key)
-            .map_err(|_| MambaError::Validation("invalid OIDC state key".into()))?;
+            .map_err(|_| RelayError::Validation("invalid OIDC state key".into()))?;
         mac.update(payload.as_bytes());
         let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         Ok(format!("v1.{payload}.{signature}"))
@@ -224,34 +224,34 @@ impl OidcProvider {
     fn decode_state(&self, value: &str) -> Result<PendingLogin> {
         let mut parts = value.split('.');
         if parts.next() != Some("v1") {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "invalid OIDC state cookie".into(),
             ));
         }
         let payload = parts
             .next()
-            .ok_or_else(|| MambaError::PermissionDenied("invalid OIDC state cookie".into()))?;
+            .ok_or_else(|| RelayError::PermissionDenied("invalid OIDC state cookie".into()))?;
         let signature = parts
             .next()
-            .ok_or_else(|| MambaError::PermissionDenied("invalid OIDC state cookie".into()))?;
+            .ok_or_else(|| RelayError::PermissionDenied("invalid OIDC state cookie".into()))?;
         if parts.next().is_some() {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "invalid OIDC state cookie".into(),
             ));
         }
         let signature = URL_SAFE_NO_PAD
             .decode(signature)
-            .map_err(|_| MambaError::PermissionDenied("invalid OIDC state signature".into()))?;
+            .map_err(|_| RelayError::PermissionDenied("invalid OIDC state signature".into()))?;
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.state_key)
-            .map_err(|_| MambaError::Validation("invalid OIDC state key".into()))?;
+            .map_err(|_| RelayError::Validation("invalid OIDC state key".into()))?;
         mac.update(payload.as_bytes());
         mac.verify_slice(&signature)
-            .map_err(|_| MambaError::PermissionDenied("invalid OIDC state signature".into()))?;
+            .map_err(|_| RelayError::PermissionDenied("invalid OIDC state signature".into()))?;
         let payload = URL_SAFE_NO_PAD
             .decode(payload)
-            .map_err(|_| MambaError::PermissionDenied("invalid OIDC state payload".into()))?;
+            .map_err(|_| RelayError::PermissionDenied("invalid OIDC state payload".into()))?;
         serde_json::from_slice(&payload)
-            .map_err(|_| MambaError::PermissionDenied("invalid OIDC state payload".into()))
+            .map_err(|_| RelayError::PermissionDenied("invalid OIDC state payload".into()))
     }
 }
 
@@ -263,25 +263,25 @@ pub struct ScimAuthenticator {
 
 impl ScimAuthenticator {
     pub fn from_env() -> Result<Self> {
-        let fallback_hash = if let Some(token) = env_value("MAMBA_SCIM_BEARER_TOKEN")? {
+        let fallback_hash = if let Some(token) = env_value("RELAY_SCIM_BEARER_TOKEN")? {
             validate_scim_token(&token)?;
             Some(Sha256::digest(token.as_bytes()).into())
         } else {
             None
         };
         let mut tenant_hashes = BTreeMap::new();
-        if let Some(value) = env_value("MAMBA_SCIM_TOKENS_JSON")? {
+        if let Some(value) = env_value("RELAY_SCIM_TOKENS_JSON")? {
             let tokens =
                 serde_json::from_str::<BTreeMap<String, String>>(&value).map_err(|_| {
-                    MambaError::Validation(
-                        "MAMBA_SCIM_TOKENS_JSON must be a JSON object of Tenant IDs to tokens"
+                    RelayError::Validation(
+                        "RELAY_SCIM_TOKENS_JSON must be a JSON object of Tenant IDs to tokens"
                             .into(),
                     )
                 })?;
             for (tenant_id, token) in tokens {
                 if !tenant_id.starts_with("TEN-") {
-                    return Err(MambaError::Validation(format!(
-                        "invalid Tenant ID in MAMBA_SCIM_TOKENS_JSON: {tenant_id}"
+                    return Err(RelayError::Validation(format!(
+                        "invalid Tenant ID in RELAY_SCIM_TOKENS_JSON: {tenant_id}"
                     )));
                 }
                 validate_scim_token(&token)?;
@@ -322,7 +322,7 @@ impl ScimAuthenticator {
 
 fn validate_scim_token(token: &str) -> Result<()> {
     if token.chars().count() < 32 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "SCIM bearer token must contain at least 32 characters".into(),
         ));
     }
@@ -331,8 +331,8 @@ fn validate_scim_token(token: &str) -> Result<()> {
 
 fn required_env(name: &str) -> Result<String> {
     env_value(name)?.ok_or_else(|| {
-        MambaError::Validation(format!(
-            "{name} is required when MAMBA_OIDC_ISSUER is configured"
+        RelayError::Validation(format!(
+            "{name} is required when RELAY_OIDC_ISSUER is configured"
         ))
     })
 }
@@ -343,24 +343,24 @@ fn env_value(name: &str) -> Result<Option<String>> {
     };
     let value = value
         .into_string()
-        .map_err(|_| MambaError::Validation(format!("{name} must be valid UTF-8")))?;
+        .map_err(|_| RelayError::Validation(format!("{name} must be valid UTF-8")))?;
     let value = value.trim().to_string();
     if value.is_empty() {
-        return Err(MambaError::Validation(format!("{name} cannot be empty")));
+        return Err(RelayError::Validation(format!("{name} cannot be empty")));
     }
     Ok(Some(value))
 }
 
 fn validate_redirect_url(value: &str) -> Result<()> {
     let url = reqwest::Url::parse(value)
-        .map_err(|_| MambaError::Validation("invalid MAMBA_OIDC_REDIRECT_URL".into()))?;
+        .map_err(|_| RelayError::Validation("invalid RELAY_OIDC_REDIRECT_URL".into()))?;
     let secure = url.scheme() == "https";
     let loopback = url.scheme() == "http"
         && url
             .host_str()
             .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"));
     if (!secure && !loopback) || url.query().is_some() || url.fragment().is_some() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "OIDC redirect URL must use HTTPS or loopback HTTP and contain no query or fragment"
                 .into(),
         ));
@@ -370,14 +370,14 @@ fn validate_redirect_url(value: &str) -> Result<()> {
 
 fn validate_issuer_url(value: &str) -> Result<()> {
     let url = reqwest::Url::parse(value)
-        .map_err(|_| MambaError::Validation("invalid MAMBA_OIDC_ISSUER".into()))?;
+        .map_err(|_| RelayError::Validation("invalid RELAY_OIDC_ISSUER".into()))?;
     let secure = url.scheme() == "https";
     let loopback = url.scheme() == "http"
         && url
             .host_str()
             .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"));
     if (!secure && !loopback) || url.query().is_some() || url.fragment().is_some() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "OIDC issuer must use HTTPS or loopback HTTP and contain no query or fragment".into(),
         ));
     }
@@ -387,15 +387,15 @@ fn validate_issuer_url(value: &str) -> Result<()> {
 fn validate_return_to(value: &str) -> Result<String> {
     let value = value.trim();
     if value != "/console" {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "OIDC return path must be /console".into(),
         ));
     }
     Ok(value.to_string())
 }
 
-fn oidc_error(context: &str, error: impl std::fmt::Display) -> MambaError {
-    MambaError::ExternalConnector(format!("OIDC {context}: {error}"))
+fn oidc_error(context: &str, error: impl std::fmt::Display) -> RelayError {
+    RelayError::ExternalConnector(format!("OIDC {context}: {error}"))
 }
 
 #[cfg(test)]
@@ -456,8 +456,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let issuer = format!("http://{address}");
-        let client_id = "mamba-test-client".to_string();
-        let client_secret = "mamba-test-client-secret-at-least-32-bytes".to_string();
+        let client_id = "relay-test-client".to_string();
+        let client_secret = "relay-test-client-secret-at-least-32-bytes".to_string();
         let nonce = Arc::new(StdMutex::new(None::<String>));
         let metadata_issuer = issuer.clone();
         let metadata_client = client_id.clone();

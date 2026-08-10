@@ -10,7 +10,7 @@ Remote Worker 默认通过 Docker 启动 Claude Code 或 Codex。Git worktree �
 ```bash
 docker build \
   -f docker/agent-runtime/Dockerfile \
-  -t manbaflow-agent-runtime:0.1.0 \
+  -t relay-agent-runtime:0.1.0 \
   .
 ```
 
@@ -38,10 +38,10 @@ Docker 沙箱信息会随 Remote Flight Report 进入 append-only Ledger，包�
 默认断网适合本地模型或已经具备离线认证与模型访问代理的 Runtime：
 
 ```bash
-export MAMBA_SERVER='https://mamba.example.com'
-export MAMBA_TOKEN='mmb_agent_...'
+export RELAY_SERVER='https://relay.example.com'
+export RELAY_TOKEN='rly_agent_...'
 
-mamba worker once \
+relay worker once \
   --mode execute \
   --executor codex \
   --workspace /path/to/repository
@@ -53,7 +53,7 @@ Claude Code 和 Codex 的云端模型需要网络及各自凭据。只有经过�
 ```bash
 export OPENAI_API_KEY='...'
 
-mamba worker once \
+relay worker once \
   --mode execute \
   --executor codex \
   --workspace /path/to/repository \
@@ -63,7 +63,7 @@ mamba worker once \
 
 `bridge` 本身不是域名级出站策略。生产节点应在主机、防火墙或透明代理层限制模型 API、Git 与依赖镜像
 目的地，并禁止访问云元数据地址和内网控制面。需要长效刷新凭据时，由工作站 Secret Broker 在起飞前
-提供短效 Access Token；不要向容器注入 `MAMBA_TOKEN`。
+提供短效 Access Token；不要向容器注入 `RELAY_TOKEN`。
 
 常用资源参数：
 
@@ -82,7 +82,7 @@ mamba worker once \
 没有 Docker 的开发机可以显式使用：
 
 ```bash
-mamba worker once --sandbox process --workspace /path/to/repository
+relay worker once --sandbox process --workspace /path/to/repository
 ```
 
 `process` 仍保留 Git worktree、Lease、Fuel 和黑匣子，但不是安全边界；Dashboard 会明确显示
@@ -96,6 +96,6 @@ mamba worker once --sandbox process --workspace /path/to/repository
 1. `plan` 航班不能修改 worktree；
 2. 默认网络无法访问外部地址；
 3. 容器内 UID 非 0，根文件系统不可写，Docker socket 不存在；
-4. 超时后 `docker ps -a --filter label=io.manbaflow.flight` 没有残留；
+4. 超时后 `docker ps -a --filter label=io.relay.flight` 没有残留；
 5. Dashboard 和黑匣子展示正确的 Image ID、资源上限及网络模式；
 6. `changes.patch` 通过 `git apply --check` 后才由 Human 接纳。

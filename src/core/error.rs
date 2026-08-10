@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum MambaError {
+pub enum RelayError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -19,7 +19,7 @@ pub enum MambaError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("organization has not been initialized; run `mamba org init` first")]
+    #[error("organization has not been initialized; run `relay org init` first")]
     OrganizationNotInitialized,
 
     #[error("organization is already initialized")]
@@ -70,4 +70,4 @@ pub enum MambaError {
     ExternalConnector(String),
 }
 
-pub type Result<T> = std::result::Result<T, MambaError>;
+pub type Result<T> = std::result::Result<T, RelayError>;

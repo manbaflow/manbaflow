@@ -6,7 +6,7 @@ use reqwest::{Client, Response, StatusCode, Url, redirect};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::domain::{GitLabWritePayload, GitLabWriteRequest, GitLabWriteResult};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::gitlab::DEFAULT_GITLAB_URL;
 
 #[derive(Clone)]
@@ -25,14 +25,14 @@ pub struct GitLabDispatchError {
 
 impl GitLabWriteBridge {
     pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("MAMBA_GITLAB_WRITE_URL")
+        let base_url = std::env::var("RELAY_GITLAB_WRITE_URL")
             .ok()
             .or_else(|| std::env::var("GITLAB_URL").ok())
             .unwrap_or_else(|| DEFAULT_GITLAB_URL.to_string());
-        let fallback_token = std::env::var("MAMBA_GITLAB_WRITE_TOKEN")
+        let fallback_token = std::env::var("RELAY_GITLAB_WRITE_TOKEN")
             .ok()
             .filter(|value| !value.trim().is_empty());
-        let tenant_tokens = std::env::var("MAMBA_GITLAB_WRITE_TOKENS_JSON")
+        let tenant_tokens = std::env::var("RELAY_GITLAB_WRITE_TOKENS_JSON")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(|value| parse_tenant_tokens(&value))
@@ -60,7 +60,7 @@ impl GitLabWriteBridge {
             .map(|(tenant, token)| {
                 let tenant = tenant.trim().to_string();
                 if tenant.is_empty() || tenant.chars().any(char::is_whitespace) {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "GitLab write token tenant IDs cannot be empty or contain whitespace"
                             .into(),
                     ));
@@ -71,10 +71,10 @@ impl GitLabWriteBridge {
         let client = Client::builder()
             .redirect(redirect::Policy::none())
             .timeout(Duration::from_secs(30))
-            .user_agent(concat!("MambaFlow/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("Relay/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| {
-                MambaError::ExternalConnector("could not initialize GitLab writer".into())
+                RelayError::ExternalConnector("could not initialize GitLab writer".into())
             })?;
         Ok(Self {
             client,
@@ -345,18 +345,18 @@ async fn parse_response<T: DeserializeOwned>(
 
 fn normalize_api_base(base_url: &str) -> Result<Url> {
     let mut url = Url::parse(base_url.trim())
-        .map_err(|_| MambaError::Validation("invalid GitLab write URL".into()))?;
+        .map_err(|_| RelayError::Validation("invalid GitLab write URL".into()))?;
     let host = url
         .host_str()
-        .ok_or_else(|| MambaError::Validation("GitLab write URL must include a hostname".into()))?;
+        .ok_or_else(|| RelayError::Validation("GitLab write URL must include a hostname".into()))?;
     let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "GitLab write URL must use HTTPS, except for a loopback test server".into(),
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "GitLab write URL must not contain credentials".into(),
         ));
     }
@@ -365,7 +365,7 @@ fn normalize_api_base(base_url: &str) -> Result<Url> {
     let already_api = url.path().trim_end_matches('/').ends_with("/api/v4");
     if !already_api {
         let mut segments = url.path_segments_mut().map_err(|_| {
-            MambaError::Validation("GitLab write URL cannot be used as an API base".into())
+            RelayError::Validation("GitLab write URL cannot be used as an API base".into())
         })?;
         segments.pop_if_empty().push("api").push("v4");
     }
@@ -378,7 +378,7 @@ fn normalize_api_base(base_url: &str) -> Result<Url> {
 fn validate_token(token: &str, label: &str) -> Result<String> {
     let token = token.trim();
     if token.len() < 16 || token.chars().any(char::is_whitespace) {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{label} must contain at least 16 non-whitespace characters"
         )));
     }
@@ -387,8 +387,8 @@ fn validate_token(token: &str, label: &str) -> Result<String> {
 
 fn parse_tenant_tokens(value: &str) -> Result<BTreeMap<String, String>> {
     serde_json::from_str(value).map_err(|_| {
-        MambaError::Validation(
-            "MAMBA_GITLAB_WRITE_TOKENS_JSON must be a JSON object of tenant IDs to tokens".into(),
+        RelayError::Validation(
+            "RELAY_GITLAB_WRITE_TOKENS_JSON must be a JSON object of tenant IDs to tokens".into(),
         )
     })
 }

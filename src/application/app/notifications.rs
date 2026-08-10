@@ -1,16 +1,16 @@
 use chrono::{Duration, Utc};
 
-use super::MambaApp;
+use super::RelayApp;
 use super::authority::Permission;
 use crate::domain::{
     NotificationConnector, NotificationDelivery, NotificationEndpoint, NotificationStatus,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 use crate::notification::{NotificationAttempt, NotificationDispatchSummary};
 
-impl MambaApp {
+impl RelayApp {
     pub fn register_notification_endpoint(
         &mut self,
         name: &str,
@@ -33,7 +33,7 @@ impl MambaApp {
             .values()
             .any(|endpoint| endpoint.name.eq_ignore_ascii_case(name.trim()) && endpoint.active)
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "active notification endpoint already exists: {}",
                 name.trim()
             )));
@@ -73,7 +73,7 @@ impl MambaApp {
     ) -> Result<NotificationEndpoint> {
         self.ensure_permission(actor, Permission::NotificationManage)?;
         if connector == NotificationConnector::Generic {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "use register_notification_endpoint for a generic signed webhook".into(),
             ));
         }
@@ -90,7 +90,7 @@ impl MambaApp {
             .values()
             .any(|endpoint| endpoint.name.eq_ignore_ascii_case(name.trim()) && endpoint.active)
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "active notification endpoint already exists: {}",
                 name.trim()
             )));
@@ -129,12 +129,12 @@ impl MambaApp {
             .state
             .notification_endpoints
             .get(endpoint_id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "notification endpoint",
                 id: endpoint_id.to_string(),
             })?;
         if !endpoint.active {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "notification endpoint {endpoint_id} is already disabled"
             )));
         }
@@ -204,7 +204,7 @@ impl MambaApp {
             .state
             .notification_deliveries
             .get(delivery_id)
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "notification delivery",
                 id: delivery_id.to_string(),
             })?;
@@ -212,7 +212,7 @@ impl MambaApp {
             delivery.status,
             NotificationStatus::Delivered | NotificationStatus::Cancelled
         ) {
-            return Err(MambaError::InvalidTransition(format!(
+            return Err(RelayError::InvalidTransition(format!(
                 "notification delivery {delivery_id} is already delivered"
             )));
         }
@@ -246,7 +246,7 @@ impl MambaApp {
     ) -> Result<NotificationDispatchSummary> {
         self.ensure_permission(actor, Permission::NotificationManage)?;
         if limit == 0 || limit > 1_000 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "notification dispatch limit must be between 1 and 1000".into(),
             ));
         }
@@ -277,7 +277,7 @@ impl MambaApp {
             .get(endpoint_id)
             .filter(|endpoint| endpoint.active)
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "active notification endpoint",
                 id: endpoint_id.to_string(),
             })?;

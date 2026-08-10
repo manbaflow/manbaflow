@@ -4,12 +4,12 @@ pub mod core;
 pub mod interfaces;
 
 pub use adapters::{
-    capability, executor, gitlab, gitlab_write, identity, interaction, migration, notification,
-    office, sandbox, store, tenant, worktree,
+    capability, executor, feishu_auth, gitlab, gitlab_write, identity, interaction, migration,
+    notification, office, sandbox, store, tenant, worktree,
 };
 pub use application::{app, dashboard, matcher, planner, scheduler};
 pub use core::{calendar, domain, error, event, ids, state};
 pub use interfaces::{console, scim, server, showcase, tui, worker};
 
-pub use app::MambaApp;
-pub use error::{MambaError, Result};
+pub use app::RelayApp;
+pub use error::{RelayError, Result};

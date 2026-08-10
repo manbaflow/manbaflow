@@ -2,15 +2,15 @@ use std::collections::BTreeSet;
 
 use chrono::Utc;
 
-use super::MambaApp;
+use super::RelayApp;
 use crate::domain::{
     AssignmentTarget, FlowMessage, FlowMessageKind, MessageInboxItem, PrincipalKind, TargetKind,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 
-impl MambaApp {
+impl RelayApp {
     #[allow(clippy::too_many_arguments)]
     pub fn post_flow_message(
         &mut self,
@@ -24,14 +24,14 @@ impl MambaApp {
     ) -> Result<FlowMessage> {
         let sender = self.state.principal(sender)?.clone();
         if !sender.active {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "principal {} is inactive",
                 sender.name
             )));
         }
         let flow = self.state.flow(flow_id)?.clone();
         if !self.principal_has_flow_access(&flow, &sender) {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "{} cannot access flow {}",
                 sender.name, flow.id
             )));
@@ -40,7 +40,7 @@ impl MambaApp {
             .map(|value| {
                 flow.task(value)
                     .map(|task| task.id.clone())
-                    .ok_or_else(|| MambaError::NotFound {
+                    .ok_or_else(|| RelayError::NotFound {
                         entity: "task",
                         id: value.to_string(),
                     })
@@ -48,12 +48,12 @@ impl MambaApp {
             .transpose()?;
         let body = body.trim();
         if body.is_empty() || body.chars().count() > 4_000 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "flow message body must contain 1 to 4000 characters".into(),
             ));
         }
         if recipients.is_empty() || recipients.len() > 32 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "flow message must target between 1 and 32 recipients".into(),
             ));
         }
@@ -65,7 +65,7 @@ impl MambaApp {
         for recipient in recipients {
             let target = if let Ok(principal) = self.state.principal(recipient) {
                 if !principal.active {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "recipient {} is inactive",
                         principal.name
                     )));
@@ -81,7 +81,7 @@ impl MambaApp {
             } else {
                 let team = self.state.team(recipient)?;
                 if !team.active {
-                    return Err(MambaError::Validation(format!(
+                    return Err(RelayError::Validation(format!(
                         "recipient team {} is inactive",
                         team.name
                     )));
@@ -93,7 +93,7 @@ impl MambaApp {
                 }
             };
             if !sender_is_requester && !self.message_target_is_flow_participant(&flow, &target) {
-                return Err(MambaError::PermissionDenied(format!(
+                return Err(RelayError::PermissionDenied(format!(
                     "only demand requester {} can bring {} into flow {}",
                     requester.name, target.name, flow.id
                 )));
@@ -161,7 +161,7 @@ impl MambaApp {
         let flow = self.state.flow(flow_id)?;
         let principal = self.state.principal(actor)?;
         if !self.principal_has_flow_access(flow, principal) {
-            return Err(MambaError::PermissionDenied(format!(
+            return Err(RelayError::PermissionDenied(format!(
                 "{} cannot access flow {}",
                 principal.name, flow.id
             )));

@@ -1,0 +1,213 @@
+# Relay 控制面部署。
+#
+#   kubectl apply -f deploy/k8s/relay.yaml
+#
+# 放在集群内而不是独立服务器，是因为大脑需要直连这些内网服务：
+#   gitlab.gitlab.svc:80              GitLab（读 MR/Pipeline，Human Gate 后写）
+#   kg-agent.agent.svc:50065          记忆与画像
+#   summary-agent.agent.svc:50063     会议纪要 → 结构化 Task
+#   multimodal-agent.agent.svc:50064  语音转写与声纹
+#   postgresql.postgresql.svc:5432    共享 PostgreSQL 18
+#
+# 前置步骤见 deploy/k8s/README.md，简述：
+#   1) 拉私有 registry 的 secret：relay 命名空间里要有 gitlab-registry
+#   2) 在共享 PostgreSQL 里建独立库和最小权限账号
+#   3) 把连接串写进 relay-database-url secret
+#   4) 跑一次 relay-setup Job 初始化组织和管理员 Token
+#   5) 在 platform/deploy 仓库给 relay.edumind.ai 加一条 nginx 路由
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: relay
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay
+  namespace: relay
+  labels:
+    app: relay
+spec:
+  # 状态全在 PostgreSQL 里（含 Tenant 目录，见 src/adapters/tenant.rs:49），
+  # 本地数据目录只是临时盘，所以可以多副本滚动更新。
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: relay
+  template:
+    metadata:
+      labels:
+        app: relay
+    spec:
+      imagePullSecrets:
+        - name: gitlab-registry
+      securityContext:
+        runAsNonRoot: true
+        # 镜像里建的系统用户就是 10001（见 Dockerfile）。
+        runAsUser: 10001
+        runAsGroup: 10001
+        # 让 kubelet 把 secret 卷 chgrp 到这个组，容器才读得到连接串。
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: relay
+          image: registry.edumind.ai/platform/relay/main:latest
+          imagePullPolicy: Always
+          args:
+            - serve
+            - --bind
+            - 0.0.0.0:7777
+            # TLS 在 platform-nginx 终止，容器内只跑明文 HTTP。
+            - --allow-insecure-public-http
+          ports:
+            - containerPort: 7777
+              name: http
+          env:
+            # 只给文件路径，不把连接串放进环境变量列表——否则 kubectl describe pod
+            # 和进程环境都能看到（与 docs/INSTALLATION.md 的外部数据库约定一致）。
+            - name: RELAY_DATABASE_URL_FILE
+              value: /run/secrets/relay-database-url
+          # 飞书登录。整组来自 relay-feishu Secret；没建这个 Secret 就不会启用飞书登录，
+          # 其余功能不受影响（optional: true）。注意 ALLOWED_TENANT_KEYS 漏配等于对全网
+          # 开放，所以适配器在缺失时直接拒绝启动，见 docs/IDENTITY.md。
+          envFrom:
+            - secretRef:
+                name: relay-feishu
+                optional: true
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: database-url
+              mountPath: /run/secrets
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/relay
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+      volumes:
+        - name: database-url
+          secret:
+            secretName: relay-database-url
+            defaultMode: 0440
+        # 数据目录在 PostgreSQL 模式下只放临时文件和 worktree 暂存，
+        # 权威状态在库里，所以不需要 PVC，也不会因为 RWO 卡住副本数。
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay
+  namespace: relay
+  labels:
+    app: relay
+spec:
+  type: ClusterIP
+  selector:
+    app: relay
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# 幂等初始化：建组织、首个团队、管理员，并签发一次性登录 Token。
+# 重复执行不会重建组织，也不会重复签发（见 src/application/app/setup.rs）。
+# Token 只在日志里出现一次：
+#   kubectl -n relay logs job/relay-setup
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: relay-setup
+  namespace: relay
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: gitlab-registry
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: setup
+          image: registry.edumind.ai/platform/relay/main:latest
+          imagePullPolicy: Always
+          args:
+            - setup
+            - --organization
+            - EduMind
+            - --administrator
+            - 管理员
+            - --team
+            - 平台研发组
+            - --capabilities
+            - product,delivery,backend,frontend,quality,operations
+            - --utc-offset
+            - "+08:00"
+          env:
+            - name: RELAY_DATABASE_URL_FILE
+              value: /run/secrets/relay-database-url
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: database-url
+              mountPath: /run/secrets
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/relay
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: database-url
+          secret:
+            secretName: relay-database-url
+            defaultMode: 0440
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

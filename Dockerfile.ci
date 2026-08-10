@@ -1,0 +1,45 @@
+# CI 构建镜像：先跑格式、Clippy 和全部测试，通过后才产出运行时镜像。
+#
+# 检查放在构建阶段而不是独立 job，是因为集群 runner 侧没有 rust 基础镜像，
+# 而 buildkit 配了 docker.io 镜像源（见 buildkit-service-system/buildkit-config），
+# 可以直接拉 rust:bookworm。这样不需要先往 infra/images 里加镜像。
+#
+# 测试不依赖 Docker daemon，也不依赖外部 PostgreSQL：
+# tests/postgres_data_plane.rs 在 RELAY_TEST_DATABASE_URL 未设置时自动跳过。
+
+FROM rust:bookworm AS builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rust-toolchain.toml README.md LICENSE ./
+COPY src ./src
+COPY tests ./tests
+
+# 分成独立 RUN，失败时能直接看出是哪一步挂的，缓存粒度也更细。
+RUN cargo fmt --all -- --check
+RUN cargo clippy --all-targets --all-features --locked -- -D warnings
+RUN cargo test --all-targets --locked
+RUN cargo build --release --locked
+
+FROM debian:bookworm-slim
+
+ARG OCI_REVISION=unknown
+ARG OCI_SOURCE=unknown
+LABEL org.opencontainers.image.revision=$OCI_REVISION
+LABEL org.opencontainers.image.source=$OCI_SOURCE
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --create-home relay \
+    && install -d -m 0700 -o relay -g relay /var/lib/relay
+
+COPY --from=builder /build/target/release/relay /usr/local/bin/relay
+
+USER relay
+VOLUME ["/var/lib/relay"]
+EXPOSE 7777
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl --fail --silent http://127.0.0.1:7777/health/ready > /dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/relay", "--data-dir", "/var/lib/relay"]
+CMD ["serve", "--bind", "0.0.0.0:7777", "--allow-insecure-public-http"]

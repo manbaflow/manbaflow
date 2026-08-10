@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, VecDeque};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::domain::{Assignment, Estimate, Flow, TargetKind, Task, TaskDraft, TaskStatus};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::ids::new_id;
 use crate::state::OrganizationState;
 
@@ -27,7 +27,7 @@ pub fn schedule(
     state: &OrganizationState,
 ) -> Result<Schedule> {
     if drafts.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "a plan must contain at least one task".to_string(),
         ));
     }
@@ -38,7 +38,7 @@ pub fn schedule(
         .map(|(index, task)| (task.key.clone(), index))
         .collect::<BTreeMap<_, _>>();
     if by_key.len() != drafts.len() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "task keys must be unique".to_string(),
         ));
     }
@@ -48,13 +48,13 @@ pub fn schedule(
     for (index, task) in drafts.iter().enumerate() {
         for dependency in &task.depends_on {
             let dependency_index = *by_key.get(dependency).ok_or_else(|| {
-                MambaError::Validation(format!(
+                RelayError::Validation(format!(
                     "task `{}` depends on unknown task `{dependency}`",
                     task.key
                 ))
             })?;
             if dependency_index == index {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "task `{}` cannot depend on itself",
                     task.key
                 )));
@@ -80,7 +80,7 @@ pub fn schedule(
         }
     }
     if order.len() != drafts.len() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "task dependency graph contains a cycle".to_string(),
         ));
     }
@@ -97,7 +97,7 @@ pub fn schedule(
         let draft = &drafts[index];
         let assignment = assignments
             .get(&draft.key)
-            .ok_or_else(|| MambaError::NoEligibleAssignee(draft.title.clone()))?;
+            .ok_or_else(|| RelayError::NoEligibleAssignee(draft.title.clone()))?;
         let capacity = assignment_capacity(assignment, state).max(0.1);
         let coordination_factor = 1.0
             + if draft.depends_on.len() > 1 { 0.1 } else { 0.0 }
@@ -204,7 +204,7 @@ pub fn reschedule(
     now: DateTime<Utc>,
 ) -> Result<Reschedule> {
     if flow.tasks.is_empty() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "a flow must contain at least one task".into(),
         ));
     }
@@ -219,13 +219,13 @@ pub fn reschedule(
     for (index, task) in flow.tasks.iter().enumerate() {
         for dependency in &task.depends_on {
             let dependency_index = *by_id.get(dependency).ok_or_else(|| {
-                MambaError::Validation(format!(
+                RelayError::Validation(format!(
                     "task `{}` depends on unknown task `{dependency}`",
                     task.key
                 ))
             })?;
             if dependency_index == index {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "task `{}` cannot depend on itself",
                     task.key
                 )));
@@ -250,7 +250,7 @@ pub fn reschedule(
         }
     }
     if order.len() != flow.tasks.len() {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "task dependency graph contains a cycle".into(),
         ));
     }
@@ -288,7 +288,7 @@ pub fn reschedule(
             let assignment = task
                 .assignment
                 .as_ref()
-                .ok_or_else(|| MambaError::NoEligibleAssignee(task.title.clone()))?;
+                .ok_or_else(|| RelayError::NoEligibleAssignee(task.title.clone()))?;
             let capacity = assignment_capacity(assignment, state).max(0.1);
             let coordination_factor = 1.0
                 + if task.depends_on.len() > 1 { 0.1 } else { 0.0 }

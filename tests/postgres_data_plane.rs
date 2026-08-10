@@ -1,30 +1,30 @@
 use chrono::Utc;
-use manbaflow::domain::{
+use relay::domain::{
     CapabilityPack, ExecutorKind, FlightManifestDraft, OrganizationRole, PrincipalKind,
     RemoteFlightReport,
 };
-use manbaflow::ids::new_id;
-use manbaflow::migration::sqlite_fleet_to_postgres;
-use manbaflow::tenant::TenantCatalog;
-use manbaflow::{MambaApp, MambaError};
+use relay::ids::new_id;
+use relay::migration::sqlite_fleet_to_postgres;
+use relay::tenant::TenantCatalog;
+use relay::{RelayApp, RelayError};
 use tempfile::tempdir;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_replicas_share_tenant_events_and_credentials() {
-    let Some(database_url) = std::env::var("MAMBA_TEST_DATABASE_URL").ok() else {
-        eprintln!("skipping PostgreSQL integration test; MAMBA_TEST_DATABASE_URL is not set");
+    let Some(database_url) = std::env::var("RELAY_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping PostgreSQL integration test; RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let directory = tempdir().unwrap();
     let tenant_id = new_id("TEN");
-    let mut first = MambaApp::open_postgres(
+    let mut first = RelayApp::open_postgres(
         directory.path().join("first-runtime"),
         &database_url,
         &tenant_id,
     )
     .unwrap();
-    first.init_organization("Shared Mamba", "admin").unwrap();
-    let mut stale = MambaApp::open_postgres(
+    first.init_organization("Shared Relay", "admin").unwrap();
+    let mut stale = RelayApp::open_postgres(
         directory.path().join("second-runtime"),
         &database_url,
         &tenant_id,
@@ -37,7 +37,7 @@ async fn postgres_replicas_share_tenant_events_and_credentials() {
     let error = stale
         .create_team("People", "operations", "admin")
         .unwrap_err();
-    assert!(matches!(error, MambaError::ConcurrentModification { .. }));
+    assert!(matches!(error, RelayError::ConcurrentModification { .. }));
     stale.create_team("People", "operations", "admin").unwrap();
 
     let admin = stale
@@ -99,7 +99,7 @@ async fn postgres_replicas_share_tenant_events_and_credentials() {
         .create_demand(
             "Prepare a reviewable Office release",
             &office_human.name,
-            manbaflow::planner::PlannerKind::Local,
+            relay::planner::PlannerKind::Local,
             directory.path(),
             10,
         )
@@ -182,8 +182,8 @@ async fn postgres_replicas_share_tenant_events_and_credentials() {
     assert_eq!(catalog.find(&slug).unwrap().unwrap().id, tenant_id);
 
     let source_dir = directory.path().join("sqlite-source");
-    let mut source = MambaApp::open(&source_dir).unwrap();
-    source.init_organization("Migrated Mamba", "admin").unwrap();
+    let mut source = RelayApp::open(&source_dir).unwrap();
+    source.init_organization("Migrated Relay", "admin").unwrap();
     let source_team = source
         .create_team("Migration", "operations", "admin")
         .unwrap();
@@ -212,7 +212,7 @@ async fn postgres_replicas_share_tenant_events_and_credentials() {
             .replayed_tenants,
         1
     );
-    let migrated = MambaApp::open_postgres(
+    let migrated = RelayApp::open_postgres(
         directory.path().join("migrated-runtime"),
         &database_url,
         &source_tenant_id,

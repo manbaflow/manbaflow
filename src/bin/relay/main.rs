@@ -3,33 +3,33 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use manbaflow::calendar::{parse_workdays, summary as calendar_summary};
-use manbaflow::dashboard::DashboardSnapshot;
-use manbaflow::domain::{
+use relay::calendar::{parse_workdays, summary as calendar_summary};
+use relay::dashboard::DashboardSnapshot;
+use relay::domain::{
     CapabilityPack, ExecutorConfig, ExecutorKind, ExecutorMode, FlightManifestDraft, Flow,
     FlowChangeRequest, FlowMessage, FlowMessageKind, NotificationConnector, NotificationDelivery,
     NotificationEndpoint, NotificationStatus, OrganizationRole, PrincipalKind, RecoveryAction,
     Task, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
-use manbaflow::gitlab::GitLabClient;
-use manbaflow::ids::new_id;
-use manbaflow::planner::PlannerKind;
-use manbaflow::sandbox::{DockerSandboxConfig, SandboxBackend, SandboxNetwork};
-use manbaflow::showcase::seed_showcase;
-use manbaflow::tenant::{TenantCatalog, TenantRecord, database_url_from_env, validate_slug};
-use manbaflow::worker::{RemoteWorker, WorkerOptions, WorkerOutcome, WorkerOutcomeStatus};
-use manbaflow::{MambaApp, MambaError, Result};
+use relay::gitlab::GitLabClient;
+use relay::ids::new_id;
+use relay::planner::PlannerKind;
+use relay::sandbox::{DockerSandboxConfig, SandboxBackend, SandboxNetwork};
+use relay::showcase::seed_showcase;
+use relay::tenant::{TenantCatalog, TenantRecord, database_url_from_env, validate_slug};
+use relay::worker::{RemoteWorker, WorkerOptions, WorkerOutcome, WorkerOutcomeStatus};
+use relay::{RelayApp, RelayError, Result};
 use serde::Serialize;
 use serde_json::json;
 
 #[derive(Parser)]
 #[command(
-    name = "mamba",
+    name = "relay",
     version,
     about = "Enterprise Human-Agent Flow control plane"
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = ".mambaflow")]
+    #[arg(long, global = true, default_value = ".relay")]
     data_dir: PathBuf,
 
     #[arg(long, global = true)]
@@ -105,7 +105,7 @@ enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
-    /// 在 Flow 内向团队、Human 或 Agent 传球并跟踪回执
+    /// 在 Flow 内向团队、Human 或 Agent 发送消息并跟踪回执
     Message {
         #[command(subcommand)]
         command: MessageCommand,
@@ -152,7 +152,7 @@ enum Command {
         #[command(subcommand)]
         command: OpsCommand,
     },
-    /// 初始化一套牢大、佐巴扬与两个副驾的演示阵容
+    /// 初始化一套陈静、李伟与两个副驾的演示数据
     Demo {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
@@ -508,7 +508,7 @@ enum WorkerCommand {
 
 #[derive(Args)]
 struct WorkerArgs {
-    /// Control Plane 根地址；也可使用 MAMBA_SERVER
+    /// Control Plane 根地址；也可使用 RELAY_SERVER
     #[arg(long)]
     server: Option<String>,
     #[arg(long, value_enum)]
@@ -532,7 +532,7 @@ struct WorkerArgs {
     sandbox: SandboxBackendArg,
     #[arg(long, default_value = "docker")]
     sandbox_runtime: PathBuf,
-    #[arg(long, default_value = "manbaflow-agent-runtime:0.1.0")]
+    #[arg(long, default_value = "relay-agent-runtime:0.1.0")]
     sandbox_image: String,
     /// none 禁止联网；云端模型需要显式选择 bridge 并由出口策略约束
     #[arg(long, value_enum, default_value = "none")]
@@ -853,7 +853,7 @@ enum OpsCommand {
     /// 把本地 SQLite Tenant Fleet 原样迁移到共享 PostgreSQL 数据面
     MigratePostgres {
         /// 保存目标 PostgreSQL URL 的环境变量名
-        #[arg(long, default_value = "MAMBA_TARGET_DATABASE_URL")]
+        #[arg(long, default_value = "RELAY_TARGET_DATABASE_URL")]
         target_env: String,
     },
 }
@@ -1005,7 +1005,7 @@ async fn run(cli: Cli) -> Result<()> {
         workspace: PathBuf::from("."),
     });
     if cli.tenant.is_some() && matches!(&command, Command::Serve { .. } | Command::Tenant { .. }) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "--tenant selects a CLI Ledger and cannot be combined with serve or tenant management"
                 .into(),
         ));
@@ -1024,7 +1024,7 @@ async fn run(cli: Cli) -> Result<()> {
     )?;
     match command {
         Command::Setup(args) => {
-            let setup = app.setup_installation(manbaflow::app::InstallationSetupOptions {
+            let setup = app.setup_installation(relay::app::InstallationSetupOptions {
                 organization_name: args.organization,
                 team_name: args.team,
                 administrator_name: args.administrator,
@@ -1077,9 +1077,9 @@ async fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::Tui { actor, workspace } => {
-            manbaflow::tui::run(
+            relay::tui::run(
                 &mut app,
-                manbaflow::tui::TuiOptions {
+                relay::tui::TuiOptions {
                     workspace: absolute_path(workspace)?,
                     actor,
                 },
@@ -1094,9 +1094,9 @@ async fn run(cli: Cli) -> Result<()> {
             escalate_after_hours,
             notification_interval,
         } => {
-            manbaflow::server::run_fleet(
+            relay::server::run_fleet(
                 &cli.data_dir,
-                manbaflow::server::ServerOptions {
+                relay::server::ServerOptions {
                     bind,
                     allow_insecure_public_http,
                     tracker_interval_seconds: tracker_interval,
@@ -1115,22 +1115,22 @@ async fn run(cli: Cli) -> Result<()> {
                 TenantCommand::Create { name, slug, by } => {
                     let slug = validate_slug(&slug)?;
                     if catalog.find(&slug)?.is_some() {
-                        return Err(MambaError::Validation(format!(
+                        return Err(RelayError::Validation(format!(
                             "tenant already exists: {slug}"
                         )));
                     }
                     let relative_path = PathBuf::from("tenants").join(&slug);
                     let tenant_data_dir = cli.data_dir.join(&relative_path);
                     if tenant_data_dir.join("flow.db").exists() {
-                        return Err(MambaError::Validation(format!(
+                        return Err(RelayError::Validation(format!(
                             "unregistered tenant Ledger already exists: {}",
                             tenant_data_dir.display()
                         )));
                     }
                     let mut tenant_app = if let Some(database_url) = database_url_from_env()? {
-                        MambaApp::open_postgres(&tenant_data_dir, &database_url, &new_id("TEN"))?
+                        RelayApp::open_postgres(&tenant_data_dir, &database_url, &new_id("TEN"))?
                     } else {
-                        MambaApp::open(&tenant_data_dir)?
+                        RelayApp::open(&tenant_data_dir)?
                     };
                     tenant_app.init_organization(&name, &by)?;
                     let tenant = tenant_app.state().tenant()?.clone();
@@ -1226,7 +1226,7 @@ async fn run(cli: Cli) -> Result<()> {
                 output(
                     &principal,
                     cli.json,
-                    format!("{} 加入轮换 ({})", principal.name, principal.id),
+                    format!("{} 加入组织 ({})", principal.name, principal.id),
                 );
             }
             PrincipalCommand::List => output(
@@ -1516,7 +1516,7 @@ async fn run(cli: Cli) -> Result<()> {
                 output(
                     &flow,
                     cli.json,
-                    format!("{} 已批准，{} 个任务完成传球", flow.id, flow.tasks.len()),
+                    format!("{} 已批准，{} 个任务完成派发", flow.id, flow.tasks.len()),
                 );
             }
             FlowCommand::ChangePropose {
@@ -1566,7 +1566,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             TaskCommand::Accept { task, by } => {
                 let task = app.accept_task(&task, &by)?;
-                output(&task, cli.json, format!("{} 接球：{}", by, task.title));
+                output(&task, cli.json, format!("{} 已接单：{}", by, task.title));
             }
             TaskCommand::Reject { task, by, reason } => {
                 let task = app.reject_task(&task, &by, &reason)?;
@@ -1608,7 +1608,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &flow,
                     cli.json,
                     format!(
-                        "{} 已换防给 {}；Flow P80 更新为 {}",
+                        "{} 已改派给 {}；Flow P80 更新为 {}",
                         task.id,
                         task.assignment.as_ref().unwrap().owner.name,
                         flow.p80_finish.format("%Y-%m-%d %H:%M UTC")
@@ -1678,7 +1678,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let mut manifest = manifest
                     .map(|path| {
                         let bytes = std::fs::read(path)?;
-                        Ok::<_, MambaError>(serde_json::from_slice::<FlightManifestDraft>(&bytes)?)
+                        Ok::<_, RelayError>(serde_json::from_slice::<FlightManifestDraft>(&bytes)?)
                     })
                     .transpose()?
                     .unwrap_or_default();
@@ -1747,11 +1747,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             TaskCommand::Complete { task, by } => {
                 let task = app.complete_task(&task, &by)?;
-                output(
-                    &task,
-                    cli.json,
-                    format!("{} 已确认落地。Mamba Out.", task.id),
-                );
+                output(&task, cli.json, format!("{} 已确认落地。", task.id));
             }
         },
         Command::Message { command } => match command {
@@ -1777,7 +1773,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &message,
                     cli.json,
                     format!(
-                        "{} 已传球给 {}：{}",
+                        "{} 已发送给 {}：{}",
                         message.id,
                         message
                             .recipients
@@ -2052,7 +2048,7 @@ async fn run(cli: Cli) -> Result<()> {
             NotificationCommand::Test { endpoint, by } => {
                 let delivery = app.test_notification_endpoint(&endpoint, &by).await?;
                 if delivery.status != NotificationStatus::Delivered {
-                    return Err(MambaError::ExternalConnector(format!(
+                    return Err(RelayError::ExternalConnector(format!(
                         "{} test delivery crashed: {}",
                         delivery.id,
                         delivery.last_error.as_deref().unwrap_or("unknown error")
@@ -2061,7 +2057,7 @@ async fn run(cli: Cli) -> Result<()> {
                 output(
                     &delivery,
                     cli.json,
-                    format!("{} 测试传球已安全落地", delivery.id),
+                    format!("{} 测试消息已送达", delivery.id),
                 );
             }
         },
@@ -2076,7 +2072,7 @@ async fn run(cli: Cli) -> Result<()> {
                 poll_seconds,
             } => {
                 if poll_seconds == 0 {
-                    return Err(manbaflow::MambaError::Validation(
+                    return Err(relay::RelayError::Validation(
                         "worker poll interval must be greater than zero".into(),
                     ));
                 }
@@ -2119,7 +2115,7 @@ async fn run(cli: Cli) -> Result<()> {
                     .arg("--version")
                     .output()?;
                 if !result.status.success() {
-                    return Err(manbaflow::MambaError::ExecutorFailed {
+                    return Err(relay::RelayError::ExecutorFailed {
                         code: result.status.code(),
                         message: String::from_utf8_lossy(&result.stderr).into_owned(),
                     });
@@ -2152,7 +2148,7 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 let destination = destination.unwrap_or_else(|| {
                     app.data_dir().join("backups").join(format!(
-                        "mambaflow-{}.sqlite",
+                        "relay-{}.sqlite",
                         Utc::now().format("%Y%m%dT%H%M%SZ")
                     ))
                 });
@@ -2165,17 +2161,17 @@ async fn run(cli: Cli) -> Result<()> {
             }
             OpsCommand::MigratePostgres { target_env } => {
                 if app.uses_shared_storage() {
-                    return Err(MambaError::Validation(
+                    return Err(RelayError::Validation(
                         "PostgreSQL migration source must be a local SQLite data directory".into(),
                     ));
                 }
                 let database_url = std::env::var(&target_env).map_err(|_| {
-                    MambaError::Validation(format!(
+                    RelayError::Validation(format!(
                         "target database URL environment variable is missing: {target_env}"
                     ))
                 })?;
                 let report =
-                    manbaflow::migration::sqlite_fleet_to_postgres(&cli.data_dir, &database_url)?;
+                    relay::migration::sqlite_fleet_to_postgres(&cli.data_dir, &database_url)?;
                 output(
                     &report,
                     cli.json,
@@ -2206,12 +2202,12 @@ fn selected_tenant_data_dir(root: &Path, selector: Option<&str>) -> Result<PathB
     let catalog = TenantCatalog::open(root)?;
     let record = catalog
         .find(selector)?
-        .ok_or_else(|| MambaError::NotFound {
+        .ok_or_else(|| RelayError::NotFound {
             entity: "tenant",
             id: selector.to_string(),
         })?;
     if !record.active {
-        return Err(MambaError::PermissionDenied(format!(
+        return Err(RelayError::PermissionDenied(format!(
             "tenant {} is inactive",
             record.id
         )));
@@ -2223,32 +2219,32 @@ fn open_selected_app(
     root: &Path,
     selector: Option<&str>,
     allow_postgres_bootstrap: bool,
-) -> Result<MambaApp> {
+) -> Result<RelayApp> {
     let Some(database_url) = database_url_from_env()? else {
-        return MambaApp::open(selected_tenant_data_dir(root, selector)?);
+        return RelayApp::open(selected_tenant_data_dir(root, selector)?);
     };
     let catalog = TenantCatalog::postgres(root, &database_url)?;
     let record = if let Some(selector) = selector {
         catalog
             .find(selector)?
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "tenant",
                 id: selector.to_string(),
             })?
     } else if let Some(record) = catalog.default_tenant()? {
         record
     } else if allow_postgres_bootstrap {
-        return MambaApp::open_postgres(root, &database_url, &new_id("TEN"));
+        return RelayApp::open_postgres(root, &database_url, &new_id("TEN"));
     } else {
-        return Err(MambaError::TenantNotInitialized);
+        return Err(RelayError::TenantNotInitialized);
     };
     if !record.active {
-        return Err(MambaError::PermissionDenied(format!(
+        return Err(RelayError::PermissionDenied(format!(
             "tenant {} is inactive",
             record.id
         )));
     }
-    MambaApp::open_postgres(catalog.data_dir(&record)?, &database_url, &record.id)
+    RelayApp::open_postgres(catalog.data_dir(&record)?, &database_url, &record.id)
 }
 
 fn format_tenant_records(records: &[TenantRecord]) -> String {
@@ -2271,20 +2267,20 @@ fn format_tenant_records(records: &[TenantRecord]) -> String {
 }
 
 async fn bootstrap_demo(
-    app: &mut MambaApp,
+    app: &mut RelayApp,
     workspace: &Path,
     include_showcase: bool,
     json_output: bool,
 ) -> Result<()> {
     let workspace = absolute_path(workspace)?;
-    let org = app.init_organization("Mamba Labs", "admin")?;
+    let org = app.init_organization("Relay Labs", "admin")?;
     let team = app.create_team(
-        "洛杉矶研发队",
+        "平台研发组",
         "product,backend,rust,llm-platform,security,quality,observability,operations",
         "admin",
     )?;
     let leader = app.register_principal(
-        "牢大",
+        "陈静",
         PrincipalKind::Human,
         Some(&team.id),
         None,
@@ -2294,7 +2290,7 @@ async fn bootstrap_demo(
         "admin",
     )?;
     let engineer = app.register_principal(
-        "佐巴扬",
+        "李伟",
         PrincipalKind::Human,
         Some(&team.id),
         None,
@@ -2360,13 +2356,13 @@ async fn bootstrap_demo(
         if include_showcase {
             "演示塔台就位：3 条 Flow 已覆盖执行、阻塞、待验收、完成和远程 Flight Lease。".into()
         } else {
-            "演示阵容就位：牢大与佐巴扬带队，Codex 和 Claude Code 已进入轮换。".into()
+            "演示数据就位：陈静与李伟就位，Codex 和 Claude Code 已就位。".into()
         },
     );
     Ok(())
 }
 
-fn print_chart(app: &MambaApp, json_output: bool) -> Result<()> {
+fn print_chart(app: &RelayApp, json_output: bool) -> Result<()> {
     let org = app.state().organization()?;
     let data = json!({
         "organization": org,
@@ -2488,7 +2484,7 @@ fn parse_datetime(value: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
         .map_err(|_| {
-            MambaError::Validation(format!(
+            RelayError::Validation(format!(
                 "invalid RFC3339 datetime `{value}`; example: 2026-07-20T09:00:00+08:00"
             ))
         })
@@ -2500,22 +2496,22 @@ fn parse_utc_offset(value: &str) -> Result<i32> {
         Some(b'+') => 1,
         Some(b'-') => -1,
         _ => {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "UTC offset must start with + or -, for example +08:00".into(),
             ));
         }
     };
     let (hours, minutes) = value[1..]
         .split_once(':')
-        .ok_or_else(|| MambaError::Validation("UTC offset must use +HH:MM".into()))?;
+        .ok_or_else(|| RelayError::Validation("UTC offset must use +HH:MM".into()))?;
     let hours = hours
         .parse::<i32>()
-        .map_err(|_| MambaError::Validation("UTC offset hours must be numeric".into()))?;
+        .map_err(|_| RelayError::Validation("UTC offset hours must be numeric".into()))?;
     let minutes = minutes
         .parse::<i32>()
-        .map_err(|_| MambaError::Validation("UTC offset minutes must be numeric".into()))?;
+        .map_err(|_| RelayError::Validation("UTC offset minutes must be numeric".into()))?;
     if hours > 14 || minutes > 59 || (hours == 14 && minutes != 0) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "UTC offset must be between -14:00 and +14:00".into(),
         ));
     }
@@ -2528,15 +2524,15 @@ fn parse_clock_minute(value: &str, allow_end_of_day: bool) -> Result<u16> {
     }
     let (hours, minutes) = value
         .split_once(':')
-        .ok_or_else(|| MambaError::Validation("clock time must use HH:MM".into()))?;
+        .ok_or_else(|| RelayError::Validation("clock time must use HH:MM".into()))?;
     let hours = hours
         .parse::<u16>()
-        .map_err(|_| MambaError::Validation("clock hours must be numeric".into()))?;
+        .map_err(|_| RelayError::Validation("clock hours must be numeric".into()))?;
     let minutes = minutes
         .parse::<u16>()
-        .map_err(|_| MambaError::Validation("clock minutes must be numeric".into()))?;
+        .map_err(|_| RelayError::Validation("clock minutes must be numeric".into()))?;
     if hours > 23 || minutes > 59 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "clock time must be within 00:00..23:59".into(),
         ));
     }
@@ -2655,12 +2651,12 @@ fn dashboard_text(dashboard: &DashboardSnapshot) -> String {
 }
 
 fn remote_worker(args: WorkerArgs, data_dir: &Path) -> Result<RemoteWorker> {
-    let token = std::env::var("MAMBA_TOKEN").map_err(|_| {
-        manbaflow::MambaError::Validation("MAMBA_TOKEN is required for a remote worker".into())
+    let token = std::env::var("RELAY_TOKEN").map_err(|_| {
+        relay::RelayError::Validation("RELAY_TOKEN is required for a remote worker".into())
     })?;
     let server_url = args
         .server
-        .or_else(|| std::env::var("MAMBA_SERVER").ok())
+        .or_else(|| std::env::var("RELAY_SERVER").ok())
         .unwrap_or_else(|| "http://127.0.0.1:7777".into());
     let sandbox: SandboxBackend = args.sandbox.into();
     let docker = (sandbox == SandboxBackend::Docker).then(|| DockerSandboxConfig {

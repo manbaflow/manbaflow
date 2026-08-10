@@ -2,17 +2,17 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Utc};
 
-use super::MambaApp;
+use super::RelayApp;
 use crate::application::tracker;
 use crate::domain::{
     AttentionSeverity, FlowStatus, Principal, PrincipalKind, TrackingAttention, TrackingEscalation,
     TrackingScan,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 
-impl MambaApp {
+impl RelayApp {
     pub fn scan_tracking(&mut self, stale_after_hours: u64, actor: &str) -> Result<TrackingScan> {
         self.scan_tracking_with_policy(stale_after_hours, 4, actor)
     }
@@ -50,18 +50,18 @@ impl MambaApp {
     ) -> Result<TrackingScan> {
         self.state.organization()?;
         if stale_after_hours == 0 {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "stale-after hours must be greater than zero".into(),
             ));
         }
         let stale_after = i64::try_from(stale_after_hours)
             .ok()
             .and_then(Duration::try_hours)
-            .ok_or_else(|| MambaError::Validation("stale-after hours is too large".into()))?;
+            .ok_or_else(|| RelayError::Validation("stale-after hours is too large".into()))?;
         let escalate_after = i64::try_from(escalate_after_hours)
             .ok()
             .and_then(Duration::try_hours)
-            .ok_or_else(|| MambaError::Validation("escalate-after hours is too large".into()))?;
+            .ok_or_else(|| RelayError::Validation("escalate-after hours is too large".into()))?;
         let findings = tracker::evaluate(&self.state, now, stale_after);
         let desired = findings
             .into_iter()
@@ -115,7 +115,7 @@ impl MambaApp {
                     self.state
                         .attentions
                         .get(attention_id)
-                        .ok_or_else(|| MambaError::NotFound {
+                        .ok_or_else(|| RelayError::NotFound {
                             entity: "tracking attention",
                             id: attention_id.clone(),
                         })?
@@ -151,7 +151,7 @@ impl MambaApp {
         for (attention_id, escalation_id) in &current_escalations {
             if !projected_ids.contains(attention_id.as_str()) {
                 let escalation = self.state.escalations.get(escalation_id).ok_or_else(|| {
-                    MambaError::NotFound {
+                    RelayError::NotFound {
                         entity: "tracking escalation",
                         id: escalation_id.clone(),
                     }

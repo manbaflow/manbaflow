@@ -21,7 +21,7 @@ RUN npm install --global \
     && codex --version \
     && claude --version
 
-RUN useradd --uid 10001 --create-home --shell /bin/bash mamba
+RUN useradd --uid 10001 --create-home --shell /bin/bash relay
 
 ENV DISABLE_AUTOUPDATER=1 \
     DISABLE_UPDATES=1

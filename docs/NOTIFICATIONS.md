@@ -1,4 +1,4 @@
-# MambaFlow Notification Connector
+# Relay Notification Connector
 
 Notification Connector 把 Flow Ledger 中需要人或外部系统关注的事件可靠投递到企业 Webhook。接收方可以是
 飞书、Slack、Teams，也可以是自动化平台、Office 服务或公司自己的消息网关。
@@ -8,12 +8,12 @@ Notification Connector 把 Flow Ledger 中需要人或外部系统关注的事�
 密钥只存在于投递进程的环境变量中，Ledger 仅保存变量名：
 
 ```bash
-export MAMBA_OPS_WEBHOOK_SECRET='replace-with-a-random-secret'
+export RELAY_OPS_WEBHOOK_SECRET='replace-with-a-random-secret'
 
-mamba notification endpoint-add \
+relay notification endpoint-add \
   --name operations \
-  --url https://bridge.example.com/mambaflow \
-  --secret-env MAMBA_OPS_WEBHOOK_SECRET \
+  --url https://bridge.example.com/relay \
+  --secret-env RELAY_OPS_WEBHOOK_SECRET \
   --events work_request.sent,task.blocked,task.submitted,tracking.escalation_raised,flow.completed
 ```
 
@@ -22,34 +22,34 @@ mamba notification endpoint-add \
 
 ## 原生消息 Connector
 
-飞书、Slack 和 Teams 的 Webhook URL 本身都是凭据。MambaFlow 只把环境变量名写入 Ledger，不保存或通过
+飞书、Slack 和 Teams 的 Webhook URL 本身都是凭据。Relay 只把环境变量名写入 Ledger，不保存或通过
 管理 API 返回真实 URL：
 
 ```bash
-export MAMBA_FEISHU_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/...'
-export MAMBA_FEISHU_SIGNING_SECRET='replace-with-the-bot-signing-secret'
+export RELAY_FEISHU_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/...'
+export RELAY_FEISHU_SIGNING_SECRET='replace-with-the-bot-signing-secret'
 
-mamba notification connector-add \
+relay notification connector-add \
   --provider feishu \
   --name engineering-feishu \
-  --url-env MAMBA_FEISHU_WEBHOOK_URL \
-  --secret-env MAMBA_FEISHU_SIGNING_SECRET \
+  --url-env RELAY_FEISHU_WEBHOOK_URL \
+  --secret-env RELAY_FEISHU_SIGNING_SECRET \
   --events work_request.sent,task.blocked,tracking.escalation_raised,flow.completed
 ```
 
 Slack 和 Teams 不需要单独的 `--secret-env`，因为随机凭据已经包含在 Webhook URL 中：
 
 ```bash
-export MAMBA_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...'
-export MAMBA_TEAMS_WORKFLOW_URL='https://...'
+export RELAY_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...'
+export RELAY_TEAMS_WORKFLOW_URL='https://...'
 
-mamba notification connector-add \
+relay notification connector-add \
   --provider slack --name operations-slack \
-  --url-env MAMBA_SLACK_WEBHOOK_URL
+  --url-env RELAY_SLACK_WEBHOOK_URL
 
-mamba notification connector-add \
+relay notification connector-add \
   --provider teams --name leadership-teams \
-  --url-env MAMBA_TEAMS_WORKFLOW_URL
+  --url-env RELAY_TEAMS_WORKFLOW_URL
 ```
 
 三种 Connector 会分别生成飞书交互卡片、Slack Block Kit 和 Teams Adaptive Card。Teams 应使用 Workflows
@@ -60,23 +60,23 @@ mamba notification connector-add \
 `notification.failed` 留在 Ledger：
 
 ```bash
-mamba notification endpoint-list
-mamba notification test NEND-xxxxxxxx
+relay notification endpoint-list
+relay notification test NEND-xxxxxxxx
 ```
 
 ## HTTP 协议
 
-MambaFlow 发送 `POST application/json`：
+Relay 发送 `POST application/json`：
 
 ```json
 {
   "specversion": "1.0",
   "id": "NTF-xxxxxxxx",
-  "source": "mambaflow://organizations/ORG-xxxxxxxx",
+  "source": "relay://organizations/ORG-xxxxxxxx",
   "type": "task.blocked",
-  "subject": "mambaflow://flows/FLOW-xxxxxxxx",
+  "subject": "relay://flows/FLOW-xxxxxxxx",
   "time": "2026-07-17T09:00:00Z",
-  "actor": "佐巴扬",
+  "actor": "李伟",
   "data": {
     "type": "task_blocked",
     "data": {}
@@ -108,21 +108,21 @@ webhook-id + "." + webhook-timestamp + "." + raw_request_body
 失败数量，底部 `投递通知` 可以立即尝试。也可以通过 CLI 查看或强制重投：
 
 ```bash
-mamba notification deliveries
-mamba notification deliveries --all
-mamba notification dispatch --force --limit 50
+relay notification deliveries
+relay notification deliveries --all
+relay notification dispatch --force --limit 50
 ```
 
 停用 Endpoint 会把它尚未发送的记录转成 `cancelled`，不会删除 payload 或审计历史：
 
 ```bash
-mamba notification endpoint-disable NEND-xxxxxxxx
+relay notification endpoint-disable NEND-xxxxxxxx
 ```
 
 ## Office 与双向交互
 
 当前原生 Connector 收到 `work_request.sent`、`task.blocked`、升级或验收事件时生成适合供应商的卡片。
-Slack 支持经过 App Signing Secret 验证的接球与确认按钮；飞书和 Teams 的双向身份需要供应商 App/Bot 或
+Slack 支持经过 App Signing Secret 验证的接单与确认按钮；飞书和 Teams 的双向身份需要供应商 App/Bot 或
 Power Automate Bridge。身份绑定、允许动作、幂等回执和 Bridge 签名协议见
 [Human Interaction Gateway](INTERACTIONS.md)。
 

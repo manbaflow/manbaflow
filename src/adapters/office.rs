@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::domain::{
     OfficeBodyType, OfficeProvider, OfficeReleasePayload, OfficeReleaseRequest, OfficeReleaseResult,
 };
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 #[derive(Clone)]
 pub struct OfficeBridge {
@@ -48,16 +48,16 @@ impl OfficeBridge {
         Ok(Self {
             client,
             microsoft: ProviderConfig::from_env(
-                "MAMBA_MICROSOFT_GRAPH_BASE_URL",
+                "RELAY_MICROSOFT_GRAPH_BASE_URL",
                 "https://graph.microsoft.com/v1.0/",
-                "MAMBA_MICROSOFT_GRAPH_TOKEN",
-                "MAMBA_MICROSOFT_GRAPH_TOKENS_JSON",
+                "RELAY_MICROSOFT_GRAPH_TOKEN",
+                "RELAY_MICROSOFT_GRAPH_TOKENS_JSON",
             )?,
             google: ProviderConfig::from_env(
-                "MAMBA_GOOGLE_WORKSPACE_BASE_URL",
+                "RELAY_GOOGLE_WORKSPACE_BASE_URL",
                 "https://www.googleapis.com/",
-                "MAMBA_GOOGLE_WORKSPACE_TOKEN",
-                "MAMBA_GOOGLE_WORKSPACE_TOKENS_JSON",
+                "RELAY_GOOGLE_WORKSPACE_TOKEN",
+                "RELAY_GOOGLE_WORKSPACE_TOKENS_JSON",
             )?,
         })
     }
@@ -289,13 +289,13 @@ impl OfficeBridge {
                 .append_pair("uploadType", "multipart")
                 .append_pair("supportsAllDrives", "true")
                 .append_pair("fields", "id,webViewLink");
-            let boundary = format!("mambaflow-{}", release.id);
+            let boundary = format!("relay-{}", release.id);
             let metadata = serde_json::to_vec(&json!({
                 "name": file_name,
                 "parents": [parent_id],
                 "appProperties": {
-                    "mambaflowReleaseId": release.id,
-                    "mambaflowPayloadSha256": release.payload_sha256
+                    "relayReleaseId": release.id,
+                    "relayPayloadSha256": release.payload_sha256
                 }
             }))
             .map_err(|error| dispatch_error(error, false))?;
@@ -374,8 +374,8 @@ impl OfficeBridge {
                     "attendees": attendees.iter().map(|email| json!({"email": email})).collect::<Vec<_>>(),
                     "location": location,
                     "extendedProperties": {"private": {
-                        "mambaflowReleaseId": release.id,
-                        "mambaflowPayloadSha256": release.payload_sha256
+                        "relayReleaseId": release.id,
+                        "relayPayloadSha256": release.payload_sha256
                     }}
                 })),
                 release,
@@ -417,7 +417,7 @@ impl ProviderConfig {
         let tenant_tokens = optional_env(tokens_name)?
             .map(|value| {
                 serde_json::from_str::<BTreeMap<String, String>>(&value).map_err(|_| {
-                    MambaError::Validation(format!(
+                    RelayError::Validation(format!(
                         "{tokens_name} must be a JSON object of Tenant IDs to OAuth access tokens"
                     ))
                 })
@@ -426,7 +426,7 @@ impl ProviderConfig {
             .unwrap_or_default();
         for (tenant_id, token) in &tenant_tokens {
             if !tenant_id.starts_with("TEN-") || token.len() < 20 {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "invalid Tenant ID or token in {tokens_name}: {tenant_id}"
                 )));
             }
@@ -435,7 +435,7 @@ impl ProviderConfig {
             .as_ref()
             .is_some_and(|token| token.len() < 20)
         {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "{token_name} must contain at least 20 characters"
             )));
         }
@@ -636,8 +636,8 @@ fn dispatch_error(error: impl std::fmt::Display, indeterminate: bool) -> OfficeD
     }
 }
 
-fn office_error(context: &str, error: impl std::fmt::Display) -> MambaError {
-    MambaError::ExternalConnector(format!("Office Bridge {context}: {error}"))
+fn office_error(context: &str, error: impl std::fmt::Display) -> RelayError {
+    RelayError::ExternalConnector(format!("Office Bridge {context}: {error}"))
 }
 
 fn optional_env(name: &str) -> Result<Option<String>> {
@@ -646,17 +646,17 @@ fn optional_env(name: &str) -> Result<Option<String>> {
     };
     let value = value
         .into_string()
-        .map_err(|_| MambaError::Validation(format!("{name} must be valid UTF-8")))?;
+        .map_err(|_| RelayError::Validation(format!("{name} must be valid UTF-8")))?;
     let value = value.trim().to_string();
     if value.is_empty() {
-        return Err(MambaError::Validation(format!("{name} cannot be empty")));
+        return Err(RelayError::Validation(format!("{name} cannot be empty")));
     }
     Ok(Some(value))
 }
 
 fn validate_base_url(name: &str, value: &str) -> Result<Url> {
     let mut url =
-        Url::parse(value).map_err(|_| MambaError::Validation(format!("invalid {name}")))?;
+        Url::parse(value).map_err(|_| RelayError::Validation(format!("invalid {name}")))?;
     let secure = url.scheme() == "https";
     let loopback = url.scheme() == "http"
         && url
@@ -668,7 +668,7 @@ fn validate_base_url(name: &str, value: &str) -> Result<Url> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "{name} must be HTTPS or loopback HTTP without credentials, query or fragment"
         )));
     }

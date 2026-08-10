@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::MambaApp;
+use crate::RelayApp;
 use crate::domain::{ExternalIdentityBinding, Principal, PrincipalKind, Team};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 pub const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
 pub const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
@@ -140,7 +140,7 @@ pub struct ScimError {
     pub scim_type: Option<String>,
 }
 
-pub fn list_users(app: &MambaApp, query: &ListQuery) -> Result<ListResponse<UserResource>> {
+pub fn list_users(app: &RelayApp, query: &ListQuery) -> Result<ListResponse<UserResource>> {
     validate_page(query)?;
     let filter = query.filter.as_deref().map(parse_filter).transpose()?;
     let mut resources = oidc_bindings(app)
@@ -159,12 +159,12 @@ pub fn list_users(app: &MambaApp, query: &ListQuery) -> Result<ListResponse<User
     page(resources, query)
 }
 
-pub fn get_user(app: &MambaApp, id: &str) -> Result<UserResource> {
+pub fn get_user(app: &RelayApp, id: &str) -> Result<UserResource> {
     let binding = user_binding(app, id)?;
     user_resource(app, binding)
 }
 
-pub fn create_user(app: &mut MambaApp, input: UserInput) -> Result<UserResource> {
+pub fn create_user(app: &mut RelayApp, input: UserInput) -> Result<UserResource> {
     validate_schema(&input.schemas, USER_SCHEMA)?;
     let subject = input.external_id.as_deref().unwrap_or(&input.user_name);
     let name = input.display_name.as_deref().unwrap_or(&input.user_name);
@@ -173,13 +173,13 @@ pub fn create_user(app: &mut MambaApp, input: UserInput) -> Result<UserResource>
     user_resource(app, &binding)
 }
 
-pub fn replace_user(app: &mut MambaApp, id: &str, input: UserInput) -> Result<UserResource> {
+pub fn replace_user(app: &mut RelayApp, id: &str, input: UserInput) -> Result<UserResource> {
     validate_schema(&input.schemas, USER_SCHEMA)?;
     let binding = user_binding(app, id)?.clone();
     if let Some(external_id) = input.external_id.as_deref()
         && external_id != binding.external_user_id
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "SCIM externalId is immutable".into(),
         ));
     }
@@ -196,7 +196,7 @@ pub fn replace_user(app: &mut MambaApp, id: &str, input: UserInput) -> Result<Us
     get_user(app, id)
 }
 
-pub fn patch_user(app: &mut MambaApp, id: &str, patch: PatchRequest) -> Result<UserResource> {
+pub fn patch_user(app: &mut RelayApp, id: &str, patch: PatchRequest) -> Result<UserResource> {
     validate_schema(&patch.schemas, PATCH_SCHEMA)?;
     let binding = user_binding(app, id)?.clone();
     let principal = app.state().principal(&binding.principal_id)?.clone();
@@ -205,7 +205,7 @@ pub fn patch_user(app: &mut MambaApp, id: &str, patch: PatchRequest) -> Result<U
     let mut active = principal.active;
     for operation in patch.operations {
         if !operation.op.eq_ignore_ascii_case("replace") {
-            return Err(MambaError::Validation(
+            return Err(RelayError::Validation(
                 "SCIM User PATCH supports replace operations only".into(),
             ));
         }
@@ -215,7 +215,7 @@ pub fn patch_user(app: &mut MambaApp, id: &str, patch: PatchRequest) -> Result<U
             Some("userName") => user_name = json_string(&operation.value, "userName")?,
             None => {
                 let object = operation.value.as_object().ok_or_else(|| {
-                    MambaError::Validation("SCIM replace value must be an object".into())
+                    RelayError::Validation("SCIM replace value must be an object".into())
                 })?;
                 if let Some(value) = object.get("active") {
                     active = json_bool(value, "active")?;
@@ -228,7 +228,7 @@ pub fn patch_user(app: &mut MambaApp, id: &str, patch: PatchRequest) -> Result<U
                 }
             }
             Some(path) => {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "unsupported SCIM User PATCH path: {path}"
                 )));
             }
@@ -245,7 +245,7 @@ pub fn patch_user(app: &mut MambaApp, id: &str, patch: PatchRequest) -> Result<U
     get_user(app, id)
 }
 
-pub fn delete_user(app: &mut MambaApp, id: &str) -> Result<()> {
+pub fn delete_user(app: &mut RelayApp, id: &str) -> Result<()> {
     let binding = user_binding(app, id)?.clone();
     let principal = app.state().principal(&binding.principal_id)?.clone();
     app.update_directory_human(
@@ -260,7 +260,7 @@ pub fn delete_user(app: &mut MambaApp, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn list_groups(app: &MambaApp, query: &ListQuery) -> Result<ListResponse<GroupResource>> {
+pub fn list_groups(app: &RelayApp, query: &ListQuery) -> Result<ListResponse<GroupResource>> {
     validate_page(query)?;
     let filter = query.filter.as_deref().map(parse_filter).transpose()?;
     let mut resources = app
@@ -282,10 +282,10 @@ pub fn list_groups(app: &MambaApp, query: &ListQuery) -> Result<ListResponse<Gro
     page(resources, query)
 }
 
-pub fn get_group(app: &MambaApp, id: &str) -> Result<GroupResource> {
+pub fn get_group(app: &RelayApp, id: &str) -> Result<GroupResource> {
     let team = app.state().team(id)?;
     if !team.active {
-        return Err(MambaError::NotFound {
+        return Err(RelayError::NotFound {
             entity: "SCIM Group",
             id: id.to_string(),
         });
@@ -293,7 +293,7 @@ pub fn get_group(app: &MambaApp, id: &str) -> Result<GroupResource> {
     group_resource(app, team)
 }
 
-pub fn create_group(app: &mut MambaApp, input: GroupInput) -> Result<GroupResource> {
+pub fn create_group(app: &mut RelayApp, input: GroupInput) -> Result<GroupResource> {
     validate_schema(&input.schemas, GROUP_SCHEMA)?;
     validate_members(app, &input.members)?;
     validate_group_external_id(app, None, input.external_id.as_deref())?;
@@ -309,12 +309,12 @@ pub fn create_group(app: &mut MambaApp, input: GroupInput) -> Result<GroupResour
     get_group(app, &team.id)
 }
 
-pub fn replace_group(app: &mut MambaApp, id: &str, input: GroupInput) -> Result<GroupResource> {
+pub fn replace_group(app: &mut RelayApp, id: &str, input: GroupInput) -> Result<GroupResource> {
     validate_schema(&input.schemas, GROUP_SCHEMA)?;
     validate_members(app, &input.members)?;
     let current = app.state().team(id)?.clone();
     if input.external_id.is_some() && input.external_id != current.directory_external_id {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "SCIM Group externalId is immutable".into(),
         ));
     }
@@ -329,7 +329,7 @@ pub fn replace_group(app: &mut MambaApp, id: &str, input: GroupInput) -> Result<
     get_group(app, &team.id)
 }
 
-pub fn patch_group(app: &mut MambaApp, id: &str, patch: PatchRequest) -> Result<GroupResource> {
+pub fn patch_group(app: &mut RelayApp, id: &str, patch: PatchRequest) -> Result<GroupResource> {
     validate_schema(&patch.schemas, PATCH_SCHEMA)?;
     let mut team = app.state().team(id)?.clone();
     for operation in patch.operations {
@@ -367,7 +367,7 @@ pub fn patch_group(app: &mut MambaApp, id: &str, patch: PatchRequest) -> Result<
                 remove_members(app, &team.id, vec![member_from_path(path)?])?;
             }
             (_, path) => {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "unsupported SCIM Group PATCH operation/path: {} {}",
                     operation.op,
                     path.unwrap_or("<none>")
@@ -378,7 +378,7 @@ pub fn patch_group(app: &mut MambaApp, id: &str, patch: PatchRequest) -> Result<
     get_group(app, &team.id)
 }
 
-pub fn delete_group(app: &mut MambaApp, id: &str) -> Result<()> {
+pub fn delete_group(app: &mut RelayApp, id: &str) -> Result<()> {
     let team = app.state().team(id)?.clone();
     let members = app
         .state()
@@ -411,7 +411,7 @@ pub fn error(status: u16, detail: impl Into<String>, scim_type: Option<&str>) ->
     }
 }
 
-fn user_resource(app: &MambaApp, binding: &ExternalIdentityBinding) -> Result<UserResource> {
+fn user_resource(app: &RelayApp, binding: &ExternalIdentityBinding) -> Result<UserResource> {
     let principal = app.state().principal(&binding.principal_id)?;
     let groups = principal
         .team_id
@@ -442,7 +442,7 @@ fn user_resource(app: &MambaApp, binding: &ExternalIdentityBinding) -> Result<Us
     })
 }
 
-fn group_resource(app: &MambaApp, team: &Team) -> Result<GroupResource> {
+fn group_resource(app: &RelayApp, team: &Team) -> Result<GroupResource> {
     let members = app
         .state()
         .principals
@@ -475,7 +475,7 @@ fn group_resource(app: &MambaApp, team: &Team) -> Result<GroupResource> {
     })
 }
 
-fn oidc_bindings(app: &MambaApp) -> Vec<&ExternalIdentityBinding> {
+fn oidc_bindings(app: &RelayApp) -> Vec<&ExternalIdentityBinding> {
     app.state()
         .external_identities
         .values()
@@ -483,18 +483,18 @@ fn oidc_bindings(app: &MambaApp) -> Vec<&ExternalIdentityBinding> {
         .collect()
 }
 
-fn user_binding<'a>(app: &'a MambaApp, id: &str) -> Result<&'a ExternalIdentityBinding> {
+fn user_binding<'a>(app: &'a RelayApp, id: &str) -> Result<&'a ExternalIdentityBinding> {
     app.state()
         .external_identities
         .values()
         .find(|binding| binding.id == id && binding.provider == "oidc" && binding.is_active())
-        .ok_or_else(|| MambaError::NotFound {
+        .ok_or_else(|| RelayError::NotFound {
             entity: "SCIM User",
             id: id.to_string(),
         })
 }
 
-fn reconcile_members(app: &mut MambaApp, team_id: &str, members: &[MemberInput]) -> Result<()> {
+fn reconcile_members(app: &mut RelayApp, team_id: &str, members: &[MemberInput]) -> Result<()> {
     let desired = members
         .iter()
         .map(|member| member.value.clone())
@@ -519,11 +519,11 @@ fn reconcile_members(app: &mut MambaApp, team_id: &str, members: &[MemberInput])
     assign_members(app, team_id, desired)
 }
 
-fn validate_members(app: &MambaApp, members: &[MemberInput]) -> Result<()> {
+fn validate_members(app: &RelayApp, members: &[MemberInput]) -> Result<()> {
     let mut seen = std::collections::BTreeSet::new();
     for member in members {
         if !seen.insert(member.value.as_str()) {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "duplicate SCIM Group member: {}",
                 member.value
             )));
@@ -534,7 +534,7 @@ fn validate_members(app: &MambaApp, members: &[MemberInput]) -> Result<()> {
 }
 
 fn validate_group_external_id(
-    app: &MambaApp,
+    app: &RelayApp,
     group_id: Option<&str>,
     external_id: Option<&str>,
 ) -> Result<()> {
@@ -544,14 +544,14 @@ fn validate_group_external_id(
                 && team.directory_external_id.as_deref() == Some(external_id)
         })
     }) {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "directory Group externalId already exists".into(),
         ));
     }
     Ok(())
 }
 
-fn assign_members(app: &mut MambaApp, team_id: &str, members: Vec<String>) -> Result<()> {
+fn assign_members(app: &mut RelayApp, team_id: &str, members: Vec<String>) -> Result<()> {
     let principals = members
         .iter()
         .map(|member| {
@@ -572,7 +572,7 @@ fn assign_members(app: &mut MambaApp, team_id: &str, members: Vec<String>) -> Re
     Ok(())
 }
 
-fn remove_members(app: &mut MambaApp, team_id: &str, members: Vec<String>) -> Result<()> {
+fn remove_members(app: &mut RelayApp, team_id: &str, members: Vec<String>) -> Result<()> {
     let principals = members
         .iter()
         .map(|member| {
@@ -608,7 +608,7 @@ fn member_values(value: &Value) -> Result<Vec<String>> {
                 .get("value")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .ok_or_else(|| MambaError::Validation("SCIM member value is required".into()))
+                .ok_or_else(|| RelayError::Validation("SCIM member value is required".into()))
         })
         .collect()
 }
@@ -617,10 +617,10 @@ fn member_from_path(path: &str) -> Result<String> {
     let expression = path
         .strip_prefix("members[")
         .and_then(|value| value.strip_suffix(']'))
-        .ok_or_else(|| MambaError::Validation("invalid SCIM member filter path".into()))?;
+        .ok_or_else(|| RelayError::Validation("invalid SCIM member filter path".into()))?;
     let (attribute, value) = parse_filter(expression)?;
     if attribute != "value" {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "SCIM member filter must target value".into(),
         ));
     }
@@ -661,7 +661,7 @@ fn parse_filter(value: &str) -> Result<(&str, String)> {
         || !expected.ends_with('"')
         || expected.len() < 2
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "SCIM filter must use attribute eq \"value\"".into(),
         ));
     }
@@ -669,7 +669,7 @@ fn parse_filter(value: &str) -> Result<(&str, String)> {
         attribute,
         "userName" | "externalId" | "displayName" | "id" | "value"
     ) {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "unsupported SCIM filter attribute: {attribute}"
         )));
     }
@@ -678,7 +678,7 @@ fn parse_filter(value: &str) -> Result<(&str, String)> {
 
 fn validate_page(query: &ListQuery) -> Result<()> {
     if query.start_index == 0 || query.count == 0 || query.count > 200 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "SCIM startIndex must be positive and count must be between 1 and 200".into(),
         ));
     }
@@ -687,7 +687,7 @@ fn validate_page(query: &ListQuery) -> Result<()> {
 
 fn validate_schema(schemas: &[String], expected: &str) -> Result<()> {
     if !schemas.is_empty() && !schemas.iter().any(|schema| schema == expected) {
-        return Err(MambaError::Validation(format!(
+        return Err(RelayError::Validation(format!(
             "SCIM request is missing schema {expected}"
         )));
     }
@@ -697,14 +697,14 @@ fn validate_schema(schemas: &[String], expected: &str) -> Result<()> {
 fn json_bool(value: &Value, name: &str) -> Result<bool> {
     value
         .as_bool()
-        .ok_or_else(|| MambaError::Validation(format!("SCIM {name} must be boolean")))
+        .ok_or_else(|| RelayError::Validation(format!("SCIM {name} must be boolean")))
 }
 
 fn json_string(value: &Value, name: &str) -> Result<String> {
     value
         .as_str()
         .map(str::to_string)
-        .ok_or_else(|| MambaError::Validation(format!("SCIM {name} must be a string")))
+        .ok_or_else(|| RelayError::Validation(format!("SCIM {name} must be a string")))
 }
 
 fn default_active() -> bool {
@@ -728,8 +728,8 @@ mod tests {
     #[test]
     fn scim_users_and_groups_drive_principal_lifecycle_and_access() {
         let directory = tempdir().unwrap();
-        let mut app = MambaApp::open(directory.path()).unwrap();
-        app.init_organization("Mamba", "admin").unwrap();
+        let mut app = RelayApp::open(directory.path()).unwrap();
+        app.init_organization("Relay", "admin").unwrap();
         let user = create_user(
             &mut app,
             UserInput {
@@ -843,7 +843,7 @@ mod tests {
         delete_user(&mut app, &user.id).unwrap();
         assert!(get_user(&app, &user.id).is_err());
 
-        let replayed = MambaApp::open(directory.path()).unwrap();
+        let replayed = RelayApp::open(directory.path()).unwrap();
         assert!(get_user(&replayed, &user.id).is_err());
         assert!(get_group(&replayed, &group.id).is_err());
     }

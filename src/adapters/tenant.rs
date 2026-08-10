@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use super::postgres_store::PostgresDatabase;
 use crate::domain::Tenant;
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 const CATALOG_SCHEMA_VERSION: i64 = 1;
 
@@ -153,7 +153,7 @@ impl SqliteTenantCatalog {
             |row| row.get::<_, i64>(0),
         )?;
         if schema_version != CATALOG_SCHEMA_VERSION {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "unsupported tenant catalog schema version {schema_version}; this binary requires {CATALOG_SCHEMA_VERSION}"
             )));
         }
@@ -166,7 +166,7 @@ impl SqliteTenantCatalog {
     fn adopt_default(&mut self, tenant: &Tenant) -> Result<TenantRecord> {
         if let Some(record) = self.default_tenant()? {
             if record.id != tenant.id {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "default tenant catalog points to {} but the root Ledger belongs to {}",
                     record.id, tenant.id
                 )));
@@ -238,7 +238,7 @@ impl SqliteTenantCatalog {
         validate_relative_storage_path(storage_path)?;
         let storage_path = storage_path.to_path_buf();
         let storage_text = storage_path.to_str().ok_or_else(|| {
-            MambaError::Validation("tenant storage path must be valid UTF-8".into())
+            RelayError::Validation("tenant storage path must be valid UTF-8".into())
         })?;
         self.connection.execute(
             "INSERT INTO tenants(id, slug, name, storage_path, is_default, active, created_at)
@@ -273,10 +273,10 @@ impl PostgresTenantCatalog {
     fn connect(root: impl AsRef<Path>, database_url: &str) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        let database = PostgresDatabase::connect(database_url, "mamba-pg-tenant-catalog")?;
+        let database = PostgresDatabase::connect(database_url, "relay-pg-tenant-catalog")?;
         database.call(|client| {
             client.batch_execute(
-                "CREATE TABLE IF NOT EXISTS mamba_tenants (
+                "CREATE TABLE IF NOT EXISTS relay_tenants (
                      id           TEXT PRIMARY KEY,
                      slug         TEXT NOT NULL UNIQUE,
                      name         TEXT NOT NULL,
@@ -285,8 +285,8 @@ impl PostgresTenantCatalog {
                      active       BOOLEAN NOT NULL DEFAULT TRUE,
                      created_at   TEXT NOT NULL
                  );
-                 CREATE UNIQUE INDEX IF NOT EXISTS idx_mamba_tenants_single_default
-                     ON mamba_tenants(is_default) WHERE is_default = TRUE;",
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_tenants_single_default
+                     ON relay_tenants(is_default) WHERE is_default = TRUE;",
             )?;
             Ok(())
         })?;
@@ -296,7 +296,7 @@ impl PostgresTenantCatalog {
     fn adopt_default(&mut self, tenant: &Tenant) -> Result<TenantRecord> {
         if let Some(record) = self.default_tenant()? {
             if record.id != tenant.id {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "default PostgreSQL tenant is {} but bootstrap opened {}",
                     record.id, tenant.id
                 )));
@@ -320,7 +320,7 @@ impl PostgresTenantCatalog {
             client
                 .query(
                     "SELECT id, slug, name, storage_path, is_default, active, created_at
-                 FROM mamba_tenants ORDER BY is_default DESC, slug",
+                 FROM relay_tenants ORDER BY is_default DESC, slug",
                     &[],
                 )?
                 .into_iter()
@@ -335,7 +335,7 @@ impl PostgresTenantCatalog {
             client
                 .query_opt(
                     "SELECT id, slug, name, storage_path, is_default, active, created_at
-                 FROM mamba_tenants WHERE id = $1 OR slug = $1",
+                 FROM relay_tenants WHERE id = $1 OR slug = $1",
                     &[&id_or_slug],
                 )?
                 .map(decode_postgres_record)
@@ -348,7 +348,7 @@ impl PostgresTenantCatalog {
             client
                 .query_opt(
                     "SELECT id, slug, name, storage_path, is_default, active, created_at
-                 FROM mamba_tenants WHERE is_default = TRUE",
+                 FROM relay_tenants WHERE is_default = TRUE",
                     &[],
                 )?
                 .map(decode_postgres_record)
@@ -374,7 +374,7 @@ impl PostgresTenantCatalog {
         let storage_text = storage_path
             .to_str()
             .ok_or_else(|| {
-                MambaError::Validation("tenant storage path must be valid UTF-8".into())
+                RelayError::Validation("tenant storage path must be valid UTF-8".into())
             })?
             .to_string();
         let tenant_id = tenant.id.clone();
@@ -383,7 +383,7 @@ impl PostgresTenantCatalog {
         let stored_slug = slug.clone();
         self.database.call(move |client| {
             client.execute(
-                "INSERT INTO mamba_tenants(
+                "INSERT INTO relay_tenants(
                     id, slug, name, storage_path, is_default, active, created_at
                  ) VALUES ($1, $2, $3, $4, $5, TRUE, $6)",
                 &[
@@ -411,7 +411,7 @@ impl PostgresTenantCatalog {
 
 fn decode_postgres_record(row: postgres::Row) -> Result<TenantRecord> {
     let created_at = DateTime::parse_from_rfc3339(row.get::<_, String>(6).as_str())
-        .map_err(|error| MambaError::Validation(error.to_string()))?
+        .map_err(|error| RelayError::Validation(error.to_string()))?
         .with_timezone(&Utc);
     Ok(TenantRecord {
         id: row.get(0),
@@ -425,8 +425,8 @@ fn decode_postgres_record(row: postgres::Row) -> Result<TenantRecord> {
 }
 
 pub fn database_url_from_env() -> Result<Option<String>> {
-    let direct = unicode_environment("MAMBA_DATABASE_URL")?;
-    let file = unicode_environment("MAMBA_DATABASE_URL_FILE")?.map(PathBuf::from);
+    let direct = unicode_environment("RELAY_DATABASE_URL")?;
+    let file = unicode_environment("RELAY_DATABASE_URL_FILE")?.map(PathBuf::from);
     database_url_from_sources(direct, file)
 }
 
@@ -435,25 +435,25 @@ fn database_url_from_sources(
     file: Option<PathBuf>,
 ) -> Result<Option<String>> {
     if direct.is_some() && file.is_some() {
-        return Err(MambaError::Validation(
-            "configure only one of MAMBA_DATABASE_URL or MAMBA_DATABASE_URL_FILE".into(),
+        return Err(RelayError::Validation(
+            "configure only one of RELAY_DATABASE_URL or RELAY_DATABASE_URL_FILE".into(),
         ));
     }
     let (value, source) = match (direct, file) {
-        (Some(value), None) => (value, "MAMBA_DATABASE_URL"),
+        (Some(value), None) => (value, "RELAY_DATABASE_URL"),
         (None, Some(path)) => {
             if path.as_os_str().is_empty() || !path.is_file() {
-                return Err(MambaError::Validation(
-                    "MAMBA_DATABASE_URL_FILE must point to a readable regular file".into(),
+                return Err(RelayError::Validation(
+                    "RELAY_DATABASE_URL_FILE must point to a readable regular file".into(),
                 ));
             }
             (
                 fs::read_to_string(&path).map_err(|_| {
-                    MambaError::Validation(
-                        "MAMBA_DATABASE_URL_FILE could not be read as UTF-8".into(),
+                    RelayError::Validation(
+                        "RELAY_DATABASE_URL_FILE could not be read as UTF-8".into(),
                     )
                 })?,
-                "MAMBA_DATABASE_URL_FILE",
+                "RELAY_DATABASE_URL_FILE",
             )
         }
         (None, None) => return Ok(None),
@@ -461,7 +461,7 @@ fn database_url_from_sources(
     };
     let value = value.trim();
     if value.is_empty() {
-        return Err(MambaError::Validation(format!("{source} cannot be empty")));
+        return Err(RelayError::Validation(format!("{source} cannot be empty")));
     }
     Ok(Some(value.to_string()))
 }
@@ -471,7 +471,7 @@ fn unicode_environment(name: &str) -> Result<Option<String>> {
         .map(|value| {
             value
                 .into_string()
-                .map_err(|_| MambaError::Validation(format!("{name} must be valid UTF-8")))
+                .map_err(|_| RelayError::Validation(format!("{name} must be valid UTF-8")))
         })
         .transpose()
 }
@@ -509,7 +509,7 @@ pub fn validate_slug(value: &str) -> Result<String> {
         || value.ends_with('-')
         || value.contains("--")
     {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "tenant slug must contain 2 to 48 lowercase letters, digits or single hyphens".into(),
         ));
     }
@@ -526,8 +526,8 @@ fn validate_relative_storage_path(path: &Path) -> Result<()> {
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Err(MambaError::Validation(
-            "tenant storage path must stay inside the MambaFlow data directory".into(),
+        return Err(RelayError::Validation(
+            "tenant storage path must stay inside the Relay data directory".into(),
         ));
     }
     Ok(())
@@ -570,7 +570,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut catalog = TenantCatalog::open(directory.path()).unwrap();
         let default = catalog
-            .adopt_default(&tenant("TEN-default", "Mamba"))
+            .adopt_default(&tenant("TEN-default", "Relay"))
             .unwrap();
         let second = catalog
             .register(
@@ -615,12 +615,12 @@ mod tests {
         let secret = directory.path().join("database-url");
         fs::write(
             &secret,
-            "  postgresql://mamba:secret@database.example/mamba?sslmode=require\n",
+            "  postgresql://relay:secret@database.example/relay?sslmode=require\n",
         )
         .unwrap();
         assert_eq!(
             database_url_from_sources(None, Some(secret.clone())).unwrap(),
-            Some("postgresql://mamba:secret@database.example/mamba?sslmode=require".into())
+            Some("postgresql://relay:secret@database.example/relay?sslmode=require".into())
         );
         assert!(
             database_url_from_sources(Some("postgresql://direct/db".into()), Some(secret)).is_err()

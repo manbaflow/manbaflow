@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::postgres_store::PostgresEventStore;
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::{CURRENT_EVENT_VERSION, DomainEvent, EventEnvelope};
 use crate::ids::new_id;
 
@@ -51,7 +51,7 @@ impl FlowStore {
     pub fn backup(&mut self, destination: impl AsRef<Path>) -> Result<PathBuf> {
         match self {
             Self::Sqlite(store) => store.backup(destination),
-            Self::Postgres(_) => Err(MambaError::Validation(
+            Self::Postgres(_) => Err(RelayError::Validation(
                 "PostgreSQL storage must be backed up with database snapshots or PITR".into(),
             )),
         }
@@ -214,7 +214,7 @@ impl EventStore {
                 |row| row.get::<_, i64>(0),
             )?;
             if !matches!(existing_version, 2 | 3 | SCHEMA_VERSION) {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "unsupported storage schema version {existing_version}; this binary requires {SCHEMA_VERSION}"
                 )));
             }
@@ -285,7 +285,7 @@ impl EventStore {
             schema_version = 4;
         }
         if schema_version != SCHEMA_VERSION {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "unsupported storage schema version {schema_version}; this binary requires {SCHEMA_VERSION}"
             )));
         }
@@ -334,7 +334,7 @@ impl EventStore {
     pub fn backup(&mut self, destination: impl AsRef<Path>) -> Result<PathBuf> {
         let destination = destination.as_ref().to_path_buf();
         if destination.exists() {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "backup destination already exists: {}",
                 destination.display()
             )));
@@ -345,7 +345,7 @@ impl EventStore {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(FULL);")?;
         let destination_text = destination.to_str().ok_or_else(|| {
-            MambaError::Validation("backup destination is not valid UTF-8".into())
+            RelayError::Validation("backup destination is not valid UTF-8".into())
         })?;
         self.connection
             .execute("VACUUM INTO ?1", [destination_text])?;
@@ -353,7 +353,7 @@ impl EventStore {
         let backup = EventStore::open(&destination)?;
         let health = backup.health()?;
         if health.integrity != "ok" {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "backup integrity check failed: {}",
                 health.integrity
             )));
@@ -393,12 +393,12 @@ impl EventStore {
 
         for (index, event) in events.iter().enumerate() {
             let offset = i64::try_from(index)
-                .map_err(|_| MambaError::Validation("event batch is too large".into()))?;
+                .map_err(|_| RelayError::Validation("event batch is too large".into()))?;
             let sequence = expected_sequence
                 .checked_add(offset)
                 .and_then(|value| value.checked_add(1))
                 .ok_or_else(|| {
-                    MambaError::Validation("event sequence exceeded the supported range".into())
+                    RelayError::Validation("event sequence exceeded the supported range".into())
                 })?;
             let id = new_id("EVT");
             let occurred_at = Utc::now();
@@ -436,7 +436,7 @@ impl EventStore {
                 row.get::<_, i64>(0)
             })?;
         if actual_sequence != expected_sequence {
-            return Err(MambaError::ConcurrentModification {
+            return Err(RelayError::ConcurrentModification {
                 expected: expected_sequence,
                 actual: actual_sequence,
             });
@@ -444,27 +444,27 @@ impl EventStore {
 
         for (index, envelope) in envelopes.iter().enumerate() {
             let offset = i64::try_from(index)
-                .map_err(|_| MambaError::Validation("event batch is too large".into()))?;
+                .map_err(|_| RelayError::Validation("event batch is too large".into()))?;
             let expected_envelope_sequence = expected_sequence
                 .checked_add(offset)
                 .and_then(|value| value.checked_add(1))
                 .ok_or_else(|| {
-                    MambaError::Validation("event sequence exceeded the supported range".into())
+                    RelayError::Validation("event sequence exceeded the supported range".into())
                 })?;
             if envelope.sequence != expected_envelope_sequence {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "prepared event sequence {} is not the expected sequence {}",
                     envelope.sequence, expected_envelope_sequence
                 )));
             }
             if envelope.event_version != CURRENT_EVENT_VERSION {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "cannot append event payload version {}",
                     envelope.event_version
                 )));
             }
             if envelope.kind != envelope.event.kind() {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "event kind `{}` does not match payload kind `{}`",
                     envelope.kind,
                     envelope.event.kind()
@@ -549,7 +549,7 @@ impl EventStore {
             params![id, revoked_at.to_rfc3339()],
         )?;
         if updated == 0 {
-            return Err(MambaError::NotFound {
+            return Err(RelayError::NotFound {
                 entity: "active API credential",
                 id: id.to_string(),
             });
@@ -586,13 +586,13 @@ impl EventStore {
         )?;
         if inserted == 0 {
             let existing = self.load_artifact(&artifact.sha256)?.ok_or_else(|| {
-                MambaError::Validation("artifact disappeared after a hash conflict".into())
+                RelayError::Validation("artifact disappeared after a hash conflict".into())
             })?;
             if existing.content != artifact.content
                 || existing.media_type != artifact.media_type
                 || existing.size_bytes != artifact.size_bytes
             {
-                return Err(MambaError::Validation(
+                return Err(RelayError::Validation(
                     "artifact hash already exists with different content or metadata".into(),
                 ));
             }
@@ -682,13 +682,13 @@ impl EventStore {
             let (sequence, id, organization_id, flow_id, actor, kind, payload, occurred_at) = row?;
             let (event_version, event) = decode_event_payload(&payload)?;
             if kind != event.kind() {
-                return Err(MambaError::Validation(format!(
+                return Err(RelayError::Validation(format!(
                     "stored event kind `{kind}` does not match payload kind `{}` at sequence {sequence}",
                     event.kind()
                 )));
             }
             let occurred_at = DateTime::parse_from_rfc3339(&occurred_at)
-                .map_err(|error| MambaError::Validation(error.to_string()))?
+                .map_err(|error| RelayError::Validation(error.to_string()))?
                 .with_timezone(&Utc);
             events.push(EventEnvelope {
                 event_version,
@@ -730,7 +730,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 pub(crate) fn decode_event_payload(payload: &str) -> Result<(u16, DomainEvent)> {
     let value = serde_json::from_str::<Value>(payload)?;
     let Some(object) = value.as_object() else {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "stored event payload must be a JSON object".into(),
         ));
     };
@@ -739,17 +739,17 @@ pub(crate) fn decode_event_payload(payload: &str) -> Result<(u16, DomainEvent)> 
         let version_value = object
             .get("version")
             .cloned()
-            .ok_or_else(|| MambaError::Validation("stored event version is missing".into()))?;
+            .ok_or_else(|| RelayError::Validation("stored event version is missing".into()))?;
         let version = serde_json::from_value::<u16>(version_value)?;
         if !matches!(version, 1 | CURRENT_EVENT_VERSION) {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "unsupported event payload version {version}"
             )));
         }
         let event_value = object
             .get("event")
             .cloned()
-            .ok_or_else(|| MambaError::Validation("stored event body is missing".into()))?;
+            .ok_or_else(|| RelayError::Validation("stored event body is missing".into()))?;
         return Ok((version, serde_json::from_value(event_value)?));
     }
 
@@ -767,11 +767,11 @@ mod tests {
     #[test]
     fn events_round_trip_in_sequence() {
         let directory = tempdir().unwrap();
-        let mut store = EventStore::open(directory.path().join("mamba.db")).unwrap();
+        let mut store = EventStore::open(directory.path().join("relay.db")).unwrap();
         let event = DomainEvent::OrganizationInitialized {
             organization: Organization {
                 id: "ORG-1".to_string(),
-                name: "Mamba".to_string(),
+                name: "Relay".to_string(),
                 created_at: Utc::now(),
             },
         };
@@ -810,7 +810,7 @@ mod tests {
                 &[DomainEvent::OrganizationInitialized {
                     organization: Organization {
                         id: "ORG-1".into(),
-                        name: "Mamba".into(),
+                        name: "Relay".into(),
                         created_at: Utc::now(),
                     },
                 }],
@@ -881,18 +881,18 @@ mod tests {
         drop(future);
         assert!(matches!(
             EventStore::open(future_path),
-            Err(MambaError::Validation(message)) if message.contains("schema version 99")
+            Err(RelayError::Validation(message)) if message.contains("schema version 99")
         ));
     }
 
     #[test]
     fn legacy_unversioned_events_still_replay() {
         let directory = tempdir().unwrap();
-        let store = EventStore::open(directory.path().join("mamba.db")).unwrap();
+        let store = EventStore::open(directory.path().join("relay.db")).unwrap();
         let event = DomainEvent::OrganizationInitialized {
             organization: Organization {
                 id: "ORG-LEGACY".to_string(),
-                name: "Legacy Mamba".to_string(),
+                name: "Legacy Relay".to_string(),
                 created_at: Utc::now(),
             },
         };
@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn version_one_events_still_replay_after_authority_upgrade() {
         let directory = tempdir().unwrap();
-        let store = EventStore::open(directory.path().join("mamba.db")).unwrap();
+        let store = EventStore::open(directory.path().join("relay.db")).unwrap();
         let event = DomainEvent::OrganizationInitialized {
             organization: Organization {
                 id: "ORG-V1".to_string(),
@@ -950,13 +950,13 @@ mod tests {
     #[test]
     fn prepared_append_rejects_a_stale_writer() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("mamba.db");
+        let path = directory.path().join("relay.db");
         let mut first = EventStore::open(&path).unwrap();
         let mut stale = EventStore::open(&path).unwrap();
         let event = DomainEvent::OrganizationInitialized {
             organization: Organization {
                 id: "ORG-1".to_string(),
-                name: "Mamba".to_string(),
+                name: "Relay".to_string(),
                 created_at: Utc::now(),
             },
         };
@@ -968,7 +968,7 @@ mod tests {
         let error = stale.append_prepared(0, &prepared).unwrap_err();
         assert!(matches!(
             error,
-            MambaError::ConcurrentModification {
+            RelayError::ConcurrentModification {
                 expected: 0,
                 actual: 1
             }

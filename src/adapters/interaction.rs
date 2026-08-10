@@ -5,12 +5,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domain::ExternalInteractionAction;
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub const BRIDGE_SECRET_ENV: &str = "MAMBA_INTERACTION_WEBHOOK_SECRET";
-pub const SLACK_SECRET_ENV: &str = "MAMBA_SLACK_SIGNING_SECRET";
+pub const BRIDGE_SECRET_ENV: &str = "RELAY_INTERACTION_WEBHOOK_SECRET";
+pub const SLACK_SECRET_ENV: &str = "RELAY_SLACK_SIGNING_SECRET";
 const MAX_REQUEST_AGE_SECONDS: i64 = 300;
 
 #[derive(Clone, Default)]
@@ -86,21 +86,21 @@ impl InteractionWebhookAuth {
         now: DateTime<Utc>,
     ) -> Result<()> {
         let secret = self.bridge_secret.as_deref().ok_or_else(|| {
-            MambaError::PermissionDenied("interaction Bridge is not enabled".into())
+            RelayError::PermissionDenied("interaction Bridge is not enabled".into())
         })?;
         verify_fresh_timestamp(timestamp, now)?;
         let signature = signature.strip_prefix("v1,").ok_or_else(|| {
-            MambaError::PermissionDenied("invalid interaction Bridge signature".into())
+            RelayError::PermissionDenied("invalid interaction Bridge signature".into())
         })?;
         let signature = BASE64_STANDARD.decode(signature).map_err(|_| {
-            MambaError::PermissionDenied("invalid interaction Bridge signature".into())
+            RelayError::PermissionDenied("invalid interaction Bridge signature".into())
         })?;
         let message = bridge_message(provider, delivery_id, timestamp, body);
         let mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts keys of any size");
         mac.chain_update(&message)
             .verify_slice(&signature)
             .map_err(|_| {
-                MambaError::PermissionDenied("invalid interaction Bridge signature".into())
+                RelayError::PermissionDenied("invalid interaction Bridge signature".into())
             })
     }
 
@@ -112,14 +112,14 @@ impl InteractionWebhookAuth {
         now: DateTime<Utc>,
     ) -> Result<()> {
         let secret = self.slack_secret.as_deref().ok_or_else(|| {
-            MambaError::PermissionDenied("Slack interactions are not enabled".into())
+            RelayError::PermissionDenied("Slack interactions are not enabled".into())
         })?;
         verify_fresh_timestamp(timestamp, now)?;
         let signature = signature.strip_prefix("v0=").ok_or_else(|| {
-            MambaError::PermissionDenied("invalid Slack request signature".into())
+            RelayError::PermissionDenied("invalid Slack request signature".into())
         })?;
         let signature = decode_hex(signature).ok_or_else(|| {
-            MambaError::PermissionDenied("invalid Slack request signature".into())
+            RelayError::PermissionDenied("invalid Slack request signature".into())
         })?;
         let mut message = Vec::with_capacity(timestamp.len() + body.len() + 4);
         message.extend_from_slice(b"v0:");
@@ -129,27 +129,27 @@ impl InteractionWebhookAuth {
         let mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts keys of any size");
         mac.chain_update(&message)
             .verify_slice(&signature)
-            .map_err(|_| MambaError::PermissionDenied("invalid Slack request signature".into()))
+            .map_err(|_| RelayError::PermissionDenied("invalid Slack request signature".into()))
     }
 }
 
 pub fn parse_slack_interaction(body: &[u8]) -> Result<ExternalInteractionInput> {
     let form: SlackForm = serde_urlencoded::from_bytes(body)
-        .map_err(|_| MambaError::Validation("invalid Slack interaction form".into()))?;
+        .map_err(|_| RelayError::Validation("invalid Slack interaction form".into()))?;
     let payload: SlackPayload = serde_json::from_str(&form.payload)
-        .map_err(|_| MambaError::Validation("invalid Slack interaction payload".into()))?;
+        .map_err(|_| RelayError::Validation("invalid Slack interaction payload".into()))?;
     if payload.payload_type != "block_actions" || payload.actions.len() != 1 {
-        return Err(MambaError::Validation(
+        return Err(RelayError::Validation(
             "Slack interaction must contain exactly one block action".into(),
         ));
     }
     let action = &payload.actions[0];
     let action = match action.action_id.as_str() {
-        "mambaflow.task.accept" => ExternalInteractionAction::TaskAccept,
-        "mambaflow.message.ack" => ExternalInteractionAction::MessageAck,
-        "mambaflow.escalation.ack" => ExternalInteractionAction::EscalationAck,
+        "relay.task.accept" => ExternalInteractionAction::TaskAccept,
+        "relay.message.ack" => ExternalInteractionAction::MessageAck,
+        "relay.escalation.ack" => ExternalInteractionAction::EscalationAck,
         _ => {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "unsupported Slack action {}",
                 action.action_id
             )));
@@ -173,12 +173,12 @@ pub fn slack_delivery_id(timestamp: &str, body: &[u8]) -> String {
 
 fn optional_secret(name: &str) -> Result<Option<Vec<u8>>> {
     match std::env::var(name) {
-        Ok(value) if value.is_empty() => Err(MambaError::Validation(format!(
+        Ok(value) if value.is_empty() => Err(RelayError::Validation(format!(
             "{name} cannot be empty when configured"
         ))),
         Ok(value) => Ok(Some(value.into_bytes())),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(MambaError::Validation(format!(
+        Err(error) => Err(RelayError::Validation(format!(
             "could not read {name}: {error}"
         ))),
     }
@@ -187,10 +187,10 @@ fn optional_secret(name: &str) -> Result<Option<Vec<u8>>> {
 fn verify_fresh_timestamp(value: &str, now: DateTime<Utc>) -> Result<()> {
     let timestamp = value
         .parse::<i64>()
-        .map_err(|_| MambaError::PermissionDenied("invalid interaction timestamp".into()))?;
+        .map_err(|_| RelayError::PermissionDenied("invalid interaction timestamp".into()))?;
     let age = (now.timestamp() - timestamp).abs();
     if age > Duration::seconds(MAX_REQUEST_AGE_SECONDS).num_seconds() {
-        return Err(MambaError::PermissionDenied(
+        return Err(RelayError::PermissionDenied(
             "interaction timestamp is outside the five minute replay window".into(),
         ));
     }
@@ -260,7 +260,7 @@ mod tests {
         let payload = serde_json::json!({
             "type": "block_actions",
             "user": {"id": "U123"},
-            "actions": [{"action_id": "mambaflow.task.accept", "value": "TSK-1"}]
+            "actions": [{"action_id": "relay.task.accept", "value": "TSK-1"}]
         });
         let body = serde_urlencoded::to_string([("payload", payload.to_string())]).unwrap();
         let input = parse_slack_interaction(body.as_bytes()).unwrap();

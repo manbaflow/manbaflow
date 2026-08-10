@@ -1,8 +1,8 @@
 use chrono::Utc;
 
-use super::MambaApp;
+use super::RelayApp;
 use crate::domain::{OrganizationRole, PrincipalKind, RoleBinding, Tenant};
-use crate::error::{MambaError, Result};
+use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
 use crate::ids::new_id;
 
@@ -20,7 +20,7 @@ pub(crate) enum Permission {
     AuditRead,
 }
 
-impl MambaApp {
+impl RelayApp {
     pub fn authorize_organization_read(&self, actor: &str) -> Result<()> {
         self.ensure_permission(actor, Permission::OrganizationRead)
     }
@@ -88,12 +88,12 @@ impl MambaApp {
                     .has_role(&principal.id, OrganizationRole::TenantAdmin)
             })
         {
-            return Err(MambaError::PermissionDenied(
+            return Err(RelayError::PermissionDenied(
                 "only a tenant admin can grant tenant_admin".into(),
             ));
         }
         if self.state.has_role(&target.id, role) {
-            return Err(MambaError::Validation(format!(
+            return Err(RelayError::Validation(format!(
                 "{} already has role {role}",
                 target.name
             )));
@@ -131,7 +131,7 @@ impl MambaApp {
             .get(binding_id)
             .filter(|binding| binding.is_active())
             .cloned()
-            .ok_or_else(|| MambaError::NotFound {
+            .ok_or_else(|| RelayError::NotFound {
                 entity: "active role binding",
                 id: binding_id.to_string(),
             })?;
@@ -145,7 +145,7 @@ impl MambaApp {
                 })
                 .count();
             if active_admins == 1 {
-                return Err(MambaError::InvalidTransition(
+                return Err(RelayError::InvalidTransition(
                     "cannot revoke the last tenant admin".into(),
                 ));
             }
@@ -164,7 +164,7 @@ impl MambaApp {
     pub(crate) fn ensure_permission(&self, actor: &str, permission: Permission) -> Result<()> {
         let principal = match self.state.principal(actor) {
             Ok(principal) => principal,
-            Err(MambaError::NotFound { .. }) if is_system_actor(actor) => return Ok(()),
+            Err(RelayError::NotFound { .. }) if is_system_actor(actor) => return Ok(()),
             Err(error) => return Err(error),
         };
         if self
@@ -175,7 +175,7 @@ impl MambaApp {
         {
             Ok(())
         } else {
-            Err(MambaError::PermissionDenied(format!(
+            Err(RelayError::PermissionDenied(format!(
                 "{} lacks permission {:?}",
                 principal.name, permission
             )))
@@ -249,10 +249,10 @@ impl MambaApp {
 fn validate_role_kind(kind: PrincipalKind, role: OrganizationRole) -> Result<()> {
     match (kind, role) {
         (PrincipalKind::Agent, OrganizationRole::Agent) => Ok(()),
-        (PrincipalKind::Agent, _) => Err(MambaError::Validation(
+        (PrincipalKind::Agent, _) => Err(RelayError::Validation(
             "an Agent principal can only hold the agent role".into(),
         )),
-        (PrincipalKind::Human, OrganizationRole::Agent) => Err(MambaError::Validation(
+        (PrincipalKind::Human, OrganizationRole::Agent) => Err(RelayError::Validation(
             "a Human principal cannot hold the agent role".into(),
         )),
         (PrincipalKind::Human, _) => Ok(()),
@@ -298,8 +298,8 @@ mod tests {
     fn default_roles_are_minimal_grantable_revocable_and_replayable() {
         let directory = tempdir().unwrap();
         let data_dir = directory.path().join("data");
-        let mut app = MambaApp::open(&data_dir).unwrap();
-        app.init_organization("Mamba", "admin").unwrap();
+        let mut app = RelayApp::open(&data_dir).unwrap();
+        app.init_organization("Relay", "admin").unwrap();
         let team = app
             .create_team("Platform", "product,rust", "admin")
             .unwrap();
@@ -345,7 +345,7 @@ mod tests {
         assert!(app.state.has_role(&agent.id, OrganizationRole::Agent));
         assert!(matches!(
             app.admin_dashboard(&member.id),
-            Err(MambaError::PermissionDenied(_))
+            Err(RelayError::PermissionDenied(_))
         ));
 
         let manager = app
@@ -354,7 +354,7 @@ mod tests {
         app.admin_dashboard(&member.id).unwrap();
         assert!(matches!(
             app.grant_role(&agent.id, OrganizationRole::Manager, &admin.id),
-            Err(MambaError::Validation(_))
+            Err(RelayError::Validation(_))
         ));
         let admin_binding = app
             .role_bindings(&admin.id, &admin.id, false)
@@ -364,16 +364,16 @@ mod tests {
             .unwrap();
         assert!(matches!(
             app.revoke_role(&admin_binding.id, &admin.id),
-            Err(MambaError::InvalidTransition(_))
+            Err(RelayError::InvalidTransition(_))
         ));
         app.revoke_role(&manager.id, &admin.id).unwrap();
         assert!(matches!(
             app.admin_dashboard(&member.id),
-            Err(MambaError::PermissionDenied(_))
+            Err(RelayError::PermissionDenied(_))
         ));
 
         drop(app);
-        let replayed = MambaApp::open(&data_dir).unwrap();
+        let replayed = RelayApp::open(&data_dir).unwrap();
         assert!(
             replayed
                 .state
