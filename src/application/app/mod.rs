@@ -63,7 +63,17 @@ pub(crate) struct ExternalDeliverySync {
 fn restrict_data_dir_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        // 裸的 io::Error 只会打出「Operation not permitted」，不带路径也不带原因，
+        // 排查起来很费劲。最常见的触发场景是把数据目录直接指到容器的卷挂载点上：
+        // 挂载点属主是 root，非 root 进程 chmod 不了，指向它下面的子目录即可。
+        crate::error::RelayError::Validation(format!(
+            "无法把数据目录 {} 的权限设为 0700：{error}。\
+             如果它是容器里的卷挂载点，请改用其中的子目录——挂载点属主通常是 root，\
+             非 root 进程无法修改它的权限。",
+            path.display()
+        ))
+    })?;
     Ok(())
 }
 

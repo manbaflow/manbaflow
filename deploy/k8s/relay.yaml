@@ -48,6 +48,9 @@ spec:
     spec:
       imagePullSecrets:
         - name: gitlab-registry
+      # Relay 不访问 k8s API，不需要服务账号令牌；根文件系统只读时
+      # kubelet 也无法为它创建挂载点。
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         # 镜像里建的系统用户就是 10001（见 Dockerfile）。
@@ -61,6 +64,11 @@ spec:
         - name: relay
           image: registry.edumind.ai/platform/relay/main:latest
           imagePullPolicy: Always
+          # 覆盖镜像 ENTRYPOINT 的 --data-dir：应用会把数据目录 chmod 成 0700
+          # (src/application/app/mod.rs:66)，而卷挂载点本身属主是 root，
+          # 非 root 进程改不了权限，会以 EPERM 起不来。放到卷的子目录里，
+          # 目录由进程自己创建，chmod 正常。
+          command: ["/usr/local/bin/relay", "--data-dir", "/var/lib/relay/data"]
           args:
             - serve
             - --bind
@@ -74,7 +82,7 @@ spec:
             # 只给文件路径，不把连接串放进环境变量列表——否则 kubectl describe pod
             # 和进程环境都能看到（与 docs/INSTALLATION.md 的外部数据库约定一致）。
             - name: RELAY_DATABASE_URL_FILE
-              value: /run/secrets/relay-database-url
+              value: /etc/relay/secrets/relay-database-url
           # 飞书登录。整组来自 relay-feishu Secret；没建这个 Secret 就不会启用飞书登录，
           # 其余功能不受影响（optional: true）。注意 ALLOWED_TENANT_KEYS 漏配等于对全网
           # 开放，所以适配器在缺失时直接拒绝启动，见 docs/IDENTITY.md。
@@ -89,7 +97,7 @@ spec:
               drop: ["ALL"]
           volumeMounts:
             - name: database-url
-              mountPath: /run/secrets
+              mountPath: /etc/relay/secrets
               readOnly: true
             - name: data
               mountPath: /var/lib/relay
@@ -163,6 +171,9 @@ spec:
       restartPolicy: Never
       imagePullSecrets:
         - name: gitlab-registry
+      # Relay 不访问 k8s API，不需要服务账号令牌；根文件系统只读时
+      # kubelet 也无法为它创建挂载点。
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -174,6 +185,7 @@ spec:
         - name: setup
           image: registry.edumind.ai/platform/relay/main:latest
           imagePullPolicy: Always
+          command: ["/usr/local/bin/relay", "--data-dir", "/var/lib/relay/data"]
           args:
             - setup
             - --organization
@@ -188,7 +200,7 @@ spec:
             - "+08:00"
           env:
             - name: RELAY_DATABASE_URL_FILE
-              value: /run/secrets/relay-database-url
+              value: /etc/relay/secrets/relay-database-url
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -196,7 +208,7 @@ spec:
               drop: ["ALL"]
           volumeMounts:
             - name: database-url
-              mountPath: /run/secrets
+              mountPath: /etc/relay/secrets
               readOnly: true
             - name: data
               mountPath: /var/lib/relay
