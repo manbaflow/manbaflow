@@ -14,11 +14,13 @@ default:
     - mkdir -p ~/.docker
     - cat /etc/ssl/edumind/ca.crt >> /etc/ssl/certs/ca-certificates.crt
     - |
-      if [ -z "${CI_REGISTRY_USER:-}" ] || [ -z "${CI_REGISTRY_PASSWORD:-}" ]; then
-        echo "Missing GitLab registry credentials: CI_REGISTRY_USER/CI_REGISTRY_PASSWORD" >&2
+      if [ -z "${CI_JOB_TOKEN:-}" ]; then
+        echo "Missing CI_JOB_TOKEN" >&2
         exit 1
       fi
-      REGISTRY_AUTH=$(echo -n "${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD}" | base64 -w 0)
+      # 用字面量 gitlab-ci-token + CI_JOB_TOKEN，与 platform/console 一致——
+      # 那是本实例上已验证能用 job token 推镜像的写法。
+      REGISTRY_AUTH=$(printf '%s:%s' 'gitlab-ci-token' "${CI_JOB_TOKEN}" | base64 | tr -d '\n')
     - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${REGISTRY_AUTH}\"}}}" > ~/.docker/config.json
 
 stages:
