@@ -7,7 +7,12 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 
-RUN apt-get update \
+# 国内直连 deb.debian.org 极慢，默认走阿里云镜像。
+# 在国外构建时用 --build-arg APT_MIRROR=deb.debian.org 关掉。
+ARG APT_MIRROR=mirrors.aliyun.com
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home relay \

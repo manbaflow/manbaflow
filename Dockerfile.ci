@@ -27,7 +27,14 @@ ARG OCI_SOURCE=unknown
 LABEL org.opencontainers.image.revision=$OCI_REVISION
 LABEL org.opencontainers.image.source=$OCI_SOURCE
 
-RUN apt-get update \
+# 集群在 cn-hangzhou，直连 deb.debian.org 慢到 30 分钟装不完这几个包
+# （perl 4MB 花了 5 分钟）。buildkit 已经给 docker.io 配了国内镜像源，
+# apt 也得配，否则每次构建都卡在这一步。
+# 在国外构建时用 --build-arg APT_MIRROR=deb.debian.org 关掉。
+ARG APT_MIRROR=mirrors.aliyun.com
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home relay \
