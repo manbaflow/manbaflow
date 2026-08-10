@@ -1,9 +1,22 @@
 FROM rust:bookworm AS builder
 
+# 国内直连 crates.io 会卡到不可用，默认走阿里云镜像。
+# 在国外构建时用 --build-arg CARGO_MIRROR=sparse+https://index.crates.io/ 关掉。
+ARG CARGO_MIRROR=sparse+https://mirrors.aliyun.com/crates.io-index/
+RUN mkdir -p "$CARGO_HOME" && printf '%s\n' \
+        '[source.crates-io]' \
+        'replace-with = "mirror"' \
+        '[source.mirror]' \
+        "registry = \"${CARGO_MIRROR}\"" \
+        > "$CARGO_HOME/config.toml"
+
 WORKDIR /build
-COPY Cargo.toml Cargo.lock rust-toolchain.toml README.md LICENSE ./
+# 不复制 rust-toolchain.toml：它写的是 channel = "stable"，而镜像里的工具链按
+# 版本号命名，rustup 会为了满足 "stable" 再下载一整套。容器里用镜像自带的即可。
+COPY Cargo.toml Cargo.lock README.md LICENSE ./
+RUN cargo fetch --locked
 COPY src ./src
-RUN cargo build --release --locked
+RUN cargo build --release --locked --offline
 
 FROM debian:bookworm-slim
 

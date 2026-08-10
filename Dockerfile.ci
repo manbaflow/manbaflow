@@ -1,18 +1,20 @@
 # CI 构建镜像：先跑格式、Clippy 和全部测试，通过后才产出运行时镜像。
 #
-# 检查放在构建阶段而不是独立 job，是因为集群 runner 侧没有 rust 基础镜像，
-# 而 buildkit 配了 docker.io 镜像源（见 buildkit-service-system/buildkit-config），
-# 可以直接拉 rust:bookworm。这样不需要先往 infra/images 里加镜像。
+# 基础镜像一律用内部 registry（infra/images 约定），不直连 DockerHub。
+# 这两个镜像同步时已经把 apt 源改成 mirrors.aliyun.com，所以下面不需要再动 sources。
+#
+# 检查放在构建阶段而不是独立 job：集群 runner 侧没有带 clippy/rustfmt 的 rust 镜像，
+# 放这里能顺带复用 buildkit 的层缓存。检查不过镜像就构建不出来。
 #
 # 测试不依赖 Docker daemon，也不依赖外部 PostgreSQL：
 # tests/postgres_data_plane.rs 在 RELAY_TEST_DATABASE_URL 未设置时自动跳过。
 
-FROM rust:bookworm AS builder
+# 用 1.96 而不是仓库里更早的 1.87：ratatui 0.30 和 darling 0.23 的 MSRV 是 1.88。
+FROM registry.edumind.ai/infra/images/rust:1.96-bookworm AS builder
 
-# 集群在 cn-hangzhou，直连 crates.io 拉依赖会卡住：上一次构建 cargo fmt
-# 空转了 23 分钟没有任何输出，全花在下载索引和 crate 上。
-# 用和 apt 同一个阿里云镜像（那边实测 17 秒装完全部包）。
-# 在国外构建时用 --build-arg CARGO_MIRROR=sparse+https://index.crates.io/ 关掉。
+# 基础镜像配了 apt 源，但没配 cargo 源，直连 crates.io 会卡死：
+# 上一次构建 cargo fmt 空转 23 分钟没有任何输出，全花在下载索引和 crate 上。
+# 这块值得后面挪进 infra/images 的 rust 定制里（就像 golang 镜像里的 GOPROXY）。
 ARG CARGO_MIRROR=sparse+https://mirrors.aliyun.com/crates.io-index/
 RUN mkdir -p "$CARGO_HOME" && printf '%s\n' \
         '[source.crates-io]' \
@@ -21,9 +23,15 @@ RUN mkdir -p "$CARGO_HOME" && printf '%s\n' \
         "registry = \"${CARGO_MIRROR}\"" \
         > "$CARGO_HOME/config.toml"
 
+# 官方 rust 镜像用 --profile minimal 装工具链，不带 clippy 和 rustfmt。
+RUN rustup component add rustfmt clippy
+
 WORKDIR /build
+# 注意这里**不复制** rust-toolchain.toml：它写的是 channel = "stable"，
+# 而镜像里装的工具链名叫 1.87.0，rustup 会为了满足 "stable" 去下载一整套。
+# CI 直接用镜像钉住的 1.87.0，比跟着 stable 漂移更可复现。
+COPY Cargo.toml Cargo.lock README.md LICENSE ./
 # 依赖下载单独一层：只依赖 Cargo.lock，改源码不会让它失效。
-COPY Cargo.toml Cargo.lock rust-toolchain.toml README.md LICENSE ./
 RUN cargo fetch --locked
 
 COPY src ./src
@@ -31,25 +39,18 @@ COPY tests ./tests
 
 # 分成独立 RUN，失败时能直接看出是哪一步挂的，缓存粒度也更细。
 RUN cargo fmt --all -- --check
-RUN cargo clippy --all-targets --all-features --locked -- -D warnings
-RUN cargo test --all-targets --locked
-RUN cargo build --release --locked
+RUN cargo clippy --all-targets --all-features --locked --offline -- -D warnings
+RUN cargo test --all-targets --locked --offline
+RUN cargo build --release --locked --offline
 
-FROM debian:bookworm-slim
+FROM registry.edumind.ai/infra/images/debian:bookworm-slim
 
 ARG OCI_REVISION=unknown
 ARG OCI_SOURCE=unknown
 LABEL org.opencontainers.image.revision=$OCI_REVISION
 LABEL org.opencontainers.image.source=$OCI_SOURCE
 
-# 集群在 cn-hangzhou，直连 deb.debian.org 慢到 30 分钟装不完这几个包
-# （perl 4MB 花了 5 分钟）。buildkit 已经给 docker.io 配了国内镜像源，
-# apt 也得配，否则每次构建都卡在这一步。
-# 在国外构建时用 --build-arg APT_MIRROR=deb.debian.org 关掉。
-ARG APT_MIRROR=mirrors.aliyun.com
-RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
-        /etc/apt/sources.list.d/debian.sources \
-    && apt-get update \
+RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home relay \
