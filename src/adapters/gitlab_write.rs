@@ -25,9 +25,15 @@ pub struct GitLabDispatchError {
 
 impl GitLabWriteBridge {
     pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("RELAY_GITLAB_WRITE_URL")
+        let explicit = std::env::var("RELAY_GITLAB_WRITE_URL")
             .ok()
-            .or_else(|| std::env::var("GITLAB_URL").ok())
+            .filter(|value| !value.trim().is_empty());
+        let inherited = std::env::var("GITLAB_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let base_url = explicit
+            .clone()
+            .or_else(|| inherited.clone())
             .unwrap_or_else(|| DEFAULT_GITLAB_URL.to_string());
         let fallback_token = std::env::var("RELAY_GITLAB_WRITE_TOKEN")
             .ok()
@@ -38,7 +44,19 @@ impl GitLabWriteBridge {
             .map(|value| parse_tenant_tokens(&value))
             .transpose()?
             .unwrap_or_default();
-        Self::new(&base_url, fallback_token.as_deref(), tenant_tokens)
+        match Self::new(&base_url, fallback_token.as_deref(), tenant_tokens) {
+            Ok(bridge) => Ok(bridge),
+            // 只配了只读的 GITLAB_URL（例如集群内的 http://gitlab.gitlab.svc）时，
+            // 不该让整个控制面起不来——读和写的安全要求本来就不同。关掉写入并说清楚，
+            // 比拒绝启动更合适。显式配错 RELAY_GITLAB_WRITE_URL 仍然直接报错。
+            Err(error) if explicit.is_none() && inherited.is_some() => {
+                eprintln!(
+                    "GitLab 写入网关已禁用：继承自 GITLAB_URL 的地址不能用于写入（{error}）。\n                     读取功能不受影响。需要写入时请把 RELAY_GITLAB_WRITE_URL 显式设为 HTTPS 地址。"
+                );
+                Ok(Self::disabled())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn disabled() -> Self {
@@ -395,6 +413,41 @@ fn parse_tenant_tokens(value: &str) -> Result<BTreeMap<String, String>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 这两个用例要改进程级环境变量，必须串行，否则会互相干扰、也会干扰
+    /// 其他读这些变量的测试。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 回归：集群内只读配置 GITLAB_URL=http://gitlab.gitlab.svc 时，
+    /// 写入网关曾让整个控制面拒绝启动（"GitLab write URL must use HTTPS"）。
+    #[test]
+    fn read_only_gitlab_url_disables_writes_instead_of_refusing_to_start() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let bridge = GitLabWriteBridge::new("http://gitlab.gitlab.svc", None, BTreeMap::new());
+        // 直接构造仍然拒绝——这个安全约束本身是对的。
+        assert!(bridge.is_err());
+        // from_env 在只继承 GITLAB_URL 的情况下应当降级为禁用而不是报错。
+        unsafe {
+            std::env::remove_var("RELAY_GITLAB_WRITE_URL");
+            std::env::set_var("GITLAB_URL", "http://gitlab.gitlab.svc");
+        }
+        let result = GitLabWriteBridge::from_env();
+        unsafe { std::env::remove_var("GITLAB_URL") };
+        assert!(result.is_ok(), "只读配置不应该让控制面起不来");
+    }
+
+    /// 显式把写入地址配成 HTTP 属于配置错误，要直接报出来，不能默默降级。
+    #[test]
+    fn explicitly_insecure_write_url_is_still_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        unsafe {
+            std::env::set_var("RELAY_GITLAB_WRITE_URL", "http://gitlab.example.com");
+            std::env::remove_var("GITLAB_URL");
+        }
+        let result = GitLabWriteBridge::from_env();
+        unsafe { std::env::remove_var("RELAY_GITLAB_WRITE_URL") };
+        assert!(result.is_err());
+    }
     use std::sync::{Arc, Mutex};
 
     use axum::Router;

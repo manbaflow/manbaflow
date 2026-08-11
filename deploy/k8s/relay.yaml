@@ -90,6 +90,11 @@ spec:
             - secretRef:
                 name: relay-feishu
                 optional: true
+            # GitLab 只读访问：登记仓库时要验证项目存在、凭据有权限，
+            # 同步 MR/Pipeline 也走它。没配就只是这两件事不可用。
+            - secretRef:
+                name: relay-gitlab
+                optional: true
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
