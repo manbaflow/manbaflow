@@ -227,3 +227,37 @@ async fn postgres_replicas_share_tenant_events_and_credentials() {
         source_admin.id
     );
 }
+
+/// HTTP 层为规划器单开的实例必须连同一个库。
+///
+/// 回归：原来两处都写死 `RelayApp::open()`（SQLite），PostgreSQL 部署下会在
+/// 容器临时盘上开出一个空库，于是从 Console 提需求直接报
+/// 「organization has not been initialized」，整条「提需求」路径不可用。
+#[tokio::test(flavor = "multi_thread")]
+async fn side_task_app_uses_the_same_store_as_the_server() {
+    let Some(database_url) = std::env::var("RELAY_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping PostgreSQL integration test; RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let tenant_id = new_id("TEN");
+    let data_dir = directory.path().join("runtime");
+
+    let mut server = RelayApp::open_postgres(data_dir.clone(), &database_url, &tenant_id).unwrap();
+    server
+        .init_organization("Side Task Relay", "admin")
+        .unwrap();
+
+    // 与 server.rs 的规划器路径一致：同一个 data_dir、同一个 tenant。
+    // 环境变量决定后端，模拟部署时注入的 RELAY_DATABASE_URL。
+    unsafe { std::env::set_var("RELAY_DATABASE_URL", &database_url) };
+    let side = RelayApp::open_for_side_task(data_dir, &tenant_id).unwrap();
+    unsafe { std::env::remove_var("RELAY_DATABASE_URL") };
+
+    // 看得到同一个组织，才说明连的是同一个库。
+    assert_eq!(
+        side.state().organization().unwrap().name,
+        "Side Task Relay",
+        "规划器实例没有连到服务端所用的库"
+    );
+}

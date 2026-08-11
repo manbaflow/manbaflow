@@ -91,6 +91,19 @@ impl RelayApp {
         Self::open_with_store(data_dir, store)
     }
 
+    /// 按当前部署的存储配置打开一个独立实例。
+    ///
+    /// 规划器要跑几十秒，不能一直占着主实例的锁，所以 HTTP 层会为它单开一个
+    /// App。但那个实例必须连同一个库——原来两处都写死 `open()`（SQLite），在
+    /// PostgreSQL 部署下会在容器临时盘上开一个空库，于是「提需求」直接报
+    /// 「organization has not been initialized」，整条路走不通。
+    pub fn open_for_side_task(data_dir: impl AsRef<Path>, tenant_id: &str) -> Result<Self> {
+        match crate::tenant::database_url_from_env()? {
+            Some(database_url) => Self::open_postgres(data_dir, &database_url, tenant_id),
+            None => Self::open(data_dir),
+        }
+    }
+
     pub fn open_postgres(
         data_dir: impl AsRef<Path>,
         database_url: &str,

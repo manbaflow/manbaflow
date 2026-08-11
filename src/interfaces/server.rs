@@ -1887,12 +1887,17 @@ async fn create_demand(
         .into());
     }
     let workspace = std::env::current_dir().map_err(RelayError::from)?;
-    let (data_dir, principal_id) = {
+    let (data_dir, principal_id, tenant_id) = {
         let app = state.app.lock().await;
         let principal = authenticate(&app, &headers)?;
-        (app.data_dir().to_path_buf(), principal.id)
+        (
+            app.data_dir().to_path_buf(),
+            principal.id,
+            app.state().tenant()?.id.clone(),
+        )
     };
-    let mut planning_app = RelayApp::open(data_dir)?;
+    // 必须跟主实例连同一个库；写死 SQLite 会在 PostgreSQL 部署下开出空库。
+    let mut planning_app = RelayApp::open_for_side_task(data_dir, &tenant_id)?;
     let flow = planning_app
         .create_demand(
             &input.summary,
@@ -2110,12 +2115,16 @@ async fn propose_flow_change(
     Json(input): Json<ProposeFlowChangeInput>,
 ) -> ApiResult<Json<FlowChangeRequest>> {
     let workspace = std::env::current_dir().map_err(RelayError::from)?;
-    let (data_dir, principal_id) = {
+    let (data_dir, principal_id, tenant_id) = {
         let app = state.app.lock().await;
         let principal = authenticate(&app, &headers)?;
-        (app.data_dir().to_path_buf(), principal.id)
+        (
+            app.data_dir().to_path_buf(),
+            principal.id,
+            app.state().tenant()?.id.clone(),
+        )
     };
-    let mut planning_app = RelayApp::open(data_dir)?;
+    let mut planning_app = RelayApp::open_for_side_task(data_dir, &tenant_id)?;
     let change = planning_app
         .propose_flow_change(
             &flow_id,
