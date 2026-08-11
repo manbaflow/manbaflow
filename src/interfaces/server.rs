@@ -25,12 +25,12 @@ use crate::domain::{
     Flow, FlowChangeRequest, FlowMessage, FlowMessageKind, GitLabWritePayload, GitLabWriteRequest,
     IssuedCredential, MessageInboxItem, NotificationConnector, NotificationDelivery,
     NotificationEndpoint, OfficeProvider, OfficeReleasePayload, OfficeReleaseRequest, Organization,
-    OrganizationRole, Principal, PrincipalKind, RecoveryAction, RemoteFlightReport, RoleBinding,
-    Task, Team, Tenant, TrackingEscalation, WorkCalendar, Workday,
+    OrganizationRole, Principal, PrincipalKind, RecoveryAction, RemoteFlightReport, Repository,
+    RoleBinding, Task, Team, Tenant, TrackingEscalation, WorkCalendar, Workday,
 };
 use crate::error::{RelayError, Result};
 use crate::feishu_auth::FeishuProvider;
-use crate::gitlab::{GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
+use crate::gitlab::{GitLabClient, GitLabWebhookAuth, GitLabWebhookEvent, parse_webhook_event};
 use crate::gitlab_write::GitLabWriteBridge;
 use crate::identity::{OidcProvider, ScimAuthenticator};
 use crate::interaction::{
@@ -240,6 +240,21 @@ struct OrganizationView {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct CreateRepositoryInput {
+    /// GitLab 上的完整路径，例如 edumind/edumindx
+    gitlab_project_path: String,
+    /// 界面上显示的短名字；不填就取项目路径的最后一段
+    #[serde(default)]
+    name: Option<String>,
+    /// 不填就用 GitLab 上的默认分支
+    #[serde(default)]
+    default_branch: Option<String>,
+    /// 覆盖 GitLab 地址，一般不用填
+    #[serde(default)]
+    gitlab_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct CreateTeamInput {
     name: String,
     #[serde(default)]
@@ -275,6 +290,9 @@ struct IssueCredentialInput {
 #[derive(Clone, Debug, Deserialize)]
 struct CreateDemandInput {
     summary: String,
+    /// 这条需求在哪个代码仓库上做（ID 或名称）
+    #[serde(default)]
+    repository: Option<String>,
     #[serde(default = "default_planner_kind")]
     planner: PlannerKind,
     #[serde(default = "default_planner_timeout_seconds")]
@@ -837,6 +855,14 @@ fn router_with_identity(app: Arc<Mutex<RelayApp>>, integrations: ServerIntegrati
         .route("/api/v1/me", get(me))
         .route("/api/v1/organization", get(organization))
         .route("/api/v1/teams", get(teams).post(create_team))
+        .route(
+            "/api/v1/repositories",
+            get(repositories).post(create_repository),
+        )
+        .route(
+            "/api/v1/repositories/{id}/archive",
+            post(archive_repository),
+        )
         .route("/api/v1/principals", get(principals).post(create_principal))
         .route(
             "/api/v1/principals/{id}/roles",
@@ -1772,6 +1798,55 @@ async fn teams(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<J
     Ok(Json(teams))
 }
 
+async fn repositories(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<Repository>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    app.authorize_organization_read(&principal.id)?;
+    Ok(Json(app.repositories()))
+}
+
+async fn create_repository(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateRepositoryInput>,
+) -> ApiResult<Json<Repository>> {
+    // 先确认 GitLab 上项目真实存在、Token 也有权限，再落库。否则会攒下一堆
+    // 连不上的仓库，等 Agent 起飞时才发现——那时排查成本高得多。
+    let client = GitLabClient::from_env(input.gitlab_url.as_deref())?;
+    let project = client.check_project(&input.gitlab_project_path).await?;
+    let branch = input
+        .default_branch
+        .clone()
+        .or_else(|| project.default_branch.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let name = input.name.clone().unwrap_or_else(|| {
+        project
+            .path_with_namespace
+            .rsplit('/')
+            .next()
+            .unwrap_or(&project.path_with_namespace)
+            .to_string()
+    });
+    mutate(&state, &headers, |app, actor| {
+        app.register_repository(&name, &project.path_with_namespace, &branch, actor)
+    })
+    .await
+}
+
+async fn archive_repository(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Repository>> {
+    mutate(&state, &headers, |app, actor| {
+        app.archive_repository(&id, actor)
+    })
+    .await
+}
+
 async fn create_team(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1905,7 +1980,7 @@ async fn create_demand(
             input.planner,
             &workspace,
             input.timeout_seconds,
-            None,
+            input.repository.as_deref(),
         )
         .await?;
     state.app.lock().await.reload()?;

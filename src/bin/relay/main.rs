@@ -85,6 +85,11 @@ enum Command {
         #[command(subcommand)]
         command: TeamCommand,
     },
+    /// 登记可以在上面干活的代码仓库
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
     /// 注册 Human、本地 Agent 和远程 Personal Agent
     Principal {
         #[command(subcommand)]
@@ -221,6 +226,34 @@ enum OrgCommand {
     Show,
     /// 查看团队、Human 和 Agent 关系
     Chart,
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// 登记一个 GitLab 项目（会先验证连通性与权限）
+    Add {
+        /// GitLab 完整路径，例如 edumind/edumindx
+        #[arg(long)]
+        project: String,
+        /// 界面上显示的短名字；默认取项目路径最后一段
+        #[arg(long)]
+        name: Option<String>,
+        /// 默认分支；不填就用 GitLab 上的
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
+    /// 列出仓库
+    List,
+    /// 归档：不再往上面派新活，历史记录保留
+    Archive {
+        repository: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1170,6 +1203,73 @@ async fn run(cli: Cli) -> Result<()> {
             }
             OrgCommand::Chart => print_chart(&app, cli.json)?,
         },
+        Command::Repo { command } => match command {
+            RepoCommand::Add {
+                project,
+                name,
+                branch,
+                url,
+                by,
+            } => {
+                // 先确认 GitLab 上项目存在且 Token 有权限，再落库。
+                let client = GitLabClient::from_env(url.as_deref())?;
+                let checked = client.check_project(&project).await?;
+                let branch = branch
+                    .or_else(|| checked.default_branch.clone())
+                    .unwrap_or_else(|| "main".to_string());
+                let name = name.unwrap_or_else(|| {
+                    checked
+                        .path_with_namespace
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&checked.path_with_namespace)
+                        .to_string()
+                });
+                let repository =
+                    app.register_repository(&name, &checked.path_with_namespace, &branch, &by)?;
+                output(
+                    &repository,
+                    cli.json,
+                    format!(
+                        "已登记仓库 {} ({})：{} @ {}",
+                        repository.name,
+                        repository.id,
+                        repository.gitlab_project_path,
+                        repository.default_branch
+                    ),
+                );
+            }
+            RepoCommand::List => output(
+                &app.repositories(),
+                cli.json,
+                app.repositories()
+                    .iter()
+                    .map(|repository| {
+                        format!(
+                            "{} {} {} @ {}{}",
+                            repository.id,
+                            repository.name,
+                            repository.gitlab_project_path,
+                            repository.default_branch,
+                            if repository.active {
+                                ""
+                            } else {
+                                "（已归档）"
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            RepoCommand::Archive { repository, by } => {
+                let repository = app.archive_repository(&repository, &by)?;
+                output(
+                    &repository,
+                    cli.json,
+                    format!("已归档仓库 {} ({})", repository.name, repository.id),
+                );
+            }
+        },
         Command::Team { command } => match command {
             TeamCommand::Add {
                 name,
@@ -1180,7 +1280,7 @@ async fn run(cli: Cli) -> Result<()> {
                 output(
                     &team,
                     cli.json,
-                    format!("已建立球队 {} ({})", team.name, team.id),
+                    format!("已建立团队 {} ({})", team.name, team.id),
                 );
             }
             TeamCommand::List => output(

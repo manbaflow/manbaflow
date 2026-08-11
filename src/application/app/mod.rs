@@ -37,6 +37,7 @@ mod messages;
 mod notifications;
 mod office;
 mod policy;
+mod repositories;
 mod setup;
 mod tracking;
 
