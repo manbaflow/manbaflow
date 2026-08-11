@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,6 +27,13 @@ pub struct WorkerOptions {
     pub executor: ExecutorKind,
     pub mode: ExecutorMode,
     pub workspace: PathBuf,
+    /// 本机能处理哪些仓库：键接受仓库 ID（REPO-xxx）或 GitLab 项目路径
+    /// （group/project），值是本地 checkout 的绝对路径。
+    ///
+    /// 不自动 clone：IsolatedWorktree::create 要求一个已存在且干净的本地仓库，
+    /// 自动 clone 意味着要在 Worker 主机上管理 Git 凭据，那一层单独评估。
+    /// 显式映射的好处是行为明确——领不到活时能立刻说清是哪个仓库没配。
+    pub repositories: BTreeMap<String, PathBuf>,
     pub model: Option<String>,
     pub command: Option<PathBuf>,
     pub task_id: Option<String>,
@@ -93,8 +101,17 @@ impl RemoteWorker {
                 "RELAY_TOKEN is required for a remote worker".into(),
             ));
         }
-        if !options.workspace.is_dir() {
+        // 配了仓库映射就按映射走，--workspace 只是单仓库时的兼容写法。
+        if options.repositories.is_empty() && !options.workspace.is_dir() {
             return Err(RelayError::InvalidWorkspace(options.workspace.clone()));
+        }
+        for (key, path) in &options.repositories {
+            if !path.is_dir() {
+                return Err(RelayError::Validation(format!(
+                    "仓库 {key} 映射到的本地路径不存在：{}",
+                    path.display()
+                )));
+            }
         }
         if options.timeout_seconds == 0 {
             return Err(RelayError::Validation(
@@ -253,6 +270,25 @@ impl RemoteWorker {
         }
     }
 
+    /// 这次航班应该在哪个本地目录里执行。
+    ///
+    /// manifest 带了仓库就必须能映射到本地路径，映射不上返回 None——调用方据此
+    /// 跳过该租约。没带仓库的走 --workspace，兼容单仓库的老用法。
+    fn workspace_for(&self, lease: &FlightLease) -> Option<PathBuf> {
+        let Some(repository) = lease.manifest.as_ref().and_then(|m| m.repository.as_ref()) else {
+            return Some(self.options.workspace.clone());
+        };
+        self.options
+            .repositories
+            .get(&repository.id)
+            .or_else(|| {
+                self.options
+                    .repositories
+                    .get(&repository.gitlab_project_path)
+            })
+            .cloned()
+    }
+
     async fn run_execute_once(&self) -> Result<WorkerOutcome> {
         let principal = self.control_plane.me().await?;
         let leases = self.control_plane.flight_leases().await?;
@@ -260,13 +296,39 @@ impl RemoteWorker {
             &leases,
             &self.options.executor,
             self.options.task_id.as_deref(),
+            |lease| self.workspace_for(lease).is_some(),
         ) else {
+            // 区分「没有活」和「有活但本机没配这个仓库」——后者只看
+            // 「worker 空转」是查不出来的。
+            let unmapped: Vec<_> = leases
+                .iter()
+                .filter(|lease| lease.executor == self.options.executor)
+                .filter(|lease| {
+                    matches!(
+                        lease.status,
+                        FlightLeaseStatus::Authorized | FlightLeaseStatus::Active
+                    )
+                })
+                .filter_map(|lease| lease.manifest.as_ref()?.repository.as_ref())
+                .map(|repository| {
+                    format!("{}({})", repository.name, repository.gitlab_project_path)
+                })
+                .collect();
+            let summary = if unmapped.is_empty() {
+                "no authorized write flight lease for this worker and executor".to_string()
+            } else {
+                format!(
+                    "有 {} 个航班在等，但本机没有配置对应仓库：{}。用 --repo <仓库>=<本地路径> 指定。",
+                    unmapped.len(),
+                    unmapped.join("、")
+                )
+            };
             return Ok(WorkerOutcome {
                 status: WorkerOutcomeStatus::Idle,
                 principal: principal.name,
                 task_id: self.options.task_id.clone(),
                 run_id: None,
-                summary: "no authorized write flight lease for this worker and executor".into(),
+                summary,
                 log_path: None,
             });
         };
@@ -352,11 +414,15 @@ impl RemoteWorker {
             .manifest
             .as_ref()
             .map_or(CapabilityPack::General, |manifest| manifest.capability_pack);
+        // select_lease 已经保证能解析出来，这里不会是 None。
+        let source_workspace = self
+            .workspace_for(&lease)
+            .unwrap_or_else(|| self.options.workspace.clone());
         let (result, artifact) = {
             let worktree = if worktree_root.exists() {
-                IsolatedWorktree::resume(&self.options.workspace, worktree_root)
+                IsolatedWorktree::resume(&source_workspace, worktree_root)
             } else {
-                IsolatedWorktree::create(&self.options.workspace, worktree_root)
+                IsolatedWorktree::create(&source_workspace, worktree_root)
             };
             match worktree {
                 Ok(mut worktree) => {
@@ -814,6 +880,7 @@ fn select_lease<'a>(
     leases: &'a [FlightLease],
     executor: &ExecutorKind,
     requested_task: Option<&str>,
+    runnable: impl Fn(&FlightLease) -> bool,
 ) -> Option<&'a FlightLease> {
     leases
         .iter()
@@ -825,6 +892,8 @@ fn select_lease<'a>(
         })
         .filter(|lease| &lease.executor == executor)
         .filter(|lease| requested_task.is_none_or(|task| lease.task_id == task))
+        // 跑不了的直接不领：领了再失败会让任务白白进入 active 又崩掉。
+        .filter(|lease| runnable(lease))
         .min_by_key(|lease| {
             (
                 if lease.status == FlightLeaseStatus::Active {
@@ -1086,6 +1155,124 @@ fn classify_worker_error(error: &RelayError) -> FailureClass {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::{FuelBudget, RepositoryRef};
+
+    fn worker_with_repos(
+        directory: &std::path::Path,
+        repositories: BTreeMap<String, PathBuf>,
+    ) -> RemoteWorker {
+        RemoteWorker::new(WorkerOptions {
+            repositories,
+            server_url: "http://127.0.0.1:1".into(),
+            token: "worker-token".into(),
+            executor: ExecutorKind::Codex,
+            mode: ExecutorMode::Execute,
+            workspace: directory.to_path_buf(),
+            model: None,
+            command: None,
+            task_id: None,
+            timeout_seconds: 10,
+            data_dir: directory.join("data"),
+            sandbox: SandboxBackend::Process,
+            docker: None,
+        })
+        .unwrap()
+    }
+
+    fn lease_for_repository(repository: Option<RepositoryRef>) -> FlightLease {
+        FlightLease {
+            id: "LEASE-1".into(),
+            flow_id: "FLOW-1".into(),
+            task_id: "TSK-1".into(),
+            principal_id: "HUM-1".into(),
+            principal_name: "李伟".into(),
+            authorized_by: "陈静".into(),
+            executor: ExecutorKind::Codex,
+            status: FlightLeaseStatus::Authorized,
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            claimed_at: None,
+            finished_at: None,
+            run_id: None,
+            report: None,
+            manifest: repository.map(|repository| FlightManifest {
+                id: "MANIFEST-1".into(),
+                repository: Some(repository),
+                objective: "实现功能".into(),
+                landing_conditions: vec!["测试通过".into()],
+                context_refs: Vec::new(),
+                tool_permissions: Vec::new(),
+                fuel: FuelBudget::default(),
+                recovery: RecoveryPolicy::default(),
+                resources: Vec::new(),
+                capability_pack: CapabilityPack::General,
+                output_contract: OutputContract::default(),
+                declared_by: "陈静".into(),
+                declared_at: Utc::now(),
+            }),
+            parent_lease_id: None,
+            root_lease_id: None,
+            attempt: 1,
+        }
+    }
+
+    fn repository_ref() -> RepositoryRef {
+        RepositoryRef {
+            id: "REPO-abc".into(),
+            name: "edumindx".into(),
+            gitlab_project_path: "edumind/edumindx".into(),
+            branch: "main".into(),
+        }
+    }
+
+    #[test]
+    fn workspace_resolves_by_repository_id_or_project_path() {
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("edumindx");
+        fs::create_dir_all(&checkout).unwrap();
+
+        for key in ["REPO-abc", "edumind/edumindx"] {
+            let worker = worker_with_repos(
+                directory.path(),
+                BTreeMap::from([(key.to_string(), checkout.clone())]),
+            );
+            assert_eq!(
+                worker.workspace_for(&lease_for_repository(Some(repository_ref()))),
+                Some(checkout.clone()),
+                "应当能用 {key} 解析出本地路径"
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_repository_yields_no_workspace() {
+        let directory = tempdir().unwrap();
+        let worker = worker_with_repos(directory.path(), BTreeMap::new());
+        // 解析不出来就不能跑；调用方据此跳过，而不是领了再崩。
+        assert_eq!(
+            worker.workspace_for(&lease_for_repository(Some(repository_ref()))),
+            None
+        );
+    }
+
+    #[test]
+    fn manifest_without_repository_falls_back_to_workspace_flag() {
+        let directory = tempdir().unwrap();
+        let worker = worker_with_repos(directory.path(), BTreeMap::new());
+        assert_eq!(
+            worker.workspace_for(&lease_for_repository(None)),
+            Some(directory.path().to_path_buf()),
+            "没绑定仓库的老用法要继续可用"
+        );
+    }
+
+    #[test]
+    fn leases_for_unmapped_repositories_are_not_claimed() {
+        let leases = vec![lease_for_repository(Some(repository_ref()))];
+        // 本机跑不了这个仓库时，select_lease 不应该把它选出来。
+        assert!(select_lease(&leases, &ExecutorKind::Codex, None, |_| false).is_none());
+        assert!(select_lease(&leases, &ExecutorKind::Codex, None, |_| true).is_some());
+    }
     use std::sync::{Arc, Mutex};
 
     use axum::body::Bytes;
@@ -1155,6 +1342,7 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
 
         let worker = RemoteWorker::new(WorkerOptions {
+            repositories: BTreeMap::new(),
             server_url: format!("http://{address}"),
             token: "worker-token".into(),
             executor: ExecutorKind::Codex,
@@ -1313,6 +1501,7 @@ printf '%s\n' '{"thread_id":"execute-thread"}'
 
         let data_dir = directory.path().join("worker-data");
         let worker = RemoteWorker::new(WorkerOptions {
+            repositories: BTreeMap::new(),
             server_url: format!("http://{address}"),
             token: "worker-token".into(),
             executor: ExecutorKind::Codex,

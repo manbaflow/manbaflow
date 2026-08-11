@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -551,6 +552,10 @@ struct WorkerArgs {
     mode: ExecutorModeArg,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// 本机能处理哪个仓库，形如 <仓库ID或 group/project>=<本地路径>，可重复。
+    /// 也可用 RELAY_WORKER_REPOS（逗号分隔）。配了之后 --workspace 就不再需要。
+    #[arg(long = "repo", value_name = "仓库=路径")]
+    repositories: Vec<String>,
     #[arg(long)]
     model: Option<String>,
     #[arg(long)]
@@ -2761,6 +2766,38 @@ fn dashboard_text(dashboard: &DashboardSnapshot) -> String {
     lines.join("\n")
 }
 
+/// 解析 `--repo 仓库=路径`，并合并 RELAY_WORKER_REPOS。
+///
+/// 键接受仓库 ID 或 GitLab 项目路径；路径统一转成绝对路径，因为 Worker 的
+/// 工作目录和它要操作的仓库通常不在一起。
+fn worker_repository_map(entries: &[String]) -> Result<BTreeMap<String, PathBuf>> {
+    let mut combined: Vec<String> = entries.to_vec();
+    if let Ok(value) = std::env::var("RELAY_WORKER_REPOS") {
+        combined.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string),
+        );
+    }
+    let mut map = BTreeMap::new();
+    for entry in combined {
+        let (key, path) = entry.split_once('=').ok_or_else(|| {
+            RelayError::Validation(format!("--repo 需要写成 <仓库>=<本地路径>，收到：{entry}"))
+        })?;
+        let key = key.trim();
+        let path = path.trim();
+        if key.is_empty() || path.is_empty() {
+            return Err(RelayError::Validation(format!(
+                "--repo 的仓库和路径都不能为空：{entry}"
+            )));
+        }
+        map.insert(key.to_string(), absolute_path(PathBuf::from(path))?);
+    }
+    Ok(map)
+}
+
 fn remote_worker(args: WorkerArgs, data_dir: &Path) -> Result<RemoteWorker> {
     let token = std::env::var("RELAY_TOKEN").map_err(|_| {
         relay::RelayError::Validation("RELAY_TOKEN is required for a remote worker".into())
@@ -2781,7 +2818,9 @@ fn remote_worker(args: WorkerArgs, data_dir: &Path) -> Result<RemoteWorker> {
         user: args.sandbox_user,
         environment: args.sandbox_environment,
     });
+    let repositories = worker_repository_map(&args.repositories)?;
     RemoteWorker::new(WorkerOptions {
+        repositories,
         server_url,
         token,
         executor: args.executor.into(),
