@@ -4,6 +4,9 @@ const state = {
   authenticated: false,
   dashboard: null,
   recoveryFlight: null,
+  repositories: [],
+  agents: [],
+  startTask: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -53,19 +56,24 @@ function openAuth() {
 
 async function loadDashboard(showMessage = true) {
   try {
-    if (showMessage) setStatus("正在同步 Flow Ledger...");
-    const [me, organization, dashboard] = await Promise.all([
+    if (showMessage) setStatus("正在同步…");
+    const [me, organization, dashboard, repositories, principals] = await Promise.all([
       api("/me"),
       api("/organization"),
       api("/dashboard"),
+      api("/repositories").catch(() => []),
+      api("/principals").catch(() => []),
     ]);
     state.dashboard = dashboard;
+    state.repositories = repositories;
+    state.agents = principals.filter((principal) => principal.kind === "agent" && principal.active);
     state.authenticated = true;
     $("#identity").textContent = `${me.name} · ${me.kind}`;
     $("#org-name").textContent = organization.organization.name;
-    $("#service-state").textContent = `${organization.tenant.name} · ONLINE`;
+    $("#service-state").textContent = `${organization.tenant.name} · 在线`;
+    renderRepositories(state.repositories);
     renderDashboard(dashboard);
-    setStatus(`塔台同步完成 · Ledger 生成于 ${formatDate(dashboard.generated_at)}`);
+    setStatus(`已同步 · 数据截至 ${formatDate(dashboard.generated_at)}`);
   } catch (error) {
     setStatus(error.message, true);
   }
@@ -85,12 +93,12 @@ function renderDashboard(dashboard) {
 
 function renderMetrics(metrics) {
   const definitions = [
-    ["活跃 Flow", metrics.active_flows, ""],
+    ["进行中的需求", metrics.active_flows, ""],
     ["任务完成", `${metrics.completed_tasks}/${metrics.total_tasks}`, "good"],
-    ["风险任务", metrics.at_risk_tasks, metrics.at_risk_tasks ? "alert" : ""],
-    ["显式阻塞", metrics.blocked_tasks, metrics.blocked_tasks ? "alert" : ""],
-    ["等待 Human", metrics.awaiting_human, metrics.awaiting_human ? "wait" : ""],
-    ["空中航班", metrics.open_flights, metrics.open_flights ? "wait" : ""],
+    ["可能延期", metrics.at_risk_tasks, metrics.at_risk_tasks ? "alert" : ""],
+    ["卡住了", metrics.blocked_tasks, metrics.blocked_tasks ? "alert" : ""],
+    ["等人确认", metrics.awaiting_human, metrics.awaiting_human ? "wait" : ""],
+    ["Agent 在跑", metrics.open_flights, metrics.open_flights ? "wait" : ""],
   ];
   const target = $("#metrics");
   target.replaceChildren(...definitions.map(([label, value, tone]) => {
@@ -98,6 +106,50 @@ function renderMetrics(metrics) {
     item.append(element("strong", "", String(value)), element("span", "", label));
     return item;
   }));
+}
+
+function renderRepositories(repositories) {
+  const active = repositories.filter((repository) => repository.active);
+  $("#repository-count").textContent = `${active.length} 个`;
+
+  // 提需求时的仓库下拉，只列还在用的。
+  const select = $("#demand-repository");
+  const previous = select.value;
+  const options = [element("option", "", "不指定")];
+  options[0].value = "";
+  for (const repository of active) {
+    const option = element("option", "", `${repository.name} (${repository.gitlab_project_path})`);
+    option.value = repository.id;
+    options.push(option);
+  }
+  select.replaceChildren(...options);
+  if (active.some((repository) => repository.id === previous)) select.value = previous;
+
+  const rows = repositories.map((repository) => {
+    const row = document.createElement("tr");
+    row.append(
+      taskCell(repository.name, repository.id),
+      textCell(repository.gitlab_project_path),
+      textCell(repository.default_branch),
+      cellBadge(repository.active ? "在用" : "已归档"),
+    );
+    const command = document.createElement("td");
+    if (repository.active) {
+      command.append(button("归档", () => archiveRepository(repository.id), "danger"));
+    }
+    row.append(command);
+    return row;
+  });
+  replaceRows("#repository-rows", rows, "还没有登记仓库。先登记一个，才能把需求落到具体项目上。", 5);
+}
+
+async function archiveRepository(repositoryId) {
+  if (!window.confirm("归档后不能再往这个仓库派新任务，历史记录会保留。确定吗？")) return;
+  try {
+    await api(`/repositories/${encodeURIComponent(repositoryId)}/archive`, { method: "POST" });
+    await loadDashboard(false);
+    setStatus("仓库已归档");
+  } catch (error) { setStatus(error.message, true); }
 }
 
 function renderActions(actions, releases, gitlabWrites) {
@@ -118,14 +170,18 @@ function renderActions(actions, releases, gitlabWrites) {
     if (next) {
       command.append(button(next.label, () => mutateTask(action.task_id, next.action)));
     }
+    // 已经接单/进行中的任务，可以直接交给 Agent 去做。
+    if (["accepted", "in_progress"].includes(action.status) && state.agents.length) {
+      command.append(button("让 Agent 开工", () => openStart(action), "primary"));
+    }
     row.append(command);
     return row;
   });
   rows.push(...releaseActions.map((release) => {
     const row = document.createElement("tr");
     const reason = release.status === "requested"
-      ? `等待 Human 放行 · SHA ${release.payload_sha256.slice(0, 12)}`
-      : (release.last_error || "需要人工核对 Provider 结果");
+      ? `等你放行 · 内容校验 ${release.payload_sha256.slice(0, 12)}`
+      : (release.last_error || "需要你去对方系统核对结果");
     row.append(
       cellBadge(release.status === "requested" ? "high" : "critical"),
       taskCell(release.summary, release.id),
@@ -148,8 +204,8 @@ function renderActions(actions, releases, gitlabWrites) {
   rows.push(...gitlabActions.map((request) => {
     const row = document.createElement("tr");
     const reason = request.status === "requested"
-      ? `等待 Human 放行 · ${request.project} · SHA ${request.payload_sha256.slice(0, 12)}`
-      : (request.last_error || "需要先在 GitLab 核对写入结果");
+      ? `等你放行 · ${request.project} · 内容校验 ${request.payload_sha256.slice(0, 12)}`
+      : (request.last_error || "需要你先去 GitLab 核对写入结果");
     row.append(
       cellBadge(request.status === "requested" ? "high" : "critical"),
       taskCell(request.summary, request.id),
@@ -165,25 +221,25 @@ function renderActions(actions, releases, gitlabWrites) {
       );
     } else {
       command.append(button(
-        request.status === "indeterminate" ? "已核对，复飞" : "再次放行",
+        request.status === "indeterminate" ? "已核对，重试" : "再次放行",
         () => mutateGitLabWrite(request.id, "retry"),
       ));
     }
     row.append(command);
     return row;
   }));
-  replaceRows("#action-rows", rows, "当前没有需要 Human 处置的任务", 6);
+  replaceRows("#action-rows", rows, "没有需要你确认的事", 6);
 }
 
 async function mutateRelease(releaseId, action, body) {
   try {
-    setStatus(`正在处理 Office Release ${releaseId}...`);
+    setStatus("正在处理文档发布…");
     await api(`/office/releases/${releaseId}/${action}`, {
       method: "POST",
       body: body ? JSON.stringify(body) : undefined,
     });
     await loadDashboard(false);
-    setStatus(`Office Release ${releaseId} 已写入 Flow Ledger`);
+    setStatus("文档发布已处理");
   } catch (error) {
     setStatus(error.message, true);
   }
@@ -196,13 +252,13 @@ function rejectRelease(releaseId) {
 
 async function mutateGitLabWrite(writeId, action, body) {
   try {
-    setStatus(`正在处理 GitLab Write ${writeId}...`);
+    setStatus("正在处理 GitLab 写入…");
     await api(`/gitlab/writes/${writeId}/${action}`, {
       method: "POST",
       body: body ? JSON.stringify(body) : undefined,
     });
     await loadDashboard(false);
-    setStatus(`GitLab Write ${writeId} 已写入 Flow Ledger`);
+    setStatus("GitLab 写入已处理");
   } catch (error) {
     setStatus(error.message, true);
   }
@@ -233,18 +289,18 @@ function renderFlows(flows) {
       textCell(shortDate(flow.p80_finish)),
     );
     const command = document.createElement("td");
-    if (flow.status === "draft") command.append(button("批准 Flow", () => approveFlow(flow.id), "primary"));
+    if (flow.status === "draft") command.append(button("确认方案，开始执行", () => approveFlow(flow.id), "primary"));
     row.append(command);
     return row;
   });
-  replaceRows("#flow-rows", rows, "还没有 Flow", 6);
+  replaceRows("#flow-rows", rows, "还没有需求。到「提需求」开始。", 6);
 }
 
 function renderFlights(flights) {
   $("#flight-count").textContent = `${flights.length} 架`;
   const target = $("#flight-list");
   if (!flights.length) {
-    target.replaceChildren(element("div", "empty", "机队待命"));
+    target.replaceChildren(element("div", "empty", "现在没有 Agent 在跑"));
     return;
   }
   target.replaceChildren(...flights.map((flight) => {
@@ -256,7 +312,10 @@ function renderFlights(flights) {
       : flight.sandbox_backend
         ? `${flight.sandbox_backend}/${flight.sandbox_network || "unknown"}/${image || "host"}`
         : "pending";
-    stateBox.append(element("span", `badge ${flight.status}`, flight.status), element("p", "", `A${flight.attempt || "-"} · ${flight.capability_pack || "local"} · ${flight.executor} · ${sandbox}`));
+    stateBox.append(
+      element("span", `badge ${flight.status}`, flightStatusLabel(flight.status)),
+      element("p", "", `第 ${flight.attempt || 1} 次 · ${flight.executor} · 沙箱 ${sandbox}`),
+    );
     const identity = element("div");
     identity.append(element("h3", "", flight.objective || flight.task_id), element("p", "", `${flight.principal} · ${flight.id}`));
     const fuel = renderFuel(
@@ -264,9 +323,15 @@ function renderFlights(flights) {
       [...(flight.budget_exhaustions || []), ...(flight.contract_violations || [])],
     );
     const resource = element("div");
-    resource.append(element("strong", "", `${flight.active_resource_leases}/${flight.total_resource_claims}`), element("p", "", `${flight.deliverable_count} ARTIFACT · ACTIVE LEASES`));
+    resource.append(
+      element("strong", "", `${flight.deliverable_count || 0}`),
+      element("p", "", "个产出文件"),
+    );
     const command = element("div");
-    if (flight.status === "crashed") command.append(button("处置坠机", () => openRecovery(flight), "danger"));
+    if (flight.deliverable_count) {
+      command.append(button("看产出", () => showArtifacts(flight)));
+    }
+    if (flight.status === "crashed") command.append(button("执行失败，处理", () => openRecovery(flight), "danger"));
     item.append(stateBox, identity, fuel, resource, command);
     return item;
   }));
@@ -275,21 +340,21 @@ function renderFlights(flights) {
 function renderFuel(fuel, exhaustions) {
   const wrap = element("div", `fuel-meter ${exhaustions.length ? "over" : ""}`.trim());
   if (!fuel) {
-    wrap.append(element("span", "", "Legacy manifest"));
+    wrap.append(element("span", "", "无用量记录"));
     return wrap;
   }
   const ratio = fuel.duration_budget_seconds
     ? Math.min(100, Math.round((fuel.duration_used_seconds / fuel.duration_budget_seconds) * 100))
     : 0;
   wrap.append(
-    element("span", "", `FUEL ${fuel.duration_used_seconds}s / ${fuel.duration_budget_seconds}s`),
+    element("span", "", `已用 ${fuel.duration_used_seconds}s / 上限 ${fuel.duration_budget_seconds}s`),
     element("strong", "", `${ratio}%`),
   );
   const bar = element("div", "bar");
   const fill = document.createElement("i");
   fill.style.width = `${ratio}%`;
   bar.append(fill);
-  wrap.append(bar, element("span", "subline", `CTX ${formatBytes(fuel.context_used_bytes)} / ${formatBytes(fuel.context_budget_bytes)}`));
+  wrap.append(bar, element("span", "subline", `上下文 ${formatBytes(fuel.context_used_bytes)} / ${formatBytes(fuel.context_budget_bytes)}`));
   if (exhaustions.length) wrap.append(element("span", "subline", exhaustions[0]));
   return wrap;
 }
@@ -334,10 +399,10 @@ function taskAction(status) {
 
 async function mutateTask(taskId, action) {
   try {
-    setStatus(`正在推进 ${taskId}...`);
+    setStatus("正在更新任务…");
     await api(`/tasks/${encodeURIComponent(taskId)}/${action}`, { method: "POST" });
     await loadDashboard(false);
-    setStatus(`${taskId} 已完成 ${action}`);
+    setStatus(`${taskId} 已更新`);
   } catch (error) { setStatus(error.message, true); }
 }
 
@@ -346,16 +411,16 @@ async function approveFlow(flowId) {
     setStatus(`正在批准 ${flowId}...`);
     await api(`/flows/${encodeURIComponent(flowId)}/approve`, { method: "POST" });
     await loadDashboard(false);
-    setStatus(`${flowId} 已批准并完成派发`);
+    setStatus(`${flowId} 已确认，任务已分配`);
   } catch (error) { setStatus(error.message, true); }
 }
 
 async function openRecovery(flight) {
   try {
     const options = await api(`/flight-leases/${encodeURIComponent(flight.id)}/recovery-options`);
-    if (!options.length) throw new Error("FlightManifest 没有可用的恢复动作");
+    if (!options.length) throw new Error("这次执行没有可选的处理方式");
     state.recoveryFlight = flight;
-    $("#recovery-flight").textContent = `${flight.id} · ${flight.failure_class || "unknown"} · ${flight.summary || "无摘要"}`;
+    $("#recovery-flight").textContent = `${flight.objective || flight.task_id} · ${flight.summary || "没有更多信息"}`;
     const select = $("#recovery-action");
     select.replaceChildren(...options.map((action) => {
       const option = document.createElement("option");
@@ -376,13 +441,55 @@ function toggleExecutor() {
 
 function recoveryLabel(action) {
   return ({
-    retry: "沿原航线复飞",
-    switch_executor: "更换执行器",
-    reduce_scope: "缩小航线",
-    human_handoff: "转交 Human",
-    ground: "永久停飞",
-    fork: "分叉复飞",
+    retry: "原样重试",
+    switch_executor: "换一个执行器重试",
+    reduce_scope: "缩小范围再试",
+    human_handoff: "转给人来做",
+    ground: "放弃这个任务",
+    fork: "换个方案重试",
   })[action] || action;
+}
+
+function flightStatusLabel(status) {
+  return ({
+    authorized: "已授权，等 Agent 领取",
+    active: "正在执行",
+    landed: "执行完成",
+    crashed: "执行失败",
+    revoked: "已撤销",
+    expired: "已过期",
+  })[status] || status;
+}
+
+async function showArtifacts(flight) {
+  try {
+    setStatus("正在读取产出…");
+    const artifacts = await api(`/flight-leases/${encodeURIComponent(flight.id)}/artifacts`);
+    if (!artifacts.length) {
+      setStatus("这次执行没有留下产出文件");
+      return;
+    }
+    const lines = artifacts
+      .map((artifact) => `${artifact.path}（${formatBytes(artifact.size_bytes || 0)}）`)
+      .join("\n");
+    window.alert(`本次改动的文件：\n\n${lines}`);
+    setStatus(`共 ${artifacts.length} 个产出文件`);
+  } catch (error) { setStatus(error.message, true); }
+}
+
+function openStart(action) {
+  if (!state.agents.length) {
+    setStatus("还没有注册可用的 Agent", true);
+    return;
+  }
+  state.startTask = action;
+  $("#start-task").textContent = `${action.task_title}（${action.task_id}）`;
+  $("#start-agent").replaceChildren(...state.agents.map((agent) => {
+    const option = element("option", "", agent.name);
+    option.value = agent.name;
+    return option;
+  }));
+  $("#start-dialog").showModal();
 }
 
 function formatDate(value) {
@@ -436,14 +543,60 @@ $("#demand-form").addEventListener("submit", async (event) => {
   const summary = $("#demand-summary").value.trim();
   if (!summary) return;
   try {
-    setStatus("正在生成 PRD 与任务 DAG...");
+    setStatus("正在拆解需求…");
     await api("/demands", {
       method: "POST",
-      body: JSON.stringify({ summary, planner: $("#demand-planner").value, timeout_seconds: 300 }),
+      body: JSON.stringify({
+        summary,
+        planner: $("#demand-planner").value,
+        timeout_seconds: 300,
+        ...(($("#demand-repository").value) ? { repository: $("#demand-repository").value } : {}),
+      }),
     });
     $("#demand-summary").value = "";
     await loadDashboard(false);
-    setStatus("PRD 草案已生成，等待 Human 批准");
+    setStatus("方案已生成，去「等我确认」里过一遍");
+  } catch (error) { setStatus(error.message, true); }
+});
+
+$("#repository-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const project = $("#repository-project").value.trim();
+  if (!project) return;
+  const name = $("#repository-name").value.trim();
+  try {
+    setStatus("正在验证 GitLab 项目…");
+    await api("/repositories", {
+      method: "POST",
+      body: JSON.stringify({
+        gitlab_project_path: project,
+        ...(name ? { name } : {}),
+      }),
+    });
+    $("#repository-project").value = "";
+    $("#repository-name").value = "";
+    await loadDashboard(false);
+    setStatus("仓库已登记，现在可以在提需求时选它了");
+  } catch (error) { setStatus(error.message, true); }
+});
+
+$("#start-cancel").addEventListener("click", () => $("#start-dialog").close());
+$("#start-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!state.startTask) return;
+  const taskId = state.startTask.task_id;
+  try {
+    setStatus("正在授权 Agent 执行…");
+    await api(`/tasks/${encodeURIComponent(taskId)}/flight-leases`, {
+      method: "POST",
+      body: JSON.stringify({
+        agent: $("#start-agent").value,
+        executor: $("#start-executor").value,
+      }),
+    });
+    $("#start-dialog").close();
+    await loadDashboard(false);
+    setStatus("已授权。Agent 领取后会开始执行，完成后到「执行与交付」看产出。");
   } catch (error) { setStatus(error.message, true); }
 });
 
@@ -468,7 +621,7 @@ $("#recovery-form").addEventListener("submit", async (event) => {
     });
     $("#recovery-dialog").close();
     await loadDashboard(false);
-    setStatus(`${state.recoveryFlight.id} 的监督决定已写入黑匣子`);
+    setStatus(`${state.recoveryFlight.id} 的处理决定已记录`);
   } catch (error) { setStatus(error.message, true); }
 });
 

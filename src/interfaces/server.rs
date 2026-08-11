@@ -3338,7 +3338,10 @@ mod tests {
         assert!(page.headers().contains_key(header::CONTENT_SECURITY_POLICY));
         assert!(page.headers().contains_key("x-request-id"));
         let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("Relay Tower"));
+        // 断言页面骨架而不是某句文案——文案会随可读性调整而变。
+        let page_html = String::from_utf8_lossy(&body);
+        assert!(page_html.contains("/console/assets/console.js"));
+        assert!(page_html.contains("id=\"demand-form\""));
 
         let script = service
             .oneshot(

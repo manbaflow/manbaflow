@@ -3,62 +3,80 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Relay Tower</title>
+  <title>Relay</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/console/assets/console.css">
 </head>
 <body>
   <div class="shell">
     <aside class="rail">
-      <div class="brand"><span class="brand-mark">24</span><div><strong>Relay</strong><small>ORGANIZATION TOWER</small></div></div>
-      <nav aria-label="控制台导航">
-        <a href="#overview" class="active">组织总览</a>
-        <a href="#actions">待办处置</a>
-        <a href="#flows">Flow 航线</a>
-        <a href="#flights">Flight Deck</a>
+      <div class="brand"><span class="brand-mark">R</span><div><strong>Relay</strong><small>需求调度</small></div></div>
+      <nav aria-label="导航">
+        <a href="#overview" class="active">概览</a>
+        <a href="#repositories">代码仓库</a>
+        <a href="#new-demand">提需求</a>
+        <a href="#actions">等我确认</a>
+        <a href="#flows">进行中</a>
+        <a href="#flights">执行与交付</a>
       </nav>
-      <div class="rail-foot"><span class="live-dot"></span><span id="service-state">CONTROL PLANE</span></div>
+      <div class="rail-foot"><span class="live-dot"></span><span id="service-state">未连接</span></div>
     </aside>
 
     <div class="workspace">
       <header class="topbar">
-        <div><p class="eyebrow">塔台工作台</p><h1 id="org-name">Relay</h1></div>
+        <div><p class="eyebrow">概览</p><h1 id="org-name">Relay</h1></div>
         <div class="top-actions">
           <span id="identity" class="identity">未连接</span>
           <button id="refresh" type="button">刷新</button>
-          <button id="logout" type="button" class="quiet">退出身份</button>
+          <button id="logout" type="button" class="quiet">退出</button>
         </div>
       </header>
 
       <main>
-        <p id="status" class="status" role="status">等待连接塔台</p>
+        <p id="status" class="status" role="status">正在连接…</p>
 
         <section id="overview" class="band">
-          <div class="section-head"><div><p class="eyebrow">实时战况</p><h2>组织总览</h2></div><time id="generated-at"></time></div>
+          <div class="section-head"><div><p class="eyebrow">现在的情况</p><h2>概览</h2></div><time id="generated-at"></time></div>
           <div id="metrics" class="metrics" aria-live="polite"></div>
         </section>
 
-        <section class="demand-strip" aria-labelledby="demand-title">
-          <div><p class="eyebrow">DEMAND INTAKE</p><h2 id="demand-title">发起一条新 Flow</h2></div>
-          <form id="demand-form">
-            <label><span>管理需求</span><input id="demand-summary" name="summary" required maxlength="4000" placeholder="例如：本周完成 LLM Gateway 的灰度发布"></label>
-            <label><span>PRD 规划器</span><select id="demand-planner" name="planner"><option value="local">Local</option><option value="codex">Codex</option><option value="claude_code">Claude Code</option></select></label>
-            <button type="submit" class="primary">生成 PRD</button>
+        <section id="repositories" class="band">
+          <div class="section-head">
+            <div><p class="eyebrow">第一步</p><h2>代码仓库</h2></div>
+            <span id="repository-count" class="count"></span>
+          </div>
+          <p class="hint">先把要开发的项目登记进来，之后提需求时才能选。登记时会验证 GitLab 上的项目是否存在、凭据是否有权限。</p>
+          <form id="repository-form" class="inline-form">
+            <label><span>GitLab 项目路径</span><input id="repository-project" required maxlength="200" placeholder="例如：edumind/edumindx"></label>
+            <label><span>显示名称（可选）</span><input id="repository-name" maxlength="80" placeholder="默认取路径最后一段"></label>
+            <button type="submit">登记仓库</button>
+          </form>
+          <div class="table-wrap"><table><thead><tr><th>名称</th><th>GitLab 项目</th><th>默认分支</th><th>状态</th><th></th></tr></thead><tbody id="repository-rows"></tbody></table></div>
+        </section>
+
+        <section id="new-demand" class="band">
+          <div class="section-head"><div><p class="eyebrow">第二步</p><h2>提需求</h2></div></div>
+          <p class="hint">用一句话说清楚要做什么。系统会拆成任务、估算工期、分配给人或 Agent，等你确认后才开始。</p>
+          <form id="demand-form" class="inline-form">
+            <label class="grow"><span>要做什么</span><input id="demand-summary" name="summary" required maxlength="4000" placeholder="例如：教师端加一个「今日课表一键导出」"></label>
+            <label><span>在哪个仓库</span><select id="demand-repository"><option value="">不指定</option></select></label>
+            <label><span>谁来拆解</span><select id="demand-planner" name="planner"><option value="local">按模板</option><option value="codex">Codex</option><option value="claude_code">Claude Code</option></select></label>
+            <button type="submit" class="primary">生成方案</button>
           </form>
         </section>
 
         <section id="actions" class="band">
-          <div class="section-head"><div><p class="eyebrow">HUMAN GATES</p><h2>待办处置</h2></div><span id="action-count" class="count"></span></div>
-          <div class="table-wrap"><table><thead><tr><th>优先级</th><th>任务</th><th>负责人</th><th>原因</th><th>P80</th><th></th></tr></thead><tbody id="action-rows"></tbody></table></div>
+          <div class="section-head"><div><p class="eyebrow">需要你点头</p><h2>等我确认</h2></div><span id="action-count" class="count"></span></div>
+          <div class="table-wrap"><table><thead><tr><th>紧急度</th><th>事项</th><th>负责人</th><th>为什么找你</th><th>最晚完成</th><th></th></tr></thead><tbody id="action-rows"></tbody></table></div>
         </section>
 
         <section id="flows" class="band">
-          <div class="section-head"><div><p class="eyebrow">ONE TEAM · ONE FLOW</p><h2>Flow 航线</h2></div><span id="flow-count" class="count"></span></div>
-          <div class="table-wrap"><table><thead><tr><th>健康度</th><th>需求</th><th>发起人</th><th>进度</th><th>P80</th><th></th></tr></thead><tbody id="flow-rows"></tbody></table></div>
+          <div class="section-head"><div><p class="eyebrow">在做的事</p><h2>进行中</h2></div><span id="flow-count" class="count"></span></div>
+          <div class="table-wrap"><table><thead><tr><th>状态</th><th>需求</th><th>提出人</th><th>进度</th><th>最晚完成</th><th></th></tr></thead><tbody id="flow-rows"></tbody></table></div>
         </section>
 
         <section id="flights" class="band flight-band">
-          <div class="section-head"><div><p class="eyebrow">BLACK BOX / FUEL / LEASE</p><h2>Flight Deck</h2></div><span id="flight-count" class="count"></span></div>
+          <div class="section-head"><div><p class="eyebrow">Agent 在干活</p><h2>执行与交付</h2></div><span id="flight-count" class="count"></span></div>
           <div id="flight-list" class="flight-list"></div>
         </section>
       </main>
@@ -67,26 +85,37 @@
 
   <dialog id="auth-dialog">
     <form id="auth-form" method="dialog" class="dialog-form">
-      <p class="eyebrow">登录</p><h2>连接组织塔台</h2>
+      <p class="eyebrow">登录</p><h2>进入 Relay</h2>
       <button id="feishu-login" type="button" class="primary">用飞书登录</button>
       <p class="dialog-note">本企业员工首次登录自动开通账号，无需管理员预先添加。</p>
-      <label><span>Tenant ID（SSO 可选）</span><input id="sso-tenant" autocomplete="organization" placeholder="TEN-xxxxxxxx"></label>
+      <label><span>租户 ID（企业 SSO 可选填）</span><input id="sso-tenant" autocomplete="organization" placeholder="TEN-xxxxxxxx"></label>
       <button id="oidc-login" type="button">企业 SSO</button>
-      <label><span>Principal Token</span><input id="token" type="password" autocomplete="off" required placeholder="rly_..."></label>
-      <p class="dialog-note">Token 仅保留在当前浏览器标签页，适合 Agent 与自动化。</p>
-      <button type="submit">进入塔台</button>
+      <label><span>接入令牌</span><input id="token" type="password" autocomplete="off" required placeholder="rly_..."></label>
+      <p class="dialog-note">令牌只保留在当前浏览器标签页，适合 Agent 与自动化使用。</p>
+      <button type="submit">用令牌进入</button>
+    </form>
+  </dialog>
+
+  <dialog id="start-dialog">
+    <form id="start-form" class="dialog-form">
+      <p class="eyebrow">让 Agent 开工</p><h2>授权执行</h2>
+      <p id="start-task" class="dialog-note"></p>
+      <label><span>交给哪个 Agent</span><select id="start-agent" required></select></label>
+      <label><span>用什么执行</span><select id="start-executor"><option value="claude_code">Claude Code</option><option value="codex">Codex</option></select></label>
+      <p class="dialog-note">Agent 会在隔离的工作副本里改代码，不会动你本地的工作区。改完回来给你看 diff，你验收后才算完成。</p>
+      <div class="dialog-actions"><button type="button" id="start-cancel" class="quiet">取消</button><button type="submit" class="primary">开工</button></div>
     </form>
   </dialog>
 
   <dialog id="recovery-dialog">
     <form id="recovery-form" class="dialog-form">
-      <p class="eyebrow">SUPERVISION TREE</p><h2>坠机处置</h2>
+      <p class="eyebrow">执行失败</p><h2>怎么处理</h2>
       <p id="recovery-flight" class="dialog-note"></p>
-      <label><span>恢复动作</span><select id="recovery-action" required></select></label>
-      <label id="executor-field" hidden><span>替换执行器</span><select id="recovery-executor"><option value="codex">Codex</option><option value="claude_code">Claude Code</option></select></label>
-      <label><span>新目标（可选）</span><input id="recovery-objective" maxlength="4000"></label>
-      <label><span>Human 决策理由</span><textarea id="recovery-reason" required maxlength="1000"></textarea></label>
-      <div class="dialog-actions"><button type="button" id="recovery-cancel" class="quiet">取消</button><button type="submit" class="primary">写入黑匣子</button></div>
+      <label><span>处理方式</span><select id="recovery-action" required></select></label>
+      <label id="executor-field" hidden><span>换成</span><select id="recovery-executor"><option value="codex">Codex</option><option value="claude_code">Claude Code</option></select></label>
+      <label><span>调整目标（可选）</span><input id="recovery-objective" maxlength="4000"></label>
+      <label><span>你的判断理由</span><textarea id="recovery-reason" required maxlength="1000"></textarea></label>
+      <div class="dialog-actions"><button type="button" id="recovery-cancel" class="quiet">取消</button><button type="submit" class="primary">记录并执行</button></div>
     </form>
   </dialog>
 
