@@ -592,6 +592,9 @@ enum DemandCommand {
         workspace: PathBuf,
         #[arg(long, default_value_t = 300)]
         timeout: u64,
+        /// 这条需求在哪个代码仓库上做（ID 或名称）
+        #[arg(long)]
+        repository: Option<String>,
     },
 }
 
@@ -1488,10 +1491,18 @@ async fn run(cli: Cli) -> Result<()> {
                 planner,
                 workspace,
                 timeout,
+                repository,
             } => {
                 let workspace = absolute_path(workspace)?;
                 let flow = app
-                    .create_demand(&summary, &requester, planner.into(), &workspace, timeout)
+                    .create_demand(
+                        &summary,
+                        &requester,
+                        planner.into(),
+                        &workspace,
+                        timeout,
+                        repository.as_deref(),
+                    )
                     .await?;
                 output(&flow, cli.json, flow_summary(&flow));
             }

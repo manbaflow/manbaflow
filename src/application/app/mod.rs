@@ -363,6 +363,7 @@ impl RelayApp {
         planner: PlannerKind,
         workspace: &Path,
         timeout_seconds: u64,
+        repository: Option<&str>,
     ) -> Result<Flow> {
         self.state.organization()?;
         if summary.trim().is_empty() {
@@ -384,6 +385,13 @@ impl RelayApp {
         if !workspace.is_dir() {
             return Err(RelayError::InvalidWorkspace(workspace.to_path_buf()));
         }
+
+        // 仓库可选，但一旦指定就必须存在且未归档——否则航班会带着一个
+        // 解析不出来的仓库飞出去，Worker 只能跳过。
+        let repository_id = match repository {
+            Some(selector) => Some(self.state.repository(selector)?.id.clone()),
+            None => None,
+        };
 
         let flow_id = new_id("FLOW");
         let demand_id = new_id("DEM");
@@ -417,6 +425,7 @@ impl RelayApp {
             created_at: now,
         };
         let flow = Flow {
+            repository_id: repository_id.clone(),
             id: flow_id,
             demand: demand.clone(),
             prd: plan.prd,
@@ -2538,6 +2547,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -2680,6 +2690,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -2896,6 +2907,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -3030,6 +3042,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -3177,6 +3190,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -3331,6 +3345,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -3675,6 +3690,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -3715,6 +3731,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -3962,6 +3979,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap_err();
@@ -3973,6 +3991,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -4077,6 +4096,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -4210,6 +4230,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -4331,6 +4352,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -4456,6 +4478,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -4559,6 +4582,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();

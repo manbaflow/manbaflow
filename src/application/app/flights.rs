@@ -7,8 +7,9 @@ use crate::capability::CapabilityAdapter;
 use crate::domain::{
     CapabilityPack, ExecutorKind, FlightDeliverable, FlightLease, FlightLeaseStatus,
     FlightManifest, FlightManifestDraft, FlightRecoveryDecision, Flow, FuelBudget, OutputContract,
-    Principal, PrincipalKind, RecoveryAction, RecoveryPolicy, RemoteFlightReport, ResourceClaim,
-    ResourceKind, ResourceLease, ResourceLeaseStatus, Task, ToolAccess, ToolPermission,
+    Principal, PrincipalKind, RecoveryAction, RecoveryPolicy, RemoteFlightReport, RepositoryRef,
+    ResourceClaim, ResourceKind, ResourceLease, ResourceLeaseStatus, Task, ToolAccess,
+    ToolPermission,
 };
 use crate::error::{RelayError, Result};
 use crate::event::DomainEvent;
@@ -126,8 +127,23 @@ impl RelayApp {
             .unwrap_or_else(|| OutputContract::for_pack(capability_pack));
         validate_output_contract(capability_pack, &output_contract)?;
 
+        // 仓库优先取草案里显式声明的，否则从 Flow 绑定的仓库解析。
+        // Worker 靠这个字段决定在哪个本地仓库执行；缺了它就只能靠 --workspace 猜。
+        let repository = draft.repository.or_else(|| {
+            flow.repository_id
+                .as_deref()
+                .and_then(|id| self.state.repositories.get(id))
+                .map(|repository| RepositoryRef {
+                    id: repository.id.clone(),
+                    name: repository.name.clone(),
+                    gitlab_project_path: repository.gitlab_project_path.clone(),
+                    branch: repository.default_branch.clone(),
+                })
+        });
+
         Ok(FlightManifest {
             id: new_id("MANIFEST"),
+            repository,
             objective,
             landing_conditions,
             context_refs,
@@ -425,6 +441,7 @@ impl RelayApp {
             ));
         }
         let parent_manifest = parent.manifest.clone().unwrap_or_else(|| FlightManifest {
+            repository: None,
             id: new_id("MANIFEST"),
             objective: format!("recover task {}", parent.task_id),
             landing_conditions: vec!["return verifiable evidence".into()],
@@ -486,6 +503,7 @@ impl RelayApp {
         let (flow, task) = self.task_snapshot(&parent.task_id)?;
         let worker = self.state.principal(&parent.principal_id)?.clone();
         let draft = FlightManifestDraft {
+            repository: parent_manifest.repository.clone(),
             capability_pack: Some(parent_manifest.capability_pack),
             objective: objective.or(Some(parent_manifest.objective)),
             landing_conditions: parent_manifest.landing_conditions,

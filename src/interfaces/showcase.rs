@@ -115,6 +115,7 @@ pub async fn seed_showcase(
             PlannerKind::Local,
             workspace,
             30,
+            None,
         )
         .await?;
     app.approve_flow(&gateway.id, requester)?;
@@ -262,6 +263,7 @@ pub async fn seed_showcase(
             PlannerKind::Local,
             workspace,
             30,
+            None,
         )
         .await?;
     app.approve_flow(&review.id, requester)?;
@@ -298,6 +300,7 @@ pub async fn seed_showcase(
             PlannerKind::Local,
             workspace,
             30,
+            None,
         )
         .await?;
     app.approve_flow(&completed.id, requester)?;

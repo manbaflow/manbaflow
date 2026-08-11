@@ -30,6 +30,35 @@ pub struct Team {
     pub created_at: DateTime<Utc>,
 }
 
+/// 一个可以在上面干活的代码仓库。
+///
+/// 在这之前「在哪个仓库干活」只存在于 Worker 启动时的 `--workspace` 参数里，
+/// 由启动 Worker 的人决定，系统本身不知道。Flow 绑定仓库之后，需求、任务和
+/// 执行授权才能一路带着这个信息走到 Worker。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Repository {
+    pub id: String,
+    pub name: String,
+    /// GitLab 上的完整路径，例如 `edumind/edumindx`。
+    pub gitlab_project_path: String,
+    pub default_branch: String,
+    pub active: bool,
+    pub registered_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 放进 FlightManifest 的仓库快照。
+///
+/// 存快照而不是只存 ID：航班记录进 append-only Ledger 之后，即使仓库被改名或
+/// 归档，也要能看出当时是在哪个仓库、哪个分支上执行的。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RepositoryRef {
+    pub id: String,
+    pub name: String,
+    pub gitlab_project_path: String,
+    pub branch: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrincipalKind {
@@ -516,6 +545,11 @@ pub enum FlowStatus {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Flow {
     pub id: String,
+    /// 这条 Flow 在哪个代码仓库上做。绑定在 Flow 层而不是 Task 层：
+    /// 一条 Flow 对应"做一个东西"，天然对应一个仓库。跨仓库协作等到
+    /// 真正需要时再说。
+    #[serde(default)]
+    pub repository_id: Option<String>,
     pub demand: Demand,
     pub prd: PrdDraft,
     pub tasks: Vec<Task>,
@@ -1249,6 +1283,8 @@ impl FlightDeliverable {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct FlightManifestDraft {
     #[serde(default)]
+    pub repository: Option<RepositoryRef>,
+    #[serde(default)]
     pub capability_pack: Option<CapabilityPack>,
     #[serde(default)]
     pub objective: Option<String>,
@@ -1271,6 +1307,9 @@ pub struct FlightManifestDraft {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FlightManifest {
     pub id: String,
+    /// Worker 据此决定在哪个本地仓库执行；没有它就只能靠 --workspace 猜。
+    #[serde(default)]
+    pub repository: Option<RepositoryRef>,
     pub objective: String,
     pub landing_conditions: Vec<String>,
     pub context_refs: Vec<String>,

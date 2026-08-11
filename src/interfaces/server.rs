@@ -1905,6 +1905,7 @@ async fn create_demand(
             input.planner,
             &workspace,
             input.timeout_seconds,
+            None,
         )
         .await?;
     state.app.lock().await.reload()?;
@@ -3500,6 +3501,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -3641,6 +3643,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -4129,6 +4132,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -4356,6 +4360,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();

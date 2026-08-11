@@ -7,7 +7,7 @@ use crate::domain::{
     FlightLease, FlightRecoveryDecision, Flow, FlowChangeRequest, FlowMessage,
     FlowScheduleRevision, GitLabWriteRequest, GitLabWriteResult, MessageAcknowledgement,
     NotificationDelivery, NotificationEndpoint, OfficeReleaseRequest, OfficeReleaseResult,
-    Organization, PrdDraft, Principal, RemoteFlightReport, ResourceLease, RoleBinding,
+    Organization, PrdDraft, Principal, RemoteFlightReport, Repository, ResourceLease, RoleBinding,
     StagedArtifact, Task, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 
@@ -28,6 +28,14 @@ pub enum DomainEvent {
     },
     TeamCreated {
         team: Team,
+    },
+    RepositoryRegistered {
+        repository: Repository,
+    },
+    RepositoryArchived {
+        repository_id: String,
+        archived_by: String,
+        archived_at: DateTime<Utc>,
     },
     TeamDirectoryUpdated {
         team_id: String,
@@ -456,6 +464,8 @@ impl DomainEvent {
             Self::TenantInitialized { .. } => "tenant.initialized",
             Self::OrganizationInitialized { .. } => "organization.initialized",
             Self::TeamCreated { .. } => "team.created",
+            Self::RepositoryRegistered { .. } => "repository.registered",
+            Self::RepositoryArchived { .. } => "repository.archived",
             Self::TeamDirectoryUpdated { .. } => "team.directory_updated",
             Self::PrincipalRegistered { .. } => "principal.registered",
             Self::PrincipalDirectoryUpdated { .. } => "principal.directory_updated",
@@ -617,6 +627,8 @@ impl DomainEvent {
             Self::TenantInitialized { .. }
             | Self::OrganizationInitialized { .. }
             | Self::TeamCreated { .. }
+            | Self::RepositoryRegistered { .. }
+            | Self::RepositoryArchived { .. }
             | Self::TeamDirectoryUpdated { .. }
             | Self::PrincipalRegistered { .. }
             | Self::PrincipalDirectoryUpdated { .. }

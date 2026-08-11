@@ -8,8 +8,8 @@ use crate::domain::{
     FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, GitLabWriteRequest,
     GitLabWriteStatus, NotificationDelivery, NotificationEndpoint, NotificationStatus,
     OfficeReleaseRequest, OfficeReleaseStatus, Organization, OrganizationRole, Principal,
-    PrincipalKind, ResourceLease, ResourceLeaseStatus, RoleBinding, StagedArtifact, TargetKind,
-    TaskStatus, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
+    PrincipalKind, Repository, ResourceLease, ResourceLeaseStatus, RoleBinding, StagedArtifact,
+    TargetKind, TaskStatus, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
 };
 use crate::error::{RelayError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -19,6 +19,7 @@ pub struct OrganizationState {
     pub tenant: Option<Tenant>,
     pub organization: Option<Organization>,
     pub teams: BTreeMap<String, Team>,
+    pub repositories: BTreeMap<String, Repository>,
     pub principals: BTreeMap<String, Principal>,
     pub external_identities: BTreeMap<String, ExternalIdentityBinding>,
     pub external_interactions: BTreeMap<String, ExternalInteractionReceipt>,
@@ -79,6 +80,15 @@ impl OrganizationState {
             }
             DomainEvent::TeamCreated { team } => {
                 self.teams.insert(team.id.clone(), team.clone());
+            }
+            DomainEvent::RepositoryRegistered { repository } => {
+                self.repositories
+                    .insert(repository.id.clone(), repository.clone());
+            }
+            DomainEvent::RepositoryArchived { repository_id, .. } => {
+                if let Some(repository) = self.repositories.get_mut(repository_id) {
+                    repository.active = false;
+                }
             }
             DomainEvent::TeamDirectoryUpdated {
                 team_id,
@@ -1419,6 +1429,23 @@ impl OrganizationState {
             })
             .ok_or_else(|| RelayError::NotFound {
                 entity: "team",
+                id: id_or_name.to_string(),
+            })
+    }
+
+    /// 按 ID 或名称查一个仍在使用的仓库。已归档的按「找不到」处理——
+    /// 归档就是为了不再往上面派活。
+    pub fn repository(&self, id_or_name: &str) -> Result<&Repository> {
+        self.repositories
+            .get(id_or_name)
+            .or_else(|| {
+                self.repositories
+                    .values()
+                    .find(|repository| repository.name.eq_ignore_ascii_case(id_or_name))
+            })
+            .filter(|repository| repository.active)
+            .ok_or_else(|| RelayError::NotFound {
+                entity: "repository",
                 id: id_or_name.to_string(),
             })
     }

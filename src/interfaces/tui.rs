@@ -1048,7 +1048,7 @@ impl UiState {
             let outcome = async {
                 let mut worker = RelayApp::open(data_dir).map_err(|error| error.to_string())?;
                 worker
-                    .create_demand(&summary, &actor, planner, &workspace, 300)
+                    .create_demand(&summary, &actor, planner, &workspace, 300, None)
                     .await
                     .map(|flow| PlannedFlow {
                         flow_id: flow.id,
@@ -4124,6 +4124,7 @@ mod tests {
             PlannerKind::Local,
             directory.path(),
             10,
+            None,
         )
         .await
         .unwrap();
@@ -4646,6 +4647,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -4752,6 +4754,7 @@ mod tests {
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -5107,6 +5110,7 @@ printf '%s\n' '{"thread_id":"fake-thread"}'
                 PlannerKind::Local,
                 directory.path(),
                 10,
+                None,
             )
             .await
             .unwrap();

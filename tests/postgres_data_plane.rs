@@ -102,6 +102,7 @@ async fn postgres_replicas_share_tenant_events_and_credentials() {
             relay::planner::PlannerKind::Local,
             directory.path(),
             10,
+            None,
         )
         .await
         .unwrap();

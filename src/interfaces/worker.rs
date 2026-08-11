@@ -1245,6 +1245,7 @@ printf '%s\n' '{"thread_id":"remote-thread"}'
             report: None,
             manifest: Some(FlightManifest {
                 id: "MANIFEST-1".into(),
+                repository: None,
                 objective: "produce a reviewable Office document".into(),
                 landing_conditions: vec!["generated.txt is staged".into()],
                 context_refs: Vec::new(),
