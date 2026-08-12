@@ -815,7 +815,9 @@ fn router_with_identity(app: Arc<Mutex<RelayApp>>, integrations: ServerIntegrati
         gitlab_write_bridge,
     };
     Router::new()
+        .route("/", get(root))
         .route("/console", get(crate::console::index))
+        .route("/console/", get(root))
         .route(
             "/console/assets/console.css",
             get(crate::console::stylesheet),
@@ -1164,6 +1166,10 @@ fn spawn_gitlab_write_dispatcher(
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn root() -> Redirect {
+    Redirect::temporary("/console")
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -3323,6 +3329,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 直接打开域名根路径的人最多，别让他们撞上 404。
+        for uri in ["/", "/console/"] {
+            let landing = service
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(landing.status(), StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(landing.headers()[header::LOCATION], "/console");
+        }
 
         let page = service
             .clone()
