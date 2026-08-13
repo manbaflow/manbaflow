@@ -6,7 +6,7 @@
 # 没有单独的 check job——集群 runner 侧没有 rust 基础镜像，而 buildkit 配了
 # docker.io 镜像源可以直接拉 rust:bookworm。检查不过镜像就构建不出来。
 default:
-  image: registry.edumind.ai/infra/buildkit:v0.17.1
+  image: hub.edumind.ai/infra/gitlab/infra/buildkit:v0.17.1
   retry: 1
   tags:
     - gpu-resource
@@ -36,7 +36,7 @@ stages:
 # 这个 job 不碰 registry，也不需要 buildkit。
 deploy-scripts:
   stage: check
-  image: registry.edumind.ai/infra/images/node:22-alpine
+  image: hub.edumind.ai/infra/gitlab/infra/images/node:22-alpine
   before_script: []
   script:
     - sh -n deploy/install.sh
