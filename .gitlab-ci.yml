@@ -1,0 +1,8 @@
+# 这个仓库同时推向内网 GitLab 和 GitHub，所以流水线的实际定义不放在这里——
+# 它带着内网 registry、buildkit 地址和 runner 约定。这里只做一次跨项目引用。
+#
+# GitHub 上不跑任何 CI，这个文件在那边是惰性的。
+include:
+  - project: platform/k8sapps
+    ref: main
+    file: relay/ci/.gitlab-ci.yml
