@@ -466,7 +466,7 @@ fn notification_card(
         ),
         "flow.completed" => (
             "Flow 已验收完成",
-            "所有任务已经通过验收，Flow 安全落地。".into(),
+            "所有任务已经通过验收，Flow 已完成。".into(),
             CardSeverity::Success,
         ),
         "connector.test" => (

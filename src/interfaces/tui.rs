@@ -980,7 +980,7 @@ impl UiState {
                 .map(|task| format!("{} 已接单", task.id)),
             TaskStatus::Accepted | TaskStatus::Blocked => app
                 .start_task(&task_id, &actor)
-                .map(|task| format!("{} 已起飞", task.id)),
+                .map(|task| format!("{} 已开始", task.id)),
             TaskStatus::InProgress => app
                 .submit_task(&task_id, &actor)
                 .map(|task| format!("{} 已提交验收", task.id)),
@@ -1005,7 +1005,7 @@ impl UiState {
         let result = task_id
             .ok_or_else(|| RelayError::Validation("没有选中的任务".to_string()))
             .and_then(|task_id| app.complete_task(&task_id, &actor))
-            .map(|task| format!("{} 已确认落地。", task.id));
+            .map(|task| format!("{} 已确认完成。", task.id));
         self.finish_action(app, result);
     }
 
@@ -1140,7 +1140,7 @@ impl UiState {
             ) {
                 Ok(delivery) if result.manual || !delivered => {
                     if delivered {
-                        self.success(format!("{} 通知安全落地", delivery.id));
+                        self.success(format!("{} 通知已完成", delivery.id));
                     } else {
                         self.failure(RelayError::Validation(format!(
                             "{} 通知执行失败：{}",
@@ -1516,7 +1516,7 @@ impl UiState {
             self.active_flights.remove(&result.task_id);
             match result.outcome {
                 Ok(flight) => self.success(format!(
-                    "{} 安全落地 · {} · {} · {}",
+                    "{} 已完成 · {} · {} · {}",
                     result.task_id,
                     flight.executor,
                     compact_summary(&flight.summary, 48),
@@ -2015,7 +2015,7 @@ fn render_flow_table(
         .collect::<Vec<_>>();
     let (headers, widths) = if compact_columns {
         (
-            vec!["健康", "目标", "落地"],
+            vec!["健康", "目标", "完成"],
             vec![
                 Constraint::Length(9),
                 Constraint::Min(16),
@@ -2024,7 +2024,7 @@ fn render_flow_table(
         )
     } else {
         (
-            vec!["健康", "FLOW", "目标", "落地", "P80"],
+            vec!["健康", "FLOW", "目标", "完成", "P80"],
             vec![
                 Constraint::Length(10),
                 Constraint::Length(14),
@@ -2108,7 +2108,7 @@ fn render_tower_brief(frame: &mut Frame, app: &RelayApp, flow: Option<&Flow>, ar
             Span::styled(flow.demand.requester.clone(), Style::new().fg(GOLD)),
         ]),
         Line::from(vec![
-            Span::styled("落地窗口  ", Style::new().fg(MUTED)),
+            Span::styled("完成窗口  ", Style::new().fg(MUTED)),
             Span::styled(
                 format!(
                     "P50 {} · P80 {}",
@@ -2479,7 +2479,7 @@ fn render_flow_selector(
         ],
     )
     .header(
-        Row::new(["状态", "目标", "落地"])
+        Row::new(["状态", "目标", "完成"])
             .style(Style::new().fg(GOLD).bold())
             .bottom_margin(1),
     )
@@ -3382,7 +3382,7 @@ fn render_composer(frame: &mut Frame, state: &mut UiState, area: Rect) {
         None => (
             "NEW DEMAND / 描述需求",
             if state.active_planning.is_some() {
-                "PRD 规划进行中；等待落地后再提交下一个需求".to_string()
+                "PRD 规划进行中；等待完成后再提交下一个需求".to_string()
             } else {
                 "直接输入业务目标，Enter 发起 PRD 规划；点击右侧胶囊切换规划器".to_string()
             },
@@ -5172,7 +5172,7 @@ printf '%s\n' '{"thread_id":"fake-thread"}'
 
         assert!(state.active_flights.is_empty());
         assert_eq!(app.state().executions.len(), 1);
-        assert!(state.message.contains("安全落地"));
+        assert!(state.message.contains("已完成"));
         assert_eq!(
             app.state().find_task(&agent_task).unwrap().1.evidence.len(),
             1

@@ -499,7 +499,7 @@ enum NotificationCommand {
         #[arg(long)]
         all: bool,
     },
-    /// 停用 Endpoint；已经落地的 Outbox 记录仍保留
+    /// 停用 Endpoint；已经写入的 Outbox 记录仍保留
     EndpointDisable {
         endpoint: String,
         #[arg(long, default_value = "admin")]
@@ -790,7 +790,7 @@ enum TaskCommand {
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
-    /// Human 在远程 Agent 起飞前撤销写入租约
+    /// Human 在远程 Agent 开工前撤销写入租约
     RevokeLease {
         lease: String,
         #[arg(long)]
@@ -1180,7 +1180,7 @@ async fn run(cli: Cli) -> Result<()> {
                         &record,
                         cli.json,
                         format!(
-                            "Tenant 已起飞：{} ({})，CLI 使用 --tenant {} 进入",
+                            "Tenant 已启用：{} ({})，CLI 使用 --tenant {} 进入",
                             record.name, record.id, record.slug
                         ),
                     );
@@ -1733,7 +1733,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             TaskCommand::Start { task, by } => {
                 let task = app.start_task(&task, &by)?;
-                output(&task, cli.json, format!("{} 已起飞", task.id));
+                output(&task, cli.json, format!("{} 已开始", task.id));
             }
             TaskCommand::Heartbeat { task, by, note } => {
                 let task = app.heartbeat_task(&task, &by, note)?;
@@ -1771,7 +1771,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &record,
                     cli.json,
                     format!(
-                        "{} 安全落地，记录：{}\n{}",
+                        "{} 已完成，记录：{}\n{}",
                         record.executor,
                         record.log_path.display(),
                         record.summary
@@ -1859,7 +1859,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             TaskCommand::Complete { task, by } => {
                 let task = app.complete_task(&task, &by)?;
-                output(&task, cli.json, format!("{} 已确认落地。", task.id));
+                output(&task, cli.json, format!("{} 已确认完成。", task.id));
             }
         },
         Command::Message { command } => match command {
@@ -2268,7 +2268,7 @@ async fn run(cli: Cli) -> Result<()> {
                 output(
                     &json!({"backup": path}),
                     cli.json,
-                    format!("Ledger 快照已落地：{}", path.display()),
+                    format!("Ledger 快照已写入：{}", path.display()),
                 );
             }
             OpsCommand::MigratePostgres { target_env } => {

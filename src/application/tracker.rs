@@ -35,7 +35,7 @@ pub(crate) fn evaluate(
                     AttentionKind::Overdue,
                     AttentionSeverity::Critical,
                     format!(
-                        "{} 已超过 P80 落地时间 {}",
+                        "{} 已超过 P80 完成时间 {}",
                         task.title,
                         task.estimate.p80_finish.format("%Y-%m-%d %H:%M UTC")
                     ),

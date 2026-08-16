@@ -1820,7 +1820,7 @@ async fn create_repository(
     Json(input): Json<CreateRepositoryInput>,
 ) -> ApiResult<Json<Repository>> {
     // 先确认 GitLab 上项目真实存在、Token 也有权限，再落库。否则会攒下一堆
-    // 连不上的仓库，等 Agent 起飞时才发现——那时排查成本高得多。
+    // 连不上的仓库，等 Agent 开工时才发现——那时排查成本高得多。
     let client = GitLabClient::from_env(input.gitlab_url.as_deref())?;
     let project = client.check_project(&input.gitlab_project_path).await?;
     let branch = input
