@@ -1219,8 +1219,8 @@ mod tests {
     fn repository_ref() -> RepositoryRef {
         RepositoryRef {
             id: "REPO-abc".into(),
-            name: "edumindx".into(),
-            gitlab_project_path: "edumind/edumindx".into(),
+            name: "web-app".into(),
+            gitlab_project_path: "acme/web-app".into(),
             branch: "main".into(),
         }
     }
@@ -1228,10 +1228,10 @@ mod tests {
     #[test]
     fn workspace_resolves_by_repository_id_or_project_path() {
         let directory = tempdir().unwrap();
-        let checkout = directory.path().join("edumindx");
+        let checkout = directory.path().join("web-app");
         fs::create_dir_all(&checkout).unwrap();
 
-        for key in ["REPO-abc", "edumind/edumindx"] {
+        for key in ["REPO-abc", "acme/web-app"] {
             let worker = worker_with_repos(
                 directory.path(),
                 BTreeMap::from([(key.to_string(), checkout.clone())]),

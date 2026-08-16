@@ -210,15 +210,12 @@ git pull --ff-only
 ./deploy/manage.sh upgrade
 ```
 
-`upgrade` 会先备份，再拉取基础镜像、重新构建并滚动重启。CI 已经把镜像推到内部 registry，因此更推荐
-在首次安装时直接指定镜像，让安装器和升级命令改为 pull，不在服务器上编译：
+`upgrade` 会先备份，再拉取基础镜像、重新构建并滚动重启。如果你在 CI 里已经构建好镜像，更推荐
+在首次安装时直接指定它，让安装器和升级命令改为 pull，不在服务器上编译：
 
 ```bash
-./deploy/install.sh --image registry.edumind.ai/platform/relay/main:latest ...
+./deploy/install.sh --image <你的 registry>/relay:latest ...
 ```
-
-镜像标签规则见 [.gitlab-ci.yml](../.gitlab-ci.yml)：`main` / `master` / `release` 分支产出
-`<分支>:<版本>` 和 `<分支>:latest`，其余分支产出 `dev:<版本>`。
 
 `./deploy/manage.sh stop` 保留所有卷。只有明确确认永久删除内置数据库、Artifact 和 TLS 状态时，才手工
 执行 `docker compose --profile local-db --profile hosted down --volumes`。外部数据库不会被该命令删除。

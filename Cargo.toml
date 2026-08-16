@@ -6,7 +6,7 @@ autobins = false
 description = "Enterprise Human-Agent Flow control plane"
 publish = false
 license-file = "LICENSE"
-repository = "https://gitlab.edumind.ai/platform/relay"
+repository = "https://github.com/manbaflow/manbaflow"
 readme = "README.md"
 
 [[bin]]

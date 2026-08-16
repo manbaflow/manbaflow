@@ -148,30 +148,27 @@ mod tests {
     fn registering_a_repository_makes_it_selectable() {
         let (mut app, _directory) = app();
         let repository = app
-            .register_repository("edumindx", "edumind/edumindx", "main", "admin")
+            .register_repository("web-app", "acme/web-app", "main", "admin")
             .unwrap();
 
         assert!(repository.active);
-        assert_eq!(repository.gitlab_project_path, "edumind/edumindx");
+        assert_eq!(repository.gitlab_project_path, "acme/web-app");
         // 按 ID 和按名称都要能查到。
         assert_eq!(
             app.state().repository(&repository.id).unwrap().id,
             repository.id
         );
-        assert_eq!(
-            app.state().repository("edumindx").unwrap().id,
-            repository.id
-        );
+        assert_eq!(app.state().repository("web-app").unwrap().id, repository.id);
     }
 
     #[test]
     fn the_same_gitlab_project_cannot_be_registered_twice() {
         let (mut app, _directory) = app();
-        app.register_repository("edumindx", "edumind/edumindx", "main", "admin")
+        app.register_repository("web-app", "acme/web-app", "main", "admin")
             .unwrap();
         // 换个名字但指向同一个项目，会让「在哪个仓库干活」出现歧义。
         let error = app
-            .register_repository("edu-x", "edumind/edumindx", "main", "admin")
+            .register_repository("web-x", "acme/web-app", "main", "admin")
             .unwrap_err();
         assert!(matches!(error, RelayError::Validation(_)));
     }
@@ -180,11 +177,11 @@ mod tests {
     fn archived_repositories_can_no_longer_be_selected() {
         let (mut app, _directory) = app();
         let repository = app
-            .register_repository("edumindx", "edumind/edumindx", "main", "admin")
+            .register_repository("web-app", "acme/web-app", "main", "admin")
             .unwrap();
         app.archive_repository(&repository.id, "admin").unwrap();
 
-        assert!(app.state().repository("edumindx").is_err());
+        assert!(app.state().repository("web-app").is_err());
         // 归档只是停用，记录还在——历史航班要能读出当时用的是哪个仓库。
         assert_eq!(app.repositories().len(), 1);
         assert!(!app.repositories()[0].active);
@@ -194,11 +191,11 @@ mod tests {
     fn archiving_frees_the_name_for_reuse() {
         let (mut app, _directory) = app();
         let first = app
-            .register_repository("edumindx", "edumind/edumindx", "main", "admin")
+            .register_repository("web-app", "acme/web-app", "main", "admin")
             .unwrap();
         app.archive_repository(&first.id, "admin").unwrap();
         let second = app
-            .register_repository("edumindx", "edumind/edumindx", "main", "admin")
+            .register_repository("web-app", "acme/web-app", "main", "admin")
             .unwrap();
         assert_ne!(first.id, second.id);
     }
@@ -206,7 +203,7 @@ mod tests {
     #[test]
     fn project_path_must_look_like_a_gitlab_path() {
         let (mut app, _directory) = app();
-        for bad in ["edumindx", "/edumind/edumindx", "edumind/../etc", "a b/c"] {
+        for bad in ["web-app", "/acme/web-app", "acme/../etc", "a b/c"] {
             assert!(
                 app.register_repository("x", bad, "main", "admin").is_err(),
                 "应当拒绝: {bad}"

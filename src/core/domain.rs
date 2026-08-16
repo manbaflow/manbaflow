@@ -39,7 +39,7 @@ pub struct Team {
 pub struct Repository {
     pub id: String,
     pub name: String,
-    /// GitLab 上的完整路径，例如 `edumind/edumindx`。
+    /// GitLab 上的完整路径，例如 `acme/web-app`。
     pub gitlab_project_path: String,
     pub default_branch: String,
     pub active: bool,

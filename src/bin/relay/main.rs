@@ -233,7 +233,7 @@ enum OrgCommand {
 enum RepoCommand {
     /// 登记一个 GitLab 项目（会先验证连通性与权限）
     Add {
-        /// GitLab 完整路径，例如 edumind/edumindx
+        /// GitLab 完整路径，例如 acme/web-app
         #[arg(long)]
         project: String,
         /// 界面上显示的短名字；默认取项目路径最后一段

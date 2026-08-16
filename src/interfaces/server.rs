@@ -241,7 +241,7 @@ struct OrganizationView {
 
 #[derive(Clone, Debug, Deserialize)]
 struct CreateRepositoryInput {
-    /// GitLab 上的完整路径，例如 edumind/edumindx
+    /// GitLab 上的完整路径，例如 acme/web-app
     gitlab_project_path: String,
     /// 界面上显示的短名字；不填就取项目路径的最后一段
     #[serde(default)]
