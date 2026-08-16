@@ -48,7 +48,7 @@ struct Cli {
 enum Command {
     /// 幂等初始化生产组织、首个团队、管理员和登录 Token
     Setup(SetupArgs),
-    /// 打开全屏组织塔台
+    /// 打开全屏控制台
     Tui {
         #[arg(long = "as")]
         actor: Option<String>,
@@ -76,7 +76,7 @@ enum Command {
         #[command(subcommand)]
         command: TenantCommand,
     },
-    /// 初始化和查看组织塔台
+    /// 初始化和查看组织
     Org {
         #[command(subcommand)]
         command: OrgCommand,
@@ -121,12 +121,12 @@ enum Command {
         #[arg(long = "for")]
         target: String,
     },
-    /// 查看管理员 Flow、风险、待办和航班看板
+    /// 查看管理员 Flow、风险、待办和执行看板
     Dashboard {
         #[arg(long = "as")]
         actor: String,
     },
-    /// 扫描 Todo 风险并查看塔台 Attention
+    /// 扫描 Todo 风险并查看需要关注的事项
     Track {
         #[command(subcommand)]
         command: TrackCommand,
@@ -141,7 +141,7 @@ enum Command {
         #[command(subcommand)]
         command: NotificationCommand,
     },
-    /// 在同事工作站运行 Personal Agent 航班
+    /// 在同事工作站运行 Personal Agent 任务
     Worker {
         #[command(subcommand)]
         command: WorkerCommand,
@@ -440,7 +440,7 @@ enum GitLabCommand {
         #[arg(long)]
         url: Option<String>,
     },
-    /// 把 Merge Request 和最新 Pipeline 同步到任务黑匣子
+    /// 把 Merge Request 和最新 Pipeline 同步到任务的过程记录
     Sync {
         #[arg(long)]
         task: String,
@@ -529,9 +529,9 @@ enum NotificationCommand {
 
 #[derive(Subcommand)]
 enum WorkerCommand {
-    /// 领取并执行一个远程规划或写入航班后退出
+    /// 领取并执行一个远程规划或写入任务后退出
     Once(WorkerArgs),
-    /// 持续轮询远程 Inbox 或 Flight Lease，串行执行航班
+    /// 持续轮询远程 Inbox 或 Flight Lease，串行执行任务
     Run {
         #[command(flatten)]
         worker: WorkerArgs,
@@ -786,7 +786,7 @@ enum TaskCommand {
         ttl_seconds: u64,
         #[arg(long, value_enum)]
         pack: Option<CapabilityPackArg>,
-        /// JSON 格式 FlightManifestDraft；省略时由塔台按任务生成
+        /// JSON 格式 FlightManifestDraft；省略时由控制面按任务生成
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
@@ -796,13 +796,13 @@ enum TaskCommand {
         #[arg(long)]
         by: String,
     },
-    /// 查看塔台按坠机类型与 FlightManifest 给出的恢复动作
+    /// 查看控制面按失败类型与 FlightManifest 给出的恢复动作
     RecoveryOptions {
         lease: String,
         #[arg(long)]
         by: String,
     },
-    /// Human 选择监督树恢复动作；可复飞、换执行器、缩小范围、转人工或停飞
+    /// Human 选择监督树恢复动作；可重试、换执行器、缩小范围、转人工或放弃
     Recover {
         lease: String,
         #[arg(long)]
@@ -1109,7 +1109,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &json!({"setup": setup, "calendar": calendar}),
                 cli.json,
                 format!(
-                    "生产塔台就位：{} · {} · {}\n{}\nConsole：http://127.0.0.1:7777/console",
+                    "初始化完成：{} · {} · {}\n{}\nConsole：http://127.0.0.1:7777/console",
                     setup.organization.name,
                     setup.team.name,
                     setup.administrator.name,
@@ -1199,7 +1199,7 @@ async fn run(cli: Cli) -> Result<()> {
                 output(
                     &org,
                     cli.json,
-                    format!("塔台已启用：{} ({})", org.name, org.id),
+                    format!("组织已启用：{} ({})", org.name, org.id),
                 );
             }
             OrgCommand::Show => {
@@ -1741,11 +1741,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             TaskCommand::Block { task, by, reason } => {
                 let task = app.block_task(&task, &by, &reason)?;
-                output(
-                    &task,
-                    cli.json,
-                    format!("{} 等待塔台处理：{}", task.id, reason),
-                );
+                output(&task, cli.json, format!("{} 等待处理：{}", task.id, reason));
             }
             TaskCommand::Evidence {
                 task,
@@ -1758,7 +1754,7 @@ async fn run(cli: Cli) -> Result<()> {
                 output(
                     &evidence,
                     cli.json,
-                    format!("证据已加入黑匣子：{}", evidence.id),
+                    format!("证据已加入过程记录：{}", evidence.id),
                 );
             }
             TaskCommand::Run {
@@ -1852,8 +1848,8 @@ async fn run(cli: Cli) -> Result<()> {
                     ttl_seconds,
                 )?;
                 let message = recovered.as_ref().map_or_else(
-                    || format!("租约 {lease} 已转人工或永久停飞"),
-                    |child| format!("租约 {lease} 已分叉复飞，新航班 {}", child.id),
+                    || format!("租约 {lease} 已转人工或放弃"),
+                    |child| format!("租约 {lease} 已换方案重试，新任务 {}", child.id),
                 );
                 output(&recovered, cli.json, message);
             }
@@ -1962,7 +1958,7 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 let scan = app.scan_tracking_with_policy(stale_hours, escalate_after_hours, &by)?;
                 let text = format!(
-                    "塔台扫描 {} 个 Todo：新增 {}，解除 {}，活动 {}，升级 {}\n{}",
+                    "扫描 {} 个 Todo：新增 {}，解除 {}，活动 {}，升级 {}\n{}",
                     scan.scanned_tasks,
                     scan.raised.len(),
                     scan.resolved.len(),
@@ -2470,7 +2466,8 @@ async fn bootstrap_demo(
         }),
         json_output,
         if include_showcase {
-            "演示塔台就位：3 条 Flow 已覆盖执行、阻塞、待验收、完成和远程 Flight Lease。".into()
+            "演示数据已就位：3 条 Flow 覆盖执行中、已阻塞、待验收、已完成，以及一次远程执行授权。"
+                .into()
         } else {
             "演示数据就位：陈静与李伟就位，Codex 和 Claude Code 已就位。".into()
         },
@@ -2839,9 +2836,9 @@ fn remote_worker(args: WorkerArgs, data_dir: &Path) -> Result<RemoteWorker> {
 fn worker_outcome_text(outcome: &WorkerOutcome) -> String {
     let task = outcome.task_id.as_deref().unwrap_or("-");
     match outcome.status {
-        WorkerOutcomeStatus::Idle => format!("塔台静默：{}", outcome.summary),
+        WorkerOutcomeStatus::Idle => format!("没有活可领：{}", outcome.summary),
         WorkerOutcomeStatus::Planned => format!(
-            "{} 只读航班安全落地 · {}\n{}\n黑匣子：{}",
+            "{} 只读任务完成 · {}\n{}\n过程记录：{}",
             outcome.principal,
             task,
             outcome.summary,
@@ -2852,7 +2849,7 @@ fn worker_outcome_text(outcome: &WorkerOutcome) -> String {
                 .unwrap_or_else(|| "-".into())
         ),
         WorkerOutcomeStatus::Executed => format!(
-            "{} 写入航班安全落地 · {}\n{}\n隔离黑匣子：{}",
+            "{} 写入任务完成 · {}\n{}\n隔离环境的过程记录：{}",
             outcome.principal,
             task,
             outcome.summary,
@@ -2863,7 +2860,7 @@ fn worker_outcome_text(outcome: &WorkerOutcome) -> String {
                 .unwrap_or_else(|| "-".into())
         ),
         WorkerOutcomeStatus::Crashed => format!(
-            "{} 航班坠机 · {}\n{}\n黑匣子：{}",
+            "{} 执行失败 · {}\n{}\n过程记录：{}",
             outcome.principal,
             task,
             outcome.summary,
