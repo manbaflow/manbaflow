@@ -85,7 +85,7 @@ pub(crate) fn evaluate(
                     AttentionKind::Blocked,
                     AttentionSeverity::Critical,
                     format!(
-                        "{} 请求塔台协防：{}",
+                        "{} 请求协助：{}",
                         task.title,
                         task.blocker.as_deref().unwrap_or("未提供原因")
                     ),

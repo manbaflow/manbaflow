@@ -10,7 +10,7 @@ Todo、阻塞、证据与交付结果，直到通过验收。
 关系进行统一编排**。人和 Agent 都是组织成员，都有身份、能力、权限、收件箱、任务和审计记录。
 
 > [!IMPORTANT]
-> Relay 目前处于 **v0 / Preflight**。仓库已经包含可运行的 Ratatui 塔台、`relay` 自动化命令、
+> Relay 目前处于 **v0 / Preflight**。仓库已经包含可运行的 Ratatui 控制面、`relay` 自动化命令、
 > SQLite / PostgreSQL Flow Ledger、Remote Worker、隔离 Git worktree，以及本地或 Claude Code / Codex
 > PRD 规划器和执行终端适配器；控制面支持多 Tenant、多副本、OIDC 登录、SCIM 生命周期、事件化 RBAC、
 > FlightManifest、Fuel、资源租约、监督树恢复，以及经过 Human Release Gate 的 Microsoft 365 / Google
@@ -253,7 +253,7 @@ src/
 | `Evidence` | 证明 Task 满足验收条件的可验证材料 |
 | `Flight` | Agent 执行一个 Task 时产生的隔离运行实例 |
 | `FlowLedger` | 组织级、追加式的完整流程事件源 |
-| `BlackBox` | 单个 Agent Flight 的详细执行记录与航点 |
+| `BlackBox` | 单个 Agent Flight 的详细执行记录与Waypoint |
 
 平台管理员与业务管理者是不同角色：`TenantAdmin` 管理租户、身份源、策略和系统配置；`Manager`
 只能在自己的组织与授权范围内提出需求、分配工作和查看 Flow；`Requester` 可以追踪自己发起的
@@ -433,9 +433,9 @@ Human 不是只在最后按一次“批准”，而是 Flow 中的一等节点�
 
 ### Agent Black Box
 
-Flight 级详细记录，包括模型请求、Tool Call、命令输出、工作区变更、Token、费用、航点和坠机原因。
+Flight 级详细记录，包括模型请求、Tool Call、命令输出、工作区变更、Token、费用、Waypoint 和执行失败原因。
 原始内容可能包含源码、员工私人上下文或 Secret，因此按 RBAC/ABAC、数据分级和脱敏策略开放。
-任何人查看受限黑匣子本身也必须留下审计记录。
+任何人查看受限过程记录本身也必须留下审计记录。
 
 ## Agent Execution Plane
 
@@ -455,11 +455,11 @@ READY ──takeoff────────────────────�
                   LANDED             CRASHED            ABORTED
 ```
 
-每个 Flight 拥有独立上下文、Tool 权限、Cabin、Fuel、Landing Contract 和 Black Box。坠机后，
-Tower 可以从 Waypoint 复飞、换 Agent、改派给 Human、缩小任务或将阻塞升级给管理者。
+每个 Flight 拥有独立上下文、Tool 权限、Cabin、Fuel、Landing Contract 和 Black Box。执行失败后，
+Tower 可以从 Waypoint 重试、换 Agent、改派给 Human、缩小任务或将阻塞升级给管理者。
 
-默认 24 个模型回合、81 次 Tool Call 可以留作初始预算，但工程纪律不是无限重试。每次复飞都要
-带上黑匣子里的 Evidence；主 Provider 不可用时，Pilot 可以后仰切到备用路线。
+默认 24 个模型回合、81 次 Tool Call 可以留作初始预算，但工程纪律不是无限重试。每次重试都要
+带上过程记录里的 Evidence；主 Provider 不可用时，Pilot 可以后仰切到备用路线。
 
 ## Capability Packs
 
@@ -487,7 +487,7 @@ remote 和读取凭据，最终接纳补丁由 Human 完成。
 
 `office` Pack 的执行端只负责生成可审查草稿：Manifest 默认只允许 `md/txt/html/pdf/docx`、
 `csv/xlsx`、`pptx`、`eml` 和 `ics`，至少要求一个 Deliverable，并强制 `requires_human_release=true`。
-服务端从实际变更文件重建 Deliverable，扩展名越界或缺少交付物会按 `validation` 坠机；合规文件形成
+服务端从实际变更文件重建 Deliverable，扩展名越界或缺少交付物会按 `validation` 执行失败；合规文件形成
 `document`、`spreadsheet`、`presentation`、`email_draft` 或 `calendar_proposal` Evidence。
 
 ```bash
@@ -553,7 +553,7 @@ cargo build --release
 ./target/release/relay --help
 ```
 
-需要演示数据时，可以直接打开一座空塔台：
+需要演示数据时，可以直接打开一座空控制面：
 
 ```bash
 rm -rf .relay-showcase
@@ -561,19 +561,19 @@ rm -rf .relay-showcase
   tui --workspace .
 ```
 
-进入 Ratatui 后点击底栏的 `SHOWCASE`。塔台会在界面内注册陈静、李伟及各自的
+进入 Ratatui 后点击底栏的 `SHOWCASE`。控制面会在界面内注册陈静、李伟及各自的
 Claude Code / Codex 副驾，创建三条可回放的真实 Flow，并自动聚焦风险最高的 LLM Gateway。Showcase
 包含正在执行、阻塞、等待 Human 验收、已完成和远程 Flight Lease 等状态；每一步都会进入同一份
 append-only Flow Ledger，不是一张静态看板。完整的五分钟展示顺序见
 [TUI Showcase 演示脚本](docs/SHOWCASE.md)。
 
-不带子命令时，`relay` 默认进入全屏 Ratatui 塔台。也可以显式指定当前 Human 和工作区：
+不带子命令时，`relay` 默认进入全屏 Ratatui 控制面。也可以显式指定当前 Human 和工作区：
 
 ```bash
 ./target/release/relay tui --as 陈静 --workspace .
 ```
 
-塔台提供五个实时视图：组织总览、Flow/PRD/任务 DAG、个人 Inbox、团队成员和 append-only 时间线。
+控制面提供五个实时视图：组织总览、Flow/PRD/任务 DAG、个人 Inbox、团队成员和 append-only 时间线。
 写操作直接调用同一套领域 API，不会在界面里维护另一份状态。TUI 以鼠标为主要操作方式：点击顶部
 标签切换视图，点击表格行选择 Flow 或任务，点击当前操作人切换 Human，滚轮移动当前列表，所有业务动作
 都通过底部自动换行的操作带完成。新需求弹窗中的规划器、改派候选人、确认和取消也都可以直接点击。
@@ -637,7 +637,7 @@ append-only Flow Ledger，不是一张静态看板。完整的五分钟展示顺
 ```
 
 改派会撤销旧 Assignment 状态并向新 Owner 发送 WorkRequest；新 Owner 必须重新接单。存在已领取或仍可
-领取的 Remote Flight Lease 时禁止改派，必须先结束或撤销航班，避免两个执行者同时接管同一任务。
+领取的 Remote Flight Lease 时禁止改派，必须先结束或撤销任务，避免两个执行者同时接管同一任务。
 
 人员工作日历把“有 80% 产能”和“什么时候真的能工作”分开。未配置成员保持 24×7，配置后 Matcher 会
 考虑下一可用时间，Scheduler 会跳过夜间、周末和请假，并立即重排该成员参与的 Active Flow：
@@ -683,7 +683,7 @@ export RELAY_OPS_WEBHOOK_SECRET='replace-with-a-random-secret'
 [Notification Connector](docs/NOTIFICATIONS.md)。
 
 不需要额外部署 Bridge 也可以直接发送原生消息卡片。供应商 Webhook URL 只放在环境变量里；以下测试消息
-同样经过 Outbox 并留下可检查的落地或坠机记录：
+同样经过 Outbox 并留下可检查的完成或执行失败记录：
 
 ```bash
 export RELAY_FEISHU_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/...'
@@ -852,7 +852,7 @@ relay --data-dir /var/lib/relay ops migrate-postgres
 | `GET/PUT /api/v1/me/calendar` | 查看或更新本人工作日、固定 UTC 偏移和每日工作段 |
 | `POST /api/v1/me/time-off` | 登记本人不可用区间并重排相关 Flow |
 | `POST /api/v1/me/time-off/:id/cancel` | 取消本人不可用区间并恢复相关排期 |
-| `GET /api/v1/dashboard` | Human 查看组织 Flow、风险、Action Queue 和航班聚合快照 |
+| `GET /api/v1/dashboard` | Human 查看组织 Flow、风险、Action Queue 和任务聚合快照 |
 | `GET /api/v1/inbox` | 查看本人 Assignment |
 | `GET /api/v1/messages` | 查看本人收到的 Flow 指令与待确认回执 |
 | `GET /api/v1/notifications/{endpoints,deliveries}` | Human 查看通知配置与 Outbox 健康度 |
@@ -868,18 +868,18 @@ relay --data-dir /var/lib/relay ops migrate-postgres
 | `GET /api/v1/tasks/:id/reassignment-candidates` | Requester 查看满足能力和 Human 约束的改派候选人 |
 | `POST /api/v1/tasks/:id/reassign` | Requester 改派 Owner/Copilot 并重新计算 Flow ETA |
 | `POST /api/v1/tasks/:id/flight-leases` | Human 为自己的 Personal Agent 签发限时写租约 |
-| `GET /api/v1/flight-leases` | Agent 查看可执行租约；Human 查看相关航班报告 |
-| `POST /api/v1/flight-leases/:id/{claim,finish,revoke}` | 领取、结束或在起飞前撤销租约 |
+| `GET /api/v1/flight-leases` | Agent 查看可执行租约；Human 查看相关任务报告 |
+| `POST /api/v1/flight-leases/:id/{claim,finish,revoke}` | 领取、结束或在开始前撤销租约 |
 | `GET/PUT /api/v1/flight-leases/:id/artifacts` | 查看或暂存 Office Flight 的不可变 Artifact |
 | `GET /api/v1/artifacts/:id/content` | 由 Flow 参与者下载并核验待发布内容 |
 | `GET/POST /api/v1/office/releases` | 查看或申请 Office 云端副作用 |
 | `POST /api/v1/office/releases/:id/{approve,reject,retry}` | Human Requester 放行、驳回或重试确定失败的发布 |
 | `POST /api/v1/office/releases/dispatch` | Tenant Admin 手动触发一次 Bridge 投递；服务端也会后台投递 |
 | `GET/POST /api/v1/gitlab/writes` | 查看或申请创建/评论 Issue、创建/评论 MR |
-| `POST /api/v1/gitlab/writes/:id/{approve,reject,retry}` | Human Requester 放行、驳回，或核对未知结果后批准复飞 |
+| `POST /api/v1/gitlab/writes/:id/{approve,reject,retry}` | Human Requester 放行、驳回，或核对未知结果后批准重试 |
 | `POST /api/v1/gitlab/writes/dispatch` | Tenant Admin 手动触发一次 GitLab Writer 投递；服务端也会后台投递 |
 | `GET /api/v1/flight-leases/:id/recovery-options` | 按失败类型和 Manifest 查看可用恢复动作 |
-| `POST /api/v1/flight-leases/:id/recover` | Human 选择复飞、换执行器、缩小范围、转人工、停飞或分叉 |
+| `POST /api/v1/flight-leases/:id/recover` | Human 选择重试、换执行器、缩小范围、转人工、放弃或分叉 |
 | `POST /api/v1/escalations/:id/ack` | 接收人确认 Tower Call |
 | `POST /api/v1/connectors/gitlab/webhook` | 接收经过独立签名校验的 GitLab 事件 |
 | `POST /api/v1/connectors/slack/actions` | 验证 Slack 原始请求并以绑定 Human 身份执行允许动作 |
@@ -915,14 +915,14 @@ relay --data-dir /var/lib/relay ops backup \
 服务启动后可直接打开 `http://127.0.0.1:7777/console`。Console 可以使用企业 OIDC 登录，Session 只存在
 8 小时有效的 HttpOnly Cookie 中；引导和排障时也可以输入 Human Bearer Token，它只放在当前标签页的
 `sessionStorage`。页面壳本身不包含组织数据。管理员可以查看组织指标、Action Queue、Flow 进度、
-Manifest/Fuel/资源租约与坠机分类，也可以创建 Demand、批准 Flow、推进本人有权处理的任务，并通过
-监督树对坠机航班做恢复决定。页面和静态资源编译进同一个 Rust 二进制，无需 Node 服务；HTTP 响应默认
+Manifest/Fuel/资源租约与执行失败分类，也可以创建 Demand、批准 Flow、推进本人有权处理的任务，并通过
+监督树对执行失败任务做恢复决定。页面和静态资源编译进同一个 Rust 二进制，无需 Node 服务；HTTP 响应默认
 带 CSP、`nosniff` 与 `no-referrer`。生产环境仍必须在可信 TLS 入口之后部署。OIDC / SCIM 配置见
 [企业身份接入](docs/IDENTITY.md)。
 
 ## Remote Worker
 
-Personal Agent 不需要与塔台位于同一台机器，也不需要把员工仓库挂载到服务器。先注册一个没有本地
+Personal Agent 不需要与控制面位于同一台机器，也不需要把员工仓库挂载到服务器。先注册一个没有本地
 Executor 的远程 Agent，并为它签发独立身份：
 
 ```bash
@@ -972,9 +972,9 @@ relay worker run \
 Worker 使用 Token 对应 Principal 的 Inbox 和 Assignment 权限。它会接单、通过依赖门禁后把 Task 置为
 In Progress、写入起降 Heartbeat，在本机运行严格只读的 `plan` 模式，再把结构化摘要作为
 `agent_plan` Evidence 回传。成功任务不会重复规划；自动轮询也不会闯入已经 In Progress 的任务。
-进程在起飞后中断时，可以用 `--task TSK-xxxxxxxx` 显式恢复。起飞前 Worker 还会读取关联 Flow/Task 的
+进程在开始后中断时，可以用 `--task TSK-xxxxxxxx` 显式恢复。开始前 Worker 还会读取关联 Flow/Task 的
 显式 Command、Question、Update 和 Decision，把它们注入执行 PASS，并确认当前仍在等待 Agent 回执的
-指令；复飞从完整 Flow thread 恢复这些约束，不依赖一段临时聊天上下文。
+指令；重试从完整 Flow thread 恢复这些约束，不依赖一段临时聊天上下文。
 
 远程写入需要另一条明确的授权链。Task 接单且依赖完成后，Personal Agent 的 Human Owner 可以签发
 一个最长 24 小时、绑定 Task、Agent 和执行终端的一次性 Flight Lease。单机模式可以直接使用 CLI：
@@ -997,8 +997,8 @@ curl -X POST \
   https://relay.example.com/api/v1/tasks/TSK-xxxxxxxx/flight-leases
 ```
 
-每次签发都会生成不可变的 `FlightManifest`。调用方也可以显式声明目标、落地条件、上下文引用、Tool
-权限、统一 Fuel 预算、恢复策略和资源租约；未声明时，塔台从 Task 与 Flow 生成保守默认值：
+每次签发都会生成不可变的 `FlightManifest`。调用方也可以显式声明目标、完成条件、上下文引用、Tool
+权限、统一 Fuel 预算、恢复策略和资源租约；未声明时，控制面从 Task 与 Flow 生成保守默认值：
 
 ```json
 {
@@ -1029,7 +1029,7 @@ curl -X POST \
 ```
 
 相同文件、工作区、端口、浏览器或 GPU 的冲突独占租约不会同时放行。Worker 回传耗时、上下文大小和
-可获得的模型费用；预算超限由服务端改判为 `crashed`，不能靠 Worker 自报安全落地。落地、坠机或起飞前
+可获得的模型费用；预算超限由服务端改判为 `crashed`，不能靠 Worker 自报成功完成。完成、执行失败或开始前
 撤销都会释放资源。
 
 Agent 只能领取属于自己的未过期租约。领取后租约立即失效，不能被第二个进程重复消费：
@@ -1045,7 +1045,7 @@ relay worker once \
   --task TSK-xxxxxxxx
 ```
 
-写入航班要求源 Git worktree 干净。Worker 从当前 `HEAD` 创建 detached 临时 worktree，Claude Code 或
+写入任务要求源 Git worktree 干净。Worker 从当前 `HEAD` 创建 detached 临时 worktree，Claude Code 或
 Codex 只能修改这份隔离副本；结束后把已跟踪、未跟踪和删除文件统一封装为
 `.relay/worker-runs/<TASK>/<RUN>/changes.patch`，随后强制回收临时 worktree。源仓库不会被自动修改，
 也不会自动 commit、push、创建 MR 或合并。Human 可以先检查再接纳：
@@ -1056,9 +1056,9 @@ git apply         .relay/worker-runs/TSK-*/WRUN-*/changes.patch
 ```
 
 如果 Worker 在领取后退出，下一次轮询会按原 `run_id` 恢复残留 worktree；如果补丁报告已经生成但尚未
-送达塔台，则只重传报告，不会再次执行模型。`finish` 对完全相同的报告幂等。
+送达控制面，则只重传报告，不会再次执行模型。`finish` 对完全相同的报告幂等。
 
-坠机后先检查塔台建议，再由授权 Human 做恢复决定：
+执行失败后先检查控制面建议，再由授权 Human 做恢复决定：
 
 ```bash
 relay task recovery-options LEASE-xxxxxxxx --by "工程师 A"
@@ -1068,14 +1068,14 @@ relay task recover LEASE-xxxxxxxx \
   --objective "完成 Gateway 路由的最小变更"
 ```
 
-`retry`、`switch-executor`、`reduce-scope` 和 `fork` 会创建新 Lease；新航班记录 `parent_lease_id`、
+`retry`、`switch-executor`、`reduce-scope` 和 `fork` 会创建新 Lease；新任务记录 `parent_lease_id`、
 `root_lease_id` 与递增的 `attempt`，原报告不被覆盖。`human-handoff` 和 `ground` 只记录监督决定，不会
-悄悄重跑。恢复动作和资源获取都与黑匣子写入同一批 append-only 事件，重启后仍能重建完整因果链。
+悄悄重跑。恢复动作和资源获取都与过程记录写入同一批 append-only 事件，重启后仍能重建完整因果链。
 
-塔台接收的是结构化黑匣子：基准 revision、变更文件、patch SHA-256、日志 SHA-256、执行摘要、起止时间，
+控制面接收的是结构化过程记录：基准 revision、变更文件、patch SHA-256、日志 SHA-256、执行摘要、起止时间，
 以及沙箱 backend、不可变 Image ID、网络、UID 和资源上限；
-原始 stdout/stderr 仍只保留在员工工作站。安全落地会产生 `remote_patch` Evidence，坠机会产生
-`worker_blackbox` Evidence 并阻塞 Task。Human Owner 或 Demand Requester 可以读取相关航班报告；授权人
+原始 stdout/stderr 仍只保留在员工工作站。成功完成会产生 `remote_patch` Evidence，执行失败会产生
+`worker_blackbox` Evidence 并阻塞 Task。Human Owner 或 Demand Requester 可以读取相关任务报告；授权人
 也可以在 Agent 领取前调用 `POST /api/v1/flight-leases/:id/revoke` 撤销租约。最终提交和验收仍由 Human
 完成。
 
@@ -1098,8 +1098,8 @@ export GITLAB_TOKEN='glpat-...'
 ```
 
 同步者必须是该 Task 的 Owner、Copilot 或对应的 Human Owner。MR 和 Pipeline 使用稳定 Artifact ID；
-状态未变化时重复同步不会制造重复事件，状态变化则会留下新的 Ledger 航点。已合并的 MR 或成功的
-Pipeline 可作为提交验收所需的可验证材料，但不会自动完成 Task，最终落地仍由 Demand Requester
+状态未变化时重复同步不会制造重复事件，状态变化则会留下新的 Ledger Waypoint。已合并的 MR 或成功的
+Pipeline 可作为提交验收所需的可验证材料，但不会自动完成 Task，最终验收仍由 Demand Requester
 确认。`relay task show TSK-xxxxxxxx` 和 Ratatui 的 Task Detail 都会展示同步状态。
 
 第一次手动同步同时建立 Task 与 MR 的绑定。之后可以在 GitLab 项目的 Settings > Webhooks 中订阅
@@ -1109,7 +1109,7 @@ Merge request events 和 Pipeline events，并把 URL 指向：
 https://relay.example.com/api/v1/connectors/gitlab/webhook
 ```
 
-GitLab 19 推荐使用 Signing token。把 GitLab 只显示一次的 `whsec_...` 放入服务进程环境，再启动塔台：
+GitLab 19 推荐使用 Signing token。把 GitLab 只显示一次的 `whsec_...` 放入服务进程环境，再启动控制面：
 
 ```bash
 export GITLAB_WEBHOOK_SIGNING_TOKEN='whsec_...'
@@ -1131,7 +1131,7 @@ Writer 创建/评论 Issue 和创建/评论 MR；它使用单独的 Tenant Token
 传 `--url https://gitlab.example.com`。Webhook URL 必须通过可信网络或 TLS 反向代理暴露给 GitLab，
 不能直接把默认的 localhost 监听地址公开到互联网。
 
-Tower Tracker 可以手动运行，也可以交给 cron、CI 或服务进程定时触发。默认把 24 小时没有接单、航点
+Tower Tracker 可以手动运行，也可以交给 cron、CI 或服务进程定时触发。默认把 24 小时没有接单、Waypoint
 或验收视为需要关注；Blocked 和超过 P80 会直接成为 Critical，Warning 持续 4 小时后升级：
 
 ```bash
@@ -1182,10 +1182,10 @@ v0 不自己实现另一套 Coding Agent 循环，而是把已经安装并登录
 ```
 
 在 Ratatui 中，进入 Flow 或 Inbox 选中已经接单且依赖完成的任务，点击底部 `规划`，输入
-`PASS` 确认模型调用；点击 `执行`，检查工作区后输入 `RELAY` 才会授予写权限。航班在后台运行，
-界面仍可浏览其他 Flow；Flight Deck 会显示 `AIRBORNE`、`LANDED` 或 `CRASHED`、模型费用和黑匣子
-路径。本地 TUI 执行终端目前仍采取单航班串行门禁；Remote Flight 则按 Manifest 中的工作区、文件、
-端口、浏览器和 GPU Claim 做资源冲突控制，航班结束前不会静默退出。
+`PASS` 确认模型调用；点击 `执行`，检查工作区后输入 `RELAY` 才会授予写权限。任务在后台运行，
+界面仍可浏览其他 Flow；Flight Deck 会显示 `AIRBORNE`、`LANDED` 或 `CRASHED`、模型费用和过程记录
+路径。本地 TUI 执行终端目前仍采取单任务串行门禁；Remote Flight 则按 Manifest 中的工作区、文件、
+端口、浏览器和 GPU Claim 做资源冲突控制，任务结束前不会静默退出。
 
 当前适配器的权限映射如下：
 
@@ -1211,9 +1211,9 @@ API Key，也还没有直连 Provider API 的适配层。未安装或未登录�
 给出原因，本地规划器不调用模型。
 
 原始 stdout、stderr、退出码、时间和终端摘要写入
-`.relay/runs/<FLOW-ID>/<RUN-ID>.json`。安全落地和坠机都进入同一条 Flow Ledger；即使终端未安装
-或超时，也会留下可检查的失败黑匣子。这里的本地 `relay task run --mode execute` 仍会直接作用于
-注册工作区；只有上一节的 Remote Worker 写入航班同时使用隔离 Git worktree 和容器沙箱。本地
+`.relay/runs/<FLOW-ID>/<RUN-ID>.json`。成功完成和执行失败都进入同一条 Flow Ledger；即使终端未安装
+或超时，也会留下可检查的失败过程记录。这里的本地 `relay task run --mode execute` 仍会直接作用于
+注册工作区；只有上一节的 Remote Worker 写入任务同时使用隔离 Git worktree 和容器沙箱。本地
 `task run` 适合受信任操作者的交互执行，不是 Remote Worker 的安全边界。
 
 ## v0 已实现
@@ -1236,7 +1236,7 @@ API Key，也还没有直连 Provider API 的适配层。未安装或未登录�
 - 面向 Demand Requester 的立即/延迟升级策略、Tower Calls 收件箱与 Human 确认；
 - Bearer Token 身份、远程 Human Inbox 与任务操作 HTTP Control Plane；
 - 无需共享数据库或仓库的 Remote Worker，以及远程 Agent 身份；
-- 一次性 Remote Flight Lease、Human 写授权、结构化黑匣子和隔离 Git worktree 补丁；
+- 一次性 Remote Flight Lease、Human 写授权、结构化过程记录和隔离 Git worktree 补丁；
 - 默认封闭的 Docker Remote Worker、不可变 Image ID、非 root 运行与资源限制；
 - 强制 FlightManifest、统一 Fuel 预算、资源租约、服务端预算判定与可分叉监督树恢复；
 - GitLab Project/MR/Pipeline 只读连接器、签名 Webhook、乱序保护与交付门禁；
@@ -1249,9 +1249,9 @@ API Key，也还没有直连 Provider API 的适配层。未安装或未登录�
 - SQLite v4 迁移、WAL/FULL 同步、文件权限、Doctor、在线快照、readiness 与受认证 metrics；
 - 默认 30 天的可撤销 Bearer Token、数据库级过期拒绝与非 loopback 明文启动保护；
 - 每请求 ID、敏感 API `no-store`、基础固定窗口限流与统一安全响应头；
-- Ratatui 塔台总览、Flow 工作台、个人 Inbox、成员和黑匣子时间线；
+- Ratatui 控制面总览、Flow 工作台、个人 Inbox、成员和过程记录时间线；
 - 管理员 DashboardSnapshot、Flow 健康度、Action Queue 与可重复 Showcase 工作流；
-- 内嵌管理员 Web Console、Bearer 身份、响应式管理看板与坠机恢复操作；
+- 内嵌管理员 Web Console、Bearer 身份、响应式管理看板与执行失败恢复操作；
 - TUI 内可选 Local / Claude Code / Codex 的后台 PRD 规划与 Flow Ledger 自动回放；
 - TUI 后台 Flight、`PASS` / `RELAY` 放行确认、实时状态回放与 Flight Deck；
 - 基于实时布局 HitMap 的标签、表格、操作带、弹窗点击与滚轮支持；
@@ -1302,7 +1302,7 @@ Relay 不是 DeerFlow 的 fork。DeerFlow 可以成为某种 Agent Execution Bac
 - [x] Rust workspace、测试基线和 `relay` CLI v0
 - [x] SQLite Flow Ledger、事件回放、能力匹配与基础排期
 - [x] Claude Code / Codex 执行终端
-- [x] Ratatui 组织塔台与 Human Inbox
+- [x] Ratatui 组织控制面与 Human Inbox
 - [x] Ratatui 后台模型规划与鼠标操作
 - [x] Todo Tracker、可回放 Attention 与 Requester Escalation
 - [x] Bearer 身份、远程 Inbox 与 Control Plane HTTP API
@@ -1310,7 +1310,7 @@ Relay 不是 DeerFlow 的 fork。DeerFlow 可以成为某种 Agent Execution Bac
 - [x] GitLab 签名 Webhook、delivery 幂等与乱序保护
 - [x] GitLab Issue/MR Human Gate、写入调度与不确定结果保护
 - [x] 只读 Personal Agent Remote Worker
-- [x] Remote Flight Lease、Human 写授权、结构化黑匣子与隔离 worktree
+- [x] Remote Flight Lease、Human 写授权、结构化过程记录与隔离 worktree
 - [x] FlightManifest、Fuel、资源租约、失败分类与可分叉监督恢复树
 - [x] Coding / Office Capability Pack、交付合同与 Human Release 边界
 - [x] 管理员看板、Action Queue 与一键 Showcase 数据流
@@ -1334,7 +1334,7 @@ Relay 不是 DeerFlow 的 fork。DeerFlow 可以成为某种 Agent Execution Bac
 - [x] 单进程多 Tenant Catalog、独立 Ledger 与 Token 路由
 - [x] PostgreSQL 多副本数据面、并发 stream head 与 SQLite Fleet 迁移
 - [x] OIDC Authorization Code + PKCE、HttpOnly Session 与 SCIM User/Group 生命周期
-- [x] Remote Worker Docker 沙箱、不可变 Runtime、资源上限与黑匣子隔离快照
+- [x] Remote Worker Docker 沙箱、不可变 Runtime、资源上限与过程记录隔离快照
 - [ ] 更多企业连接器
 - [ ] 集中策略引擎、域名级出站策略与 VM/微虚拟机级执行隔离
 

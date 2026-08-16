@@ -135,7 +135,7 @@ impl View {
             Self::Flows => "任务流 FLOWS",
             Self::Inbox => "收件箱 INBOX",
             Self::Roster => "成员 ROSTER",
-            Self::Timeline => "黑匣子 TIMELINE",
+            Self::Timeline => "过程记录 TIMELINE",
         }
     }
 
@@ -352,7 +352,7 @@ impl UiState {
             workspace: options.workspace,
             timeline: Vec::new(),
             modal: None,
-            message: "塔台在线。在底部输入框描述需求即可发起规划；点击列表与操作带调度 Flow。"
+            message: "控制面在线。在底部输入框描述需求即可发起规划；点击列表与操作带调度 Flow。"
                 .to_string(),
             message_is_error: false,
             active_flights: BTreeMap::new(),
@@ -656,10 +656,10 @@ impl UiState {
                     &format!("relay://task/{task_id}/evidence"),
                     value,
                 )
-                .map(|evidence| format!("证据 {} 已进入黑匣子", evidence.id)),
+                .map(|evidence| format!("证据 {} 已记入过程记录", evidence.id)),
             InputPurpose::Block { task_id } => app
                 .block_task(&task_id, &actor, value)
-                .map(|task| format!("{} 已阻塞，塔台收到求助", task.id)),
+                .map(|task| format!("{} 已阻塞，已上报", task.id)),
             InputPurpose::Message {
                 flow_id,
                 task_id,
@@ -726,8 +726,8 @@ impl UiState {
                 .recover_remote_flight(&lease_id, &actor, action, value, None, None, 3_600)
                 .map(|child| {
                     child.map_or_else(
-                        || format!("{lease_id} 已转人工或停飞，监督决定已进入黑匣子"),
-                        |child| format!("{lease_id} 已复飞为 {} · A{}", child.id, child.attempt),
+                        || format!("{lease_id} 已转人工或放弃，监督决定已记入过程记录"),
+                        |child| format!("{lease_id} 已重试为 {} · A{}", child.id, child.attempt),
                     )
                 }),
         };
@@ -774,7 +774,7 @@ impl UiState {
                 self.focus_flights = false;
                 self.view = View::Overview;
                 self.refresh_timeline(app);
-                self.success("Showcase 机队已进场：3 条 Flow 就位，塔台已聚焦 LLM Gateway 风险");
+                self.success("Showcase 已装载：3 条 Flow 就位，已聚焦 LLM Gateway 风险");
             }
             Err(error) => self.failure(error),
         }
@@ -896,7 +896,7 @@ impl UiState {
         let result = release_id
             .ok_or_else(|| RelayError::Validation("当前没有待你放行的 Office 发布".into()))
             .and_then(|release_id| app.approve_office_release(&release_id, &actor))
-            .map(|release| format!("{} 已由 Human 放行，等待 Tower 发布", release.id));
+            .map(|release| format!("{} 已由 Human 放行，等待控制面发布", release.id));
         self.finish_action(app, result);
     }
 
@@ -924,7 +924,7 @@ impl UiState {
         let result = write_id
             .ok_or_else(|| RelayError::Validation("当前没有待你放行的 GitLab 写入".into()))
             .and_then(|write_id| app.approve_gitlab_write(&write_id, &actor))
-            .map(|request| format!("{} 已由 Human 放行，等待 Tower 写入 GitLab", request.id));
+            .map(|request| format!("{} 已由 Human 放行，等待控制面写入 GitLab", request.id));
         self.finish_action(app, result);
     }
 
@@ -955,9 +955,9 @@ impl UiState {
                 .map(|request| request.id.clone())
         });
         let result = write_id
-            .ok_or_else(|| RelayError::Validation("当前没有可人工复飞的 GitLab 写入".into()))
+            .ok_or_else(|| RelayError::Validation("当前没有可人工重试的 GitLab 写入".into()))
             .and_then(|write_id| app.retry_gitlab_write(&write_id, &actor))
-            .map(|request| format!("{} 已确认复飞，等待 Tower 再次写入", request.id));
+            .map(|request| format!("{} 已确认重试，等待控制面再次写入", request.id));
         self.finish_action(app, result);
     }
 
@@ -1111,14 +1111,14 @@ impl UiState {
                 }
                 if !scan.raised.is_empty() || !scan.escalated.is_empty() {
                     self.success(format!(
-                        "Tower Tracker 新增 {} 项 Attention、{} 个 Tower Call，当前活动 {} 项",
+                        "跟踪器新增 {} 项关注、{} 个求助，当前活动 {} 项",
                         scan.raised.len(),
                         scan.escalated.len(),
                         scan.active.len()
                     ));
                 } else if announce || !scan.resolved.is_empty() {
                     self.success(format!(
-                        "Tower Tracker 已扫描 {} 个 Todo：解除 {}，活动 {}",
+                        "跟踪器已扫描 {} 个 Todo：解除 {}，活动 {}",
                         scan.scanned_tasks,
                         scan.resolved.len(),
                         scan.active.len()
@@ -1143,7 +1143,7 @@ impl UiState {
                         self.success(format!("{} 通知安全落地", delivery.id));
                     } else {
                         self.failure(RelayError::Validation(format!(
-                            "{} 通知坠机：{}",
+                            "{} 通知执行失败：{}",
                             delivery.id,
                             delivery.last_error.as_deref().unwrap_or("未知错误")
                         )));
@@ -1217,7 +1217,7 @@ impl UiState {
             .map(|escalation| escalation.id.clone());
         let Some(escalation_id) = escalation_id else {
             self.failure(RelayError::Validation(
-                "当前没有等待确认的指令或 Tower Call".into(),
+                "当前没有等待确认的指令或求助".into(),
             ));
             return;
         };
@@ -1379,7 +1379,7 @@ impl UiState {
     fn open_run_confirmation(&mut self, app: &RelayApp, mode: ExecutorMode) {
         if !self.active_flights.is_empty() {
             self.failure(RelayError::Validation(
-                "当前已有航班在空中；v0 空域一次只允许一个执行终端".to_string(),
+                "当前已有任务在执行；v0 一次只允许一个执行终端".to_string(),
             ));
             return;
         }
@@ -1431,14 +1431,12 @@ impl UiState {
 
     fn open_recovery_input(&mut self, app: &RelayApp, action: RecoveryAction) {
         let Some(flight) = self.selected_flight(app) else {
-            self.failure(RelayError::Validation(
-                "请先在 Flight Deck 选择一架航班".into(),
-            ));
+            self.failure(RelayError::Validation("请先在执行台选择一个任务".into()));
             return;
         };
         if flight.status != FlightLeaseStatus::Crashed {
             self.failure(RelayError::InvalidTransition(
-                "只有坠机航班可以进入这条恢复航线".into(),
+                "只有执行失败的任务可以进入恢复流程".into(),
             ));
             return;
         }
@@ -1487,7 +1485,7 @@ impl UiState {
         self.active_flights.insert(task_id.clone(), flight);
         self.last_flight_reload = Instant::now();
         self.success(format!(
-            "{} 航班已离场，mode={}",
+            "{} 任务已结束，mode={}",
             task_id,
             executor_mode_label(&mode)
         ));
@@ -1525,7 +1523,7 @@ impl UiState {
                     flight.log_path.display()
                 )),
                 Err(error) => self.failure(RelayError::Validation(format!(
-                    "{} 坠机：{}",
+                    "{} 执行失败：{}",
                     result.task_id, error
                 ))),
             }
@@ -1739,7 +1737,7 @@ fn render_header(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: R
         Paragraph::new(Line::from(vec![
             Span::styled(" RELAY", Style::new().fg(GOLD).bold()),
             Span::styled("FLOW ", Style::new().fg(TEXT).bold()),
-            Span::styled("TOWER", Style::new().fg(PURPLE).bold()),
+            Span::styled("RELAY", Style::new().fg(PURPLE).bold()),
         ]))
         .block(
             Block::default()
@@ -1754,7 +1752,7 @@ fn render_header(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: R
             Span::styled(organization, Style::new().fg(TEXT).bold()),
             Span::styled("  /  操作人 ", Style::new().fg(MUTED)),
             Span::styled(actor, Style::new().fg(CYAN).bold()),
-            Span::styled("  /  航班 ", Style::new().fg(MUTED)),
+            Span::styled("  /  任务 ", Style::new().fg(MUTED)),
             Span::styled(
                 (state.active_flights.len() + remote_flights).to_string(),
                 Style::new()
@@ -1887,7 +1885,7 @@ fn render_overview(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area:
     render_metric(
         frame,
         metric_areas[4],
-        "OPEN FLIGHTS",
+        "进行中 OPEN",
         (dashboard.metrics.open_flights + state.active_flights.len()).to_string(),
         GOLD,
     );
@@ -2055,10 +2053,10 @@ fn render_flow_table(
 fn render_tower_brief(frame: &mut Frame, app: &RelayApp, flow: Option<&Flow>, area: Rect) {
     let Some(flow) = flow else {
         frame.render_widget(
-            Paragraph::new("点击 SHOWCASE 装载演示机队，或在底部输入框直接描述需求。")
+            Paragraph::new("点击 SHOWCASE 装载演示数据，或在底部输入框直接描述需求。")
                 .style(Style::new().fg(MUTED))
                 .alignment(Alignment::Center)
-                .block(panel_block("TOWER BRIEF", false)),
+                .block(panel_block("概览 BRIEF", false)),
             area,
         );
         return;
@@ -2146,7 +2144,7 @@ fn render_tower_brief(frame: &mut Frame, app: &RelayApp, flow: Option<&Flow>, ar
             Span::styled("风险  ", Style::new().fg(MUTED)),
             Span::styled(
                 if attention_count == 0 {
-                    "空域正常".to_string()
+                    "一切正常".to_string()
                 } else {
                     format!(
                         "{} 项 · {}",
@@ -2161,7 +2159,7 @@ fn render_tower_brief(frame: &mut Frame, app: &RelayApp, flow: Option<&Flow>, ar
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
-            .block(panel_block("TOWER BRIEF", false)),
+            .block(panel_block("概览 BRIEF", false)),
         brief,
     );
     frame.render_widget(
@@ -2261,7 +2259,7 @@ fn render_action_queue(frame: &mut Frame, app: &RelayApp, area: Rect) {
                             .unwrap_or_else(|| "GitLab 写入失败".into()),
                     ),
                     GitLabWriteStatus::Indeterminate => {
-                        ("??", ORANGE, "GitLab 结果不确定，需核对后人工复飞".into())
+                        ("??", ORANGE, "GitLab 结果不确定，需核对后人工重试".into())
                     }
                     _ => unreachable!(),
                 };
@@ -2521,7 +2519,7 @@ fn render_tasks(frame: &mut Frame, state: &mut UiState, app: &RelayApp, area: Re
     .highlight_symbol("▶ ")
     .highlight_spacing(HighlightSpacing::Always)
     .column_spacing(1)
-    .block(panel_block("FLIGHT MANIFESTS", focused));
+    .block(panel_block("执行清单 MANIFESTS", focused));
     let mut table_state = TableState::default();
     table_state.select((!tasks.is_empty()).then_some(state.task_index));
     register_table_rows(area, state.task_index, tasks.len(), HitTarget::Task, state);
@@ -2654,7 +2652,7 @@ fn render_inbox_comms(
     frame.render_widget(
         List::new(items).block(panel_block(
             &format!(
-                "TOWER COMMS / {} 指令 · {} 呼叫 · 点击底部收到确认",
+                "消息 COMMS / {} 指令 · {} 求助 · 点击底部收到确认",
                 messages.len(),
                 escalations.len()
             ),
@@ -3059,11 +3057,11 @@ fn render_flights(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: 
             })
             .count();
         let fuel = lease.manifest.as_ref().map_or_else(
-            || "FUEL legacy manifest".to_string(),
+            || "用量 legacy manifest".to_string(),
             |manifest| {
                 let usage = lease.report.as_ref().map(|report| &report.fuel);
                 format!(
-                    "FUEL {}s/{}s · CTX {}/{}",
+                    "用量 {}s/{}s · 上下文 {}/{}",
                     usage.map_or(0, |fuel| fuel.duration_seconds),
                     manifest.fuel.max_duration_seconds,
                     format_bytes(usage.map_or(0, |fuel| fuel.context_bytes)),
@@ -3190,7 +3188,7 @@ fn render_flights(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: 
 
     if items.is_empty() {
         items.push(ListItem::new(Text::from(vec![
-            Line::styled("机队待命", Style::new().fg(MUTED)),
+            Line::styled("暂无任务", Style::new().fg(MUTED)),
             Line::styled("选中任务后点击底部的规划（只读）", Style::new().fg(TEXT)),
             Line::styled("需要写入时点击执行", Style::new().fg(TEXT)),
         ])));
@@ -3204,7 +3202,7 @@ fn render_flights(frame: &mut Frame, app: &RelayApp, state: &mut UiState, area: 
     frame.render_stateful_widget(
         List::new(items)
             .block(panel_block(
-                "FLIGHT DECK / MANIFEST · FUEL",
+                "执行台 DECK / 清单 · 用量",
                 state.focus_flights,
             ))
             .highlight_style(Style::new().bg(PANEL_ALT).fg(TEXT).bold())
@@ -3227,7 +3225,7 @@ fn render_log(frame: &mut Frame, state: &UiState, area: Rect) {
             let (label, color) = if *is_error {
                 ("CRASH", RED)
             } else {
-                ("TOWER", GREEN)
+                ("RELAY", GREEN)
             };
             Line::from(vec![
                 Span::styled(format!(" {label} "), Style::new().fg(BG).bg(color).bold()),
@@ -3238,7 +3236,7 @@ fn render_log(frame: &mut Frame, state: &UiState, area: Rect) {
         .collect::<Vec<_>>();
     if lines.is_empty() {
         lines.push(Line::styled(
-            " 塔台回执会出现在这里。",
+            " 控制面回执会出现在这里。",
             Style::new().fg(MUTED),
         ));
     }
@@ -3347,7 +3345,7 @@ fn action_bar_items(app: &RelayApp, state: &UiState) -> Vec<(&'static str, Mouse
             })
         })
     }) {
-        actions.insert(0, ("核对后复飞", MouseAction::RetryGitLabWrite));
+        actions.insert(0, ("核对后重试", MouseAction::RetryGitLabWrite));
     }
     actions
 }
@@ -3553,7 +3551,7 @@ fn composer_meta(purpose: &InputPurpose) -> (&'static str, String, Color) {
             GOLD,
         ),
         InputPurpose::Negotiate { current_hours, .. } => (
-            "FLIGHT PLAN / 动态调时",
+            "排期 PLAN / 动态调时",
             format!(
                 "当前基础工时 {:.1}h；输入新工时后同步重算下游窗口与关键路径",
                 current_hours
@@ -3576,17 +3574,17 @@ fn composer_meta(purpose: &InputPurpose) -> (&'static str, String, Color) {
             ORANGE,
         ),
         InputPurpose::FlowChange { .. } => (
-            "CHANGE REQUEST / 航线变更",
+            "变更申请 CHANGE",
             "描述新增范围；先生成影响预览，不会立即修改正式 Flow".into(),
             PURPLE,
         ),
         InputPurpose::RejectChange { .. } => (
             "REJECT CHANGE / 驳回变更",
-            "输入驳回原因；申请会进入黑匣子，正式 Flow 保持不变".into(),
+            "输入驳回原因；申请会记入过程记录，正式 Flow 保持不变".into(),
             RED,
         ),
         InputPurpose::Run { mode, .. } => (
-            "FLIGHT CLEARANCE / 航班放行",
+            "执行放行 CLEARANCE",
             match mode {
                 ExecutorMode::Plan => {
                     "只读规划会调用已分配终端并产生模型费用；输入 PASS 放行".into()
@@ -3601,7 +3599,7 @@ fn composer_meta(purpose: &InputPurpose) -> (&'static str, String, Color) {
             },
         ),
         InputPurpose::RecoverFlight { action, .. } => (
-            "BLACK BOX / 坠机处置",
+            "过程记录 RECORD / 执行失败处置",
             format!(
                 "{}；输入本次监督决定的理由，确认后写入因果链",
                 recovery_action_label(*action)
@@ -3948,22 +3946,22 @@ fn flight_selection_summary(app: &RelayApp, flight: &FlightLease) -> String {
 
 fn recovery_action_label(action: RecoveryAction) -> &'static str {
     match action {
-        RecoveryAction::Retry => "沿原航线复飞",
-        RecoveryAction::SwitchExecutor => "更换执行终端复飞",
-        RecoveryAction::ReduceScope => "缩小目标与上下文后复飞",
+        RecoveryAction::Retry => "按原方案重试",
+        RecoveryAction::SwitchExecutor => "更换执行终端重试",
+        RecoveryAction::ReduceScope => "缩小目标与上下文后重试",
         RecoveryAction::HumanHandoff => "交还给 Human",
-        RecoveryAction::Ground => "永久停飞",
-        RecoveryAction::Fork => "从黑匣子分叉新航班",
+        RecoveryAction::Ground => "放弃这个任务",
+        RecoveryAction::Fork => "基于过程记录换个方案重试",
     }
 }
 
 fn recovery_button(action: RecoveryAction) -> Option<(&'static str, MouseAction)> {
     let label = match action {
-        RecoveryAction::Retry => "原地复飞",
-        RecoveryAction::ReduceScope => "缩小航线",
+        RecoveryAction::Retry => "原地重试",
+        RecoveryAction::ReduceScope => "缩小范围",
         RecoveryAction::HumanHandoff => "转人工",
-        RecoveryAction::Ground => "永久停飞",
-        RecoveryAction::Fork => "分叉复飞",
+        RecoveryAction::Ground => "放弃",
+        RecoveryAction::Fork => "换方案重试",
         RecoveryAction::SwitchExecutor => return None,
     };
     Some((label, MouseAction::RecoverFlight(action)))
@@ -4086,6 +4084,7 @@ fn event_style(kind: &str) -> Style {
 
 #[cfg(test)]
 mod tests {
+
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
@@ -4152,7 +4151,7 @@ mod tests {
         assert!(content.contains("RELAY"));
         assert!(content.contains("Relay Labs"));
         assert!(content.contains("Prepare launch brief"));
-        assert!(content.contains("TOWER BRIEF"));
+        assert!(content.contains("BRIEF"));
         assert!(content.contains("AT RISK"));
 
         let scan_tracker = state
@@ -4166,7 +4165,7 @@ mod tests {
             .await
             .unwrap();
         assert!(state.last_tracking_scan.is_some());
-        assert!(state.message.contains("Tower Tracker"));
+        assert!(state.message.contains("跟踪器"));
 
         state.view = View::Timeline;
         terminal
@@ -4180,7 +4179,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("FLOW LEDGER"));
-        assert!(content.contains("FLIGHT DECK"));
+        assert!(content.contains("DECK"));
 
         let flows_tab = state
             .hit_regions
@@ -4403,10 +4402,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains("FLIGHT DECK"));
+        assert!(content.contains("DECK"));
         assert!(content.contains("CLEARED"));
         assert!(content.contains("CRASHED"));
-        assert!(content.contains("FUEL"));
+        assert!(content.contains("DECK"));
 
         let crashed_flight = state
             .hit_regions
@@ -4553,7 +4552,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains("TOWER COMMS"));
+        assert!(content.contains("COMMS"));
         assert!(content.contains("Provider Secret"));
         let compact_backend = TestBackend::new(80, 24);
         let mut compact_terminal = Terminal::new(compact_backend).unwrap();
@@ -4567,7 +4566,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(compact_content.contains("TOWER COMMS"));
+        assert!(compact_content.contains("COMMS"));
         assert!(compact_content.contains("Provider Secret"));
         for action in [
             MouseAction::ApproveOrAccept,
@@ -4680,7 +4679,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains("TOWER COMMS"));
+        assert!(content.contains("COMMS"));
         assert!(content.contains("CRITICAL"));
         assert!(content.contains("waiting for access"));
 

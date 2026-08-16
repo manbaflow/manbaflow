@@ -1809,7 +1809,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &lease,
                     cli.json,
                     format!(
-                        "{} 已放行 {}，租约 {}，{} 前必须起飞",
+                        "{} 已放行 {}，租约 {}，{} 前必须开始",
                         lease.authorized_by,
                         lease.principal_name,
                         lease.id,
@@ -2747,7 +2747,7 @@ fn dashboard_text(dashboard: &DashboardSnapshot) -> String {
         )
     }));
     if !dashboard.flights.is_empty() {
-        lines.push("\nFLIGHT DECK".into());
+        lines.push("\n执行台".into());
         lines.extend(dashboard.flights.iter().take(5).map(|flight| {
             format!(
                 "{}\t{}\t{}\t{}\t{}\t{}",

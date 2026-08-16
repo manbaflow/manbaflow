@@ -29,7 +29,7 @@ pub struct ShowcaseSummary {
 pub async fn bootstrap_showcase(app: &mut RelayApp, workspace: &Path) -> Result<ShowcaseSummary> {
     if app.state().organization.is_some() {
         return Err(RelayError::Validation(
-            "Showcase 只能装载到空塔台，请换一个独立的 --data-dir".to_string(),
+            "Showcase 只能装载到空实例，请换一个独立的 --data-dir".to_string(),
         ));
     }
 
@@ -247,7 +247,7 @@ pub async fn seed_showcase(
                 requester,
                 FlowMessageKind::Command,
                 &["李伟".to_string(), "Codex 副驾".to_string()],
-                "确认 Provider Secret 轮换边界，给出生产放行结论；收到后回传塔台",
+                "确认 Provider Secret 轮换边界，给出生产放行结论；收到后回传控制面",
                 true,
             )?
             .id,

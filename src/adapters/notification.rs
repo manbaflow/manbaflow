@@ -427,7 +427,7 @@ fn notification_card(
             CardSeverity::Info,
         ),
         "task.blocked" => (
-            "航线受阻，等待塔台支援",
+            "任务受阻，等待支援",
             value_text(data, "reason").unwrap_or_else(|| "任务已标记为阻塞。".into()),
             CardSeverity::Warning,
         ),
@@ -437,29 +437,29 @@ fn notification_card(
             CardSeverity::Info,
         ),
         "tracking.escalation_raised" => (
-            "塔台升级：需要管理者处理",
+            "已升级：需要管理者处理",
             nested_text(data, &["escalation", "reason"])
                 .or_else(|| value_text(data, "reason"))
                 .unwrap_or_else(|| "Todo 风险已超过升级阈值。".into()),
             CardSeverity::Critical,
         ),
         "flow_change.proposed" => (
-            "航线变更等待批准",
+            "方案变更等待批准",
             "运行中的 Flow 收到变更提案，请评估影响后放行。".into(),
             CardSeverity::Warning,
         ),
         "flow_change.applied" => (
-            "新航线已生效",
+            "新方案已生效",
             "Human 已批准变更，任务与排期已经更新。".into(),
             CardSeverity::Info,
         ),
         "flow_change.rejected" => (
-            "航线变更未获放行",
+            "方案变更未获放行",
             value_text(data, "reason").unwrap_or_else(|| "Human 已驳回变更。".into()),
             CardSeverity::Warning,
         ),
         "remote_flight.crashed" => (
-            "航班坠机，黑匣子已记录",
+            "执行失败，过程记录已保存",
             value_text(data, "reason")
                 .unwrap_or_else(|| "远程执行失败，请检查证据并选择恢复策略。".into()),
             CardSeverity::Critical,
@@ -470,7 +470,7 @@ fn notification_card(
             CardSeverity::Success,
         ),
         "connector.test" => (
-            "塔台信号测试",
+            "通知通道测试",
             "Connector 已收到 Relay 测试消息。".into(),
             CardSeverity::Success,
         ),
@@ -992,7 +992,7 @@ mod tests {
                 }
                 NotificationConnector::Slack => {
                     assert_eq!(body["blocks"][0]["type"], "header");
-                    assert!(body["text"].as_str().unwrap().contains("航线受阻"));
+                    assert!(body["text"].as_str().unwrap().contains("任务受阻"));
                 }
                 NotificationConnector::Teams => {
                     assert_eq!(body["type"], "message");

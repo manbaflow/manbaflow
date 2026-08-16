@@ -60,7 +60,7 @@ impl RelayApp {
         Ok(repository)
     }
 
-    /// 归档一个仓库：不再能往上面派新活，但历史航班记录保持可读。
+    /// 归档一个仓库：不再能往上面派新活，但历史任务记录保持可读。
     pub fn archive_repository(&mut self, selector: &str, actor: &str) -> Result<Repository> {
         self.ensure_permission(actor, Permission::PrincipalManage)?;
         let repository = self.state.repository(selector)?.clone();
@@ -182,7 +182,7 @@ mod tests {
         app.archive_repository(&repository.id, "admin").unwrap();
 
         assert!(app.state().repository("web-app").is_err());
-        // 归档只是停用，记录还在——历史航班要能读出当时用的是哪个仓库。
+        // 归档只是停用，记录还在——历史任务要能读出当时用的是哪个仓库。
         assert_eq!(app.repositories().len(), 1);
         assert!(!app.repositories()[0].active);
     }

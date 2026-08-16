@@ -270,7 +270,7 @@ impl RemoteWorker {
         }
     }
 
-    /// 这次航班应该在哪个本地目录里执行。
+    /// 这次任务应该在哪个本地目录里执行。
     ///
     /// manifest 带了仓库就必须能映射到本地路径，映射不上返回 None——调用方据此
     /// 跳过该租约。没带仓库的走 --workspace，兼容单仓库的老用法。
@@ -318,7 +318,7 @@ impl RemoteWorker {
                 "no authorized write flight lease for this worker and executor".to_string()
             } else {
                 format!(
-                    "有 {} 个航班在等，但本机没有配置对应仓库：{}。用 --repo <仓库>=<本地路径> 指定。",
+                    "有 {} 个任务在等，但本机没有配置对应仓库：{}。用 --repo <仓库>=<本地路径> 指定。",
                     unmapped.len(),
                     unmapped.join("、")
                 )

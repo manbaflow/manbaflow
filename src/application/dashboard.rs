@@ -247,7 +247,7 @@ pub fn build_dashboard(state: &OrganizationState) -> DashboardSnapshot {
                     TaskStatus::Blocked => (
                         ActionPriority::Critical,
                         format!(
-                            "请求塔台协防：{}",
+                            "请求协助：{}",
                             task.blocker.as_deref().unwrap_or("未提供阻塞原因")
                         ),
                     ),

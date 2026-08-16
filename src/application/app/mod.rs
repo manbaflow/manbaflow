@@ -387,7 +387,7 @@ impl RelayApp {
             return Err(RelayError::InvalidWorkspace(workspace.to_path_buf()));
         }
 
-        // 仓库可选，但一旦指定就必须存在且未归档——否则航班会带着一个
+        // 仓库可选，但一旦指定就必须存在且未归档——否则任务会带着一个
         // 解析不出来的仓库飞出去，Worker 只能跳过。
         let repository_id = match repository {
             Some(selector) => Some(self.state.repository(selector)?.id.clone()),

@@ -49,7 +49,7 @@ pub struct Repository {
 
 /// 放进 FlightManifest 的仓库快照。
 ///
-/// 存快照而不是只存 ID：航班记录进 append-only Ledger 之后，即使仓库被改名或
+/// 存快照而不是只存 ID：任务记录进 append-only Ledger 之后，即使仓库被改名或
 /// 归档，也要能看出当时是在哪个仓库、哪个分支上执行的。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct RepositoryRef {
