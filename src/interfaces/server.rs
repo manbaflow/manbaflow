@@ -21,12 +21,13 @@ use tower::ServiceExt;
 use crate::RelayApp;
 use crate::dashboard::DashboardSnapshot;
 use crate::domain::{
-    AssignmentTarget, AvailabilityBlock, Evidence, ExecutorKind, FlightLease, FlightManifestDraft,
-    Flow, FlowChangeRequest, FlowMessage, FlowMessageKind, GitLabWritePayload, GitLabWriteRequest,
-    IssuedCredential, MessageInboxItem, NotificationConnector, NotificationDelivery,
-    NotificationEndpoint, OfficeProvider, OfficeReleasePayload, OfficeReleaseRequest, Organization,
-    OrganizationRole, Principal, PrincipalKind, RecoveryAction, RemoteFlightReport, Repository,
-    RoleBinding, Task, Team, Tenant, TrackingEscalation, WorkCalendar, Workday,
+    AssignmentTarget, AvailabilityBlock, Evidence, ExecutorConfig, ExecutorKind, FlightLease,
+    FlightManifestDraft, Flow, FlowChangeRequest, FlowMessage, FlowMessageKind, GitLabWritePayload,
+    GitLabWriteRequest, IssuedCredential, MessageInboxItem, NotificationConnector,
+    NotificationDelivery, NotificationEndpoint, OfficeProvider, OfficeReleasePayload,
+    OfficeReleaseRequest, Organization, OrganizationRole, Principal, PrincipalKind, RecoveryAction,
+    RemoteFlightReport, Repository, RoleBinding, Task, Team, Tenant, TrackingEscalation,
+    WorkCalendar, Workday,
 };
 use crate::error::{RelayError, Result};
 use crate::feishu_auth::FeishuProvider;
@@ -276,6 +277,24 @@ struct CreatePrincipalInput {
     capabilities: String,
     #[serde(default = "default_capacity_percent")]
     capacity_percent: u8,
+    /// Agent 的执行器配置。只有 kind=agent 时有意义。
+    ///
+    /// 可执行文件路径和工作区留空即可——Worker 跑在别的机器上时，这两个值由
+    /// Worker 自己的启动参数决定，控制面这边只需要知道它是哪种执行器。
+    #[serde(default)]
+    executor: Option<CreateExecutorInput>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateExecutorInput {
+    kind: ExecutorKind,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    command: Option<std::path::PathBuf>,
+    #[serde(default)]
+    workspace: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -303,6 +322,41 @@ struct CreateDemandInput {
     planner: PlannerKind,
     #[serde(default = "default_planner_timeout_seconds")]
     timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetProviderInput {
+    provider: String,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    api_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimPlanningInput {
+    /// 领取后多久没回传就允许别人重领。
+    #[serde(default = "default_planning_lease_seconds")]
+    lease_seconds: u64,
+}
+
+const fn default_planning_lease_seconds() -> u64 {
+    600
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitPlanningInput {
+    plan: crate::domain::PlanDraft,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailPlanningInput {
+    reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -904,6 +958,25 @@ fn router_with_identity(app: Arc<Mutex<RelayApp>>, integrations: ServerIntegrati
             post(revoke_principal_credential),
         )
         .route("/api/v1/demands", post(create_demand))
+        .route("/api/v1/planning-requests", get(planning_requests))
+        .route(
+            "/api/v1/planning-requests/{id}/claim",
+            post(claim_planning_request),
+        )
+        .route(
+            "/api/v1/planning-requests/{id}/submit",
+            post(submit_planning_result),
+        )
+        .route(
+            "/api/v1/planning-requests/{id}/fail",
+            post(fail_planning_request),
+        )
+        .route(
+            "/api/v1/me/model-provider",
+            get(my_provider)
+                .put(set_my_provider)
+                .delete(delete_my_provider),
+        )
         .route("/api/v1/me/calendar", get(my_calendar).put(set_my_calendar))
         .route("/api/v1/me/time-off", post(add_my_time_off))
         .route("/api/v1/me/time-off/{id}/cancel", post(cancel_my_time_off))
@@ -1914,6 +1987,16 @@ async fn create_principal(
     headers: HeaderMap,
     Json(input): Json<CreatePrincipalInput>,
 ) -> ApiResult<Json<Principal>> {
+    let executor = input.executor.as_ref().map(|config| ExecutorConfig {
+        kind: config.kind.clone(),
+        // 远程 Worker 自带工作区，控制面这边给个占位即可。
+        workspace: config
+            .workspace
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        model: config.model.clone(),
+        command: config.command.clone(),
+    });
     mutate(&state, &headers, |app, actor| {
         app.register_principal(
             &input.name,
@@ -1922,7 +2005,7 @@ async fn create_principal(
             input.owner.as_deref(),
             &input.capabilities,
             input.capacity_percent,
-            None,
+            executor.clone(),
             actor,
         )
     })
@@ -1993,7 +2076,7 @@ async fn create_demand(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(input): Json<CreateDemandInput>,
-) -> ApiResult<Json<Flow>> {
+) -> ApiResult<Json<serde_json::Value>> {
     if input.timeout_seconds == 0 || input.timeout_seconds > 3_600 {
         return Err(RelayError::Validation(
             "planner timeout must be between 1 and 3600 seconds".into(),
@@ -2010,6 +2093,25 @@ async fn create_demand(
             app.state().tenant()?.id.clone(),
         )
     };
+    // 需要模型的拆解一律排队交给 Worker：控制面容器里没有 claude / codex，
+    // 也不该有——那等于把凭据和任意代码执行塞进管状态的进程里。
+    if input.planner != PlannerKind::Local {
+        let request = {
+            let mut app = state.app.lock().await;
+            app.request_planning(
+                &input.summary,
+                &principal_id,
+                input.planner,
+                input.repository.as_deref(),
+            )?
+        };
+        // 信封固定两个字段：排队时 flow 为 null，本地拆解时 planning_request 为 null。
+        // 形状不随 planner 变化，客户端不用猜。
+        return Ok(Json(
+            json!({ "flow": serde_json::Value::Null, "planning_request": request }),
+        ));
+    }
+
     // 必须跟主实例连同一个库；写死 SQLite 会在 PostgreSQL 部署下开出空库。
     let mut planning_app = RelayApp::open_for_side_task(data_dir, &tenant_id)?;
     let flow = planning_app
@@ -2023,7 +2125,135 @@ async fn create_demand(
         )
         .await?;
     state.app.lock().await.reload()?;
-    Ok(Json(flow))
+    Ok(Json(
+        json!({ "flow": flow, "planning_request": serde_json::Value::Null }),
+    ))
+}
+
+async fn planning_requests(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<crate::domain::PlanningRequest>>> {
+    let app = state.app.lock().await;
+    authenticate(&app, &headers)?;
+    Ok(Json(app.planning_requests()))
+}
+
+/// Worker 领取一条拆解请求。
+///
+/// 响应里**带上提出人的模型凭据**：Worker 要用提出人自己的 Key 去调模型，
+/// 这样费用落到本人头上，也不需要在集群里放一把公用密钥。
+/// 代价是密钥会经过集群网络（内网是明文 HTTP），这是部署时接受的取舍。
+async fn claim_planning_request(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<ClaimPlanningInput>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let request = mutate(&state, &headers, |app, actor| {
+        app.claim_planning_request(&id, actor, input.lease_seconds)
+    })
+    .await?
+    .0;
+    let app = state.app.lock().await;
+    // 提出人没配凭据时不报错：Worker 可能自带环境变量，让它自己决定能不能跑。
+    let provider = app
+        .state()
+        .principals
+        .values()
+        .find(|principal| principal.name == request.requester || principal.id == request.requester)
+        .and_then(|principal| app.provider_credential(&principal.id).ok().flatten());
+    Ok(Json(json!({ "request": request, "provider": provider })))
+}
+
+async fn submit_planning_result(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<SubmitPlanningInput>,
+) -> ApiResult<Json<Flow>> {
+    mutate(&state, &headers, |app, actor| {
+        app.submit_planning_result(&id, input.plan.clone(), actor)
+    })
+    .await
+}
+
+async fn fail_planning_request(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<FailPlanningInput>,
+) -> ApiResult<Json<crate::domain::PlanningRequest>> {
+    mutate(&state, &headers, |app, actor| {
+        app.fail_planning_request(&id, &input.reason, actor)
+    })
+    .await
+}
+
+/// 看自己的模型配置。**永远不返回明文 Key**——只回一个掩码，够确认"配没配、
+/// 配的是不是这把"就行。
+async fn my_provider(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    let Some(credential) = app.provider_credential(&principal.id)? else {
+        return Ok(Json(json!({ "configured": false })));
+    };
+    Ok(Json(json!({
+        "configured": true,
+        "provider": credential.provider,
+        "base_url": credential.base_url,
+        "model": credential.model,
+        "api_key_hint": mask_secret(&credential.api_key),
+        "updated_at": credential.updated_at,
+    })))
+}
+
+async fn set_my_provider(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<SetProviderInput>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    app.set_provider_credential(
+        &principal.id,
+        &input.provider,
+        input.base_url.as_deref(),
+        input.model.as_deref(),
+        &input.api_key,
+    )?;
+    Ok(Json(json!({ "configured": true })))
+}
+
+async fn delete_my_provider(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    app.delete_provider_credential(&principal.id)?;
+    Ok(Json(json!({ "configured": false })))
+}
+
+/// 只露头尾，中间一律星号。太短的直接全星号——否则等于把 Key 说了一半。
+fn mask_secret(value: &str) -> String {
+    let characters: Vec<char> = value.chars().collect();
+    if characters.len() <= 8 {
+        return "*".repeat(characters.len().max(4));
+    }
+    let head: String = characters.iter().take(4).collect();
+    let tail: String = characters
+        .iter()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
 }
 
 async fn my_calendar(
@@ -3584,7 +3814,10 @@ mod tests {
             .unwrap();
         assert_eq!(created.status(), StatusCode::OK);
         let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
-        let flow: Flow = serde_json::from_slice(&body).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // 本地拆解直接出 Flow；需要模型的拆解会走 planning_request 那一支。
+        let flow: Flow = serde_json::from_value(envelope["flow"].clone()).unwrap();
+        assert!(envelope["planning_request"].is_null());
         assert_eq!(flow.demand.requester, member.name);
         assert!(app.lock().await.state().flows.contains_key(&flow.id));
 

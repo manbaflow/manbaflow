@@ -8,6 +8,8 @@ import {
   CheckSquareOutlined,
   NodeIndexOutlined,
   RocketOutlined,
+  RobotOutlined,
+  KeyOutlined,
 } from "@ant-design/icons";
 
 import { api, auth } from "./api.js";
@@ -22,6 +24,8 @@ const NAV = [
   { key: "approvals", icon: <CheckSquareOutlined />, label: "等我确认" },
   { key: "flows", icon: <NodeIndexOutlined />, label: "进行中" },
   { key: "flights", icon: <RocketOutlined />, label: "执行与交付" },
+  { key: "agents", icon: <RobotOutlined />, label: "Agent" },
+  { key: "settings/model", icon: <KeyOutlined />, label: "我的模型配置" },
 ];
 
 export default function Shell() {

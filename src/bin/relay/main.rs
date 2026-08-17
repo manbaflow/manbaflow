@@ -955,6 +955,8 @@ enum PlannerKindArg {
 enum ExecutorModeArg {
     Plan,
     Execute,
+    /// 拆解需求：领取排队中的 planning-request，跑模型产出方案回传。
+    Decompose,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -2967,6 +2969,7 @@ impl From<ExecutorModeArg> for ExecutorMode {
         match value {
             ExecutorModeArg::Plan => Self::Plan,
             ExecutorModeArg::Execute => Self::Execute,
+            ExecutorModeArg::Decompose => Self::Decompose,
         }
     }
 }

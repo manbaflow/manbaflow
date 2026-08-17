@@ -30,6 +30,68 @@ pub struct Team {
     pub created_at: DateTime<Utc>,
 }
 
+/// 一次交给模型执行器的规划请求。
+///
+/// 控制面**不跑模型**：它的容器里没有 claude / codex，也不该有——那等于把凭据、
+/// 网络出口和任意代码执行塞进管状态的进程里。所以「按模板」以外的拆解都变成一条
+/// 排队记录，由 Worker 领走、在自己那边跑、把结构化结果回传。
+///
+/// Worker 跑在哪台机器上不影响这个对象：你的 Mac 和集群里的 Pod 用同一套协议。
+// Demand 里有非 Eq 的字段，这里只要 PartialEq 就够。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PlanningRequest {
+    pub id: String,
+    /// 请求成功后会落成的 Flow ID。先占住，便于前端在排队时就能跳转。
+    pub flow_id: String,
+    pub demand: Demand,
+    pub requester: String,
+    pub repository_id: Option<String>,
+    /// 期望由哪种执行器拆解。Worker 领取时按它过滤。
+    pub planner: String,
+    /// 拆解用的提示词，建请求时由控制面拼好。
+    ///
+    /// 放在这里而不是让 Worker 自己拼：提示词要带团队、人员和产能，那些只有
+    /// 控制面知道。Worker 因此不需要读组织状态，集群内外的 Worker 也就完全一样。
+    pub prompt: String,
+    pub status: PlanningStatus,
+    /// 领走它的 Worker 身份（Principal ID）。
+    pub claimed_by: Option<String>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    /// 领取后多久没回传就允许别人重领，避免 Worker 掉线后请求卡死。
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub attempt: u32,
+    /// 失败原因。留给界面显示，不要求调用方解析。
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningStatus {
+    /// 等待 Worker 领取。
+    Queued,
+    /// 已被领取，正在某台机器上跑模型。
+    Claimed,
+    /// 已回传并落成 Flow。
+    Planned,
+    /// 执行器报告失败，或租约过期后被人工放弃。
+    Failed,
+}
+
+/// 某个人配置的模型服务（明文，仅在内存里流转）。
+///
+/// 序列化时**不包含** api_key 之外的掩码逻辑——掩码由接口层负责，因为只有它
+/// 知道这次响应是给人看的还是给 Worker 用的。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCredential {
+    pub provider: String,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// 一个可以在上面干活的代码仓库。
 ///
 /// 在这之前「在哪个仓库干活」只存在于 Worker 启动时的 `--workspace` 参数里，
@@ -789,8 +851,13 @@ pub struct TrackingScan {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorMode {
+    /// 规划一个**已分配的任务**：产出自由文本证据，不改代码。
     Plan,
+    /// 执行一个已分配的任务：在隔离工作副本里改代码。
     Execute,
+    /// 拆解**需求**：领取 planning-request，跑模型产出 PlanDraft 回传。
+    /// 和 Plan 的区别在输入输出——那个的输入是任务，这个的输入是一句需求。
+    Decompose,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

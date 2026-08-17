@@ -216,10 +216,11 @@ fn build_command(
                 .arg("--no-session-persistence")
                 .arg("--permission-mode")
                 .arg(match request.mode {
-                    ExecutorMode::Plan => "plan",
+                    // 拆解需求同样只读：它产出的是方案，不该碰工作区。
+                    ExecutorMode::Plan | ExecutorMode::Decompose => "plan",
                     ExecutorMode::Execute => "acceptEdits",
                 });
-            if request.mode == ExecutorMode::Plan {
+            if matches!(request.mode, ExecutorMode::Plan | ExecutorMode::Decompose) {
                 command.arg("--tools").arg("");
             }
             if let Some(model) = &request.model {
@@ -248,7 +249,7 @@ fn build_command(
                 .arg("--skip-git-repo-check")
                 .arg("--sandbox")
                 .arg(match request.mode {
-                    ExecutorMode::Plan => "read-only",
+                    ExecutorMode::Plan | ExecutorMode::Decompose => "read-only",
                     ExecutorMode::Execute => "workspace-write",
                 })
                 .arg("--cd")
@@ -298,7 +299,7 @@ fn build_docker_command(
                 "--no-session-persistence".into(),
                 "--permission-mode".into(),
                 match request.mode {
-                    ExecutorMode::Plan => "plan",
+                    ExecutorMode::Plan | ExecutorMode::Decompose => "plan",
                     ExecutorMode::Execute => "acceptEdits",
                 }
                 .into(),
@@ -325,7 +326,7 @@ fn build_docker_command(
                 "--skip-git-repo-check".into(),
                 "--sandbox".into(),
                 match request.mode {
-                    ExecutorMode::Plan => "read-only",
+                    ExecutorMode::Plan | ExecutorMode::Decompose => "read-only",
                     ExecutorMode::Execute => "workspace-write",
                 }
                 .into(),

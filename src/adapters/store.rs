@@ -6,6 +6,23 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::Value;
 
+/// 一个人配置的模型服务凭据。
+///
+/// 不进事件流：Ledger 是 append-only 的，而密钥必须能真删除。这跟 `api_credentials`
+/// 是同一个先例——需要可变或可删的东西就单独一张表。
+#[derive(Clone, Debug)]
+pub struct ProviderCredentialRecord {
+    pub principal_id: String,
+    /// anthropic / openai 之类。决定 Worker 用哪套环境变量名。
+    pub provider: String,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    /// 为空表示 `secret` 是明文——没配 RELAY_CREDENTIAL_KEY 时如此。
+    pub nonce: Option<Vec<u8>>,
+    pub secret: Vec<u8>,
+    pub updated_at: DateTime<Utc>,
+}
+
 use super::postgres_store::PostgresEventStore;
 use crate::error::{RelayError, Result};
 use crate::event::{CURRENT_EVENT_VERSION, DomainEvent, EventEnvelope};
@@ -125,6 +142,30 @@ impl FlowStore {
         match self {
             Self::Sqlite(store) => store.authenticate_credential(token_hash),
             Self::Postgres(store) => store.authenticate_credential(token_hash),
+        }
+    }
+
+    pub fn upsert_provider_credential(&mut self, record: &ProviderCredentialRecord) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => store.upsert_provider_credential(record),
+            Self::Postgres(store) => store.upsert_provider_credential(record),
+        }
+    }
+
+    pub fn provider_credential(
+        &self,
+        principal_id: &str,
+    ) -> Result<Option<ProviderCredentialRecord>> {
+        match self {
+            Self::Sqlite(store) => store.provider_credential(principal_id),
+            Self::Postgres(store) => store.provider_credential(principal_id),
+        }
+    }
+
+    pub fn delete_provider_credential(&mut self, principal_id: &str) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => store.delete_provider_credential(principal_id),
+            Self::Postgres(store) => store.delete_provider_credential(principal_id),
         }
     }
 
@@ -248,6 +289,17 @@ impl EventStore {
             );
             CREATE INDEX IF NOT EXISTS idx_api_credentials_principal
                 ON api_credentials(principal_id, revoked_at);
+            CREATE TABLE IF NOT EXISTS provider_credentials (
+                principal_id TEXT PRIMARY KEY,
+                provider     TEXT NOT NULL,
+                base_url     TEXT,
+                model        TEXT,
+                -- nonce 为 NULL 表示 secret 是明文存的（没配 RELAY_CREDENTIAL_KEY）。
+                -- 以后启用加密不需要改表结构。
+                nonce        BLOB,
+                secret       BLOB NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS artifacts (
                 sha256     TEXT PRIMARY KEY,
                 media_type TEXT NOT NULL,
@@ -532,6 +584,65 @@ impl EventStore {
                 created_at.to_rfc3339(),
                 expires_at.map(|value| value.to_rfc3339())
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_provider_credential(&mut self, record: &ProviderCredentialRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO provider_credentials(
+                principal_id, provider, base_url, model, nonce, secret, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(principal_id) DO UPDATE SET
+                provider = excluded.provider,
+                base_url = excluded.base_url,
+                model = excluded.model,
+                nonce = excluded.nonce,
+                secret = excluded.secret,
+                updated_at = excluded.updated_at",
+            params![
+                record.principal_id,
+                record.provider,
+                record.base_url,
+                record.model,
+                record.nonce,
+                record.secret,
+                record.updated_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn provider_credential(
+        &self,
+        principal_id: &str,
+    ) -> Result<Option<ProviderCredentialRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT principal_id, provider, base_url, model, nonce, secret, updated_at
+             FROM provider_credentials WHERE principal_id = ?1",
+        )?;
+        let mut rows = statement.query([principal_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let updated_at: String = row.get(6)?;
+        Ok(Some(ProviderCredentialRecord {
+            principal_id: row.get(0)?,
+            provider: row.get(1)?,
+            base_url: row.get(2)?,
+            model: row.get(3)?,
+            nonce: row.get(4)?,
+            secret: row.get(5)?,
+            updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                .map_err(|error| RelayError::Validation(error.to_string()))?
+                .with_timezone(&Utc),
+        }))
+    }
+
+    pub fn delete_provider_credential(&mut self, principal_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM provider_credentials WHERE principal_id = ?1",
+            [principal_id],
         )?;
         Ok(())
     }

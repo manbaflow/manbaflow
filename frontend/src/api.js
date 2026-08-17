@@ -51,17 +51,25 @@ export const api = {
   organization: () => get("/organization"),
   dashboard: () => get("/dashboard"),
   principals: () => get("/principals"),
+  createPrincipal: (payload) => post("/principals", payload),
+  issueCredential: (id, payload) => post(`/principals/${encodeURIComponent(id)}/credentials`, payload),
 
   repositories: () => get("/repositories"),
   registerRepository: (payload) => post("/repositories", payload),
   archiveRepository: (id) => post(`/repositories/${encodeURIComponent(id)}/archive`),
 
   createDemand: (payload) => post("/demands", payload),
+  planningRequests: () => get("/planning-requests"),
+  failPlanning: (id, reason) => post(`/planning-requests/${encodeURIComponent(id)}/fail`, { reason }),
   approveFlow: (id) => post(`/flows/${encodeURIComponent(id)}/approve`),
 
   authorizeFlight: (taskId, payload) =>
     post(`/tasks/${encodeURIComponent(taskId)}/flight-leases`, payload),
   recoverFlight: (id, payload) => post(`/flight-leases/${encodeURIComponent(id)}/recover`, payload),
+
+  myProvider: () => get("/me/model-provider"),
+  setMyProvider: (payload) => request("/me/model-provider", { method: "PUT", body: JSON.stringify(payload) }),
+  deleteMyProvider: () => request("/me/model-provider", { method: "DELETE" }),
 
   logout: () => fetch("/auth/logout", { method: "POST" }),
 };

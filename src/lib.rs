@@ -5,7 +5,7 @@ pub mod interfaces;
 
 pub use adapters::{
     capability, executor, feishu_auth, gitlab, gitlab_write, identity, interaction, migration,
-    notification, office, sandbox, store, tenant, worktree,
+    notification, office, sandbox, secretbox, store, tenant, worktree,
 };
 pub use application::{app, dashboard, matcher, planner, scheduler};
 pub use core::{calendar, domain, error, event, ids, state};

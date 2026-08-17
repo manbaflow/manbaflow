@@ -12,15 +12,52 @@ use uuid::Uuid;
 use crate::capability::CapabilityAdapter;
 use crate::domain::{
     CapabilityPack, Evidence, ExecutionSandboxReport, ExecutorKind, ExecutorMode, FailureClass,
-    FlightLease, FlightLeaseStatus, FlowMessage, FuelUsage, MessageInboxItem, Principal,
-    RemoteFlightReport, Task, TaskStatus,
+    FlightLease, FlightLeaseStatus, Flow, FlowMessage, FuelUsage, MessageInboxItem, PlanDraft,
+    PlanningRequest, PlanningStatus, Principal, ProviderCredential, RemoteFlightReport, Task,
+    TaskStatus,
 };
 use crate::error::{RelayError, Result};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
+use crate::planner::run_plan_executor;
 use crate::sandbox::{DockerSandboxConfig, ResolvedDockerSandbox, SandboxBackend};
 use crate::worktree::{IsolatedWorktree, WorktreeArtifact, sha256_file};
 
 #[derive(Clone)]
+/// 领取响应：请求本身 + 提出人的模型凭据（可能没配）。
+#[derive(Debug, Deserialize)]
+struct ClaimedPlanning {
+    request: PlanningRequest,
+    #[serde(default)]
+    provider: Option<ProviderCredential>,
+}
+
+/// 把凭据写进当前进程环境，执行器子进程会继承。
+///
+/// 每种 CLI 认的变量名不同，这里按 provider 分派；未知的 provider 两套都设，
+/// 让 CLI 自己挑——总比什么都不设、跑出一个看不懂的鉴权错误强。
+fn apply_provider_env(provider: &ProviderCredential) {
+    let anthropic = || {
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", &provider.api_key) };
+        if let Some(base) = &provider.base_url {
+            unsafe { std::env::set_var("ANTHROPIC_BASE_URL", base) };
+        }
+    };
+    let openai = || {
+        unsafe { std::env::set_var("OPENAI_API_KEY", &provider.api_key) };
+        if let Some(base) = &provider.base_url {
+            unsafe { std::env::set_var("OPENAI_BASE_URL", base) };
+        }
+    };
+    match provider.provider.as_str() {
+        "anthropic" => anthropic(),
+        "openai" => openai(),
+        _ => {
+            anthropic();
+            openai();
+        }
+    }
+}
+
 pub struct WorkerOptions {
     pub server_url: String,
     pub token: String,
@@ -151,7 +188,107 @@ impl RemoteWorker {
     pub async fn run_once(&self) -> Result<WorkerOutcome> {
         match self.options.mode {
             ExecutorMode::Plan => self.run_plan_once().await,
+            ExecutorMode::Decompose => self.run_decompose_once().await,
             ExecutorMode::Execute => self.run_execute_once().await,
+        }
+    }
+
+    /// 领一条排队中的需求拆解，在本机跑模型，把方案回传。
+    ///
+    /// 和 `run_plan_once` 的区别在输入：那个的输入是已分配的任务，这个的输入是
+    /// 一句需求。提示词由控制面在建请求时拼好带过来——它才知道团队、人员和产能。
+    async fn run_decompose_once(&self) -> Result<WorkerOutcome> {
+        let principal = self.control_plane.me().await?;
+        // 队列里存的是 PlannerKind 的字符串形式（claude-code / codex）。
+        let wanted = match self.options.executor {
+            ExecutorKind::ClaudeCode => "claude-code",
+            ExecutorKind::Codex => "codex",
+        };
+        let requests = self.control_plane.planning_requests().await?;
+        let now = Utc::now();
+        let candidate = requests.into_iter().find(|request| {
+            request.planner == wanted
+                && match request.status {
+                    PlanningStatus::Queued => true,
+                    // 上一个领取者失联，租约过期后可以接手。
+                    PlanningStatus::Claimed => request.lease_expires_at.is_some_and(|at| at <= now),
+                    _ => false,
+                }
+        });
+        let Some(request) = candidate else {
+            return Ok(WorkerOutcome {
+                status: WorkerOutcomeStatus::Idle,
+                principal: principal.name,
+                task_id: None,
+                run_id: None,
+                summary: format!("没有等待 {wanted} 拆解的需求"),
+                log_path: None,
+            });
+        };
+
+        let claimed = self
+            .control_plane
+            .claim_planning(
+                &request.id,
+                self.options.timeout_seconds.saturating_add(120),
+            )
+            .await?;
+        let request = claimed.request;
+        // 提出人自己配的 baseURL / Key：设进环境变量，执行器子进程继承。
+        // 没配就沿用 Worker 自身的环境，让本机已登录的 CLI 继续可用。
+        if let Some(provider) = &claimed.provider {
+            apply_provider_env(provider);
+        }
+
+        let run_id = format!("WRUN-{}", Uuid::new_v4().simple());
+        let log_path = self
+            .options
+            .data_dir
+            .join("worker-runs")
+            .join(&request.id)
+            .join(format!("{run_id}.json"));
+        // 拆解只读，不需要仓库工作副本；用 Worker 的默认工作区即可。
+        let workspace = self.options.workspace.clone();
+
+        let outcome = run_plan_executor(
+            self.options.executor.clone(),
+            self.options.command.clone(),
+            self.options.model.clone(),
+            request.prompt.clone(),
+            &workspace,
+            log_path.clone(),
+            self.options.timeout_seconds,
+        )
+        .await;
+
+        match outcome {
+            Ok(plan) => {
+                let flow = self
+                    .control_plane
+                    .submit_planning(&request.id, &plan)
+                    .await?;
+                Ok(WorkerOutcome {
+                    status: WorkerOutcomeStatus::Planned,
+                    principal: principal.name,
+                    task_id: None,
+                    run_id: Some(run_id),
+                    summary: format!(
+                        "{} 已拆解为 {}（{} 个任务）",
+                        request.id,
+                        flow.id,
+                        flow.tasks.len()
+                    ),
+                    log_path: Some(log_path),
+                })
+            }
+            Err(error) => {
+                // 失败也要回传：否则请求会一直挂在 claimed，直到租约过期才有人再试。
+                let reason = error.to_string();
+                self.control_plane
+                    .fail_planning(&request.id, &reason)
+                    .await?;
+                Err(error)
+            }
         }
     }
 
@@ -684,6 +821,38 @@ impl ControlPlaneClient {
 
     async fn inbox(&self) -> Result<Vec<InboxItem>> {
         self.request(Method::GET, &["inbox"], None).await
+    }
+
+    async fn planning_requests(&self) -> Result<Vec<PlanningRequest>> {
+        self.request(Method::GET, &["planning-requests"], None)
+            .await
+    }
+
+    async fn claim_planning(&self, id: &str, lease_seconds: u64) -> Result<ClaimedPlanning> {
+        self.request(
+            Method::POST,
+            &["planning-requests", id, "claim"],
+            Some(json!({ "lease_seconds": lease_seconds })),
+        )
+        .await
+    }
+
+    async fn submit_planning(&self, id: &str, plan: &PlanDraft) -> Result<Flow> {
+        self.request(
+            Method::POST,
+            &["planning-requests", id, "submit"],
+            Some(json!({ "plan": plan })),
+        )
+        .await
+    }
+
+    async fn fail_planning(&self, id: &str, reason: &str) -> Result<PlanningRequest> {
+        self.request(
+            Method::POST,
+            &["planning-requests", id, "fail"],
+            Some(json!({ "reason": reason })),
+        )
+        .await
     }
 
     async fn messages(&self) -> Result<Vec<MessageInboxItem>> {

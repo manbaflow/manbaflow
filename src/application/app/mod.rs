@@ -10,18 +10,22 @@ use crate::domain::{
     ExecutionSandboxReport, ExecutorConfig, ExecutorKind, ExecutorMode, ExternalArtifact,
     FailureClass, FlightLease, FlightLeaseStatus, FlightManifestDraft, Flow, FlowChangeImpact,
     FlowChangeRequest, FlowChangeStatus, FlowScheduleRevision, FlowStatus, Organization,
-    OrganizationRole, Principal, PrincipalKind, RemoteFlightReport, RoleBinding, TargetKind, Task,
-    TaskDraft, TaskStatus, Team, Tenant,
+    OrganizationRole, PlanDraft, PlanningRequest, PlanningStatus, Principal, PrincipalKind,
+    ProviderCredential, RemoteFlightReport, RoleBinding, TargetKind, Task, TaskDraft, TaskStatus,
+    Team, Tenant,
 };
 use crate::error::{RelayError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
 use crate::executor::{ExecutionRequest, TerminalExecutor};
 use crate::ids::{new_id, normalize_capability, parse_capabilities};
 use crate::matcher::Matcher;
-use crate::planner::{PlannerKind, generate_plan, generate_revision_plan};
+use crate::planner::{
+    PlannerKind, generate_plan, generate_revision_plan, planner_prompt, validate_plan,
+};
 use crate::scheduler::{reschedule, schedule};
+use crate::secretbox::SecretBox;
 use crate::state::OrganizationState;
-use crate::store::{FlowStore, StorageHealth};
+use crate::store::{FlowStore, ProviderCredentialRecord, StorageHealth};
 
 mod actions;
 pub(crate) mod artifacts;
@@ -411,12 +415,6 @@ impl RelayApp {
         )
         .await?;
 
-        let mut matcher = Matcher::new(&self.state);
-        let mut assignments = BTreeMap::new();
-        for task in &plan.tasks {
-            assignments.insert(task.key.clone(), matcher.match_task(task)?);
-        }
-        let scheduled = schedule(&plan.tasks, &assignments, &self.state)?;
         let now = Utc::now();
         let demand = Demand {
             id: demand_id,
@@ -425,6 +423,317 @@ impl RelayApp {
             summary: summary.trim().to_string(),
             created_at: now,
         };
+        self.land_plan(
+            plan,
+            demand,
+            flow_id,
+            repository_id,
+            planner.to_string(),
+            &requester,
+        )
+    }
+
+    /// 把一次需要模型的拆解排进队列，交给 Worker 去跑。
+    ///
+    /// 和 `create_demand` 的区别只在「谁生成方案」：这里立刻返回一条排队记录，
+    /// 需求已经落 Ledger，Flow 要等 Worker 回传后才出现。
+    pub fn request_planning(
+        &mut self,
+        summary: &str,
+        requester: &str,
+        planner: PlannerKind,
+        repository: Option<&str>,
+    ) -> Result<PlanningRequest> {
+        self.state.organization()?;
+        if summary.trim().is_empty() {
+            return Err(RelayError::Validation("demand cannot be empty".into()));
+        }
+        let requester_principal = self.state.principal(requester)?;
+        if requester_principal.kind != PrincipalKind::Human {
+            return Err(RelayError::PermissionDenied(
+                "a demand requester must be a registered human".into(),
+            ));
+        }
+        self.ensure_permission(&requester_principal.id, Permission::DemandCreate)?;
+        let requester_name = requester_principal.name.clone();
+
+        let repository_id = match repository {
+            Some(selector) => Some(self.state.repository(selector)?.id.clone()),
+            None => None,
+        };
+
+        let now = Utc::now();
+        let flow_id = new_id("FLOW");
+        let demand = Demand {
+            id: new_id("DEM"),
+            flow_id: flow_id.clone(),
+            requester: requester_name.clone(),
+            summary: summary.trim().to_string(),
+            created_at: now,
+        };
+        let request = PlanningRequest {
+            id: new_id("PLAN"),
+            flow_id,
+            demand: demand.clone(),
+            requester: requester_name.clone(),
+            repository_id,
+            planner: planner.to_string(),
+            prompt: planner_prompt(summary.trim(), &self.state),
+            status: PlanningStatus::Queued,
+            claimed_by: None,
+            claimed_at: None,
+            lease_expires_at: None,
+            attempt: 0,
+            error: None,
+            created_at: now,
+            settled_at: None,
+        };
+        self.commit(
+            &requester_name,
+            vec![
+                DomainEvent::DemandCreated { demand },
+                DomainEvent::PlanningRequested {
+                    request: request.clone(),
+                },
+            ],
+        )?;
+        Ok(request)
+    }
+
+    /// Worker 领取一条待拆解的请求。
+    ///
+    /// 只按执行器种类过滤，不区分 Worker 跑在哪台机器上——你的 Mac 和集群里的
+    /// Pod 领的是同一个队列。租约到期后请求会重新变得可领，避免 Worker 掉线卡死。
+    pub fn claim_planning_request(
+        &mut self,
+        request_id: &str,
+        worker: &str,
+        lease_seconds: u64,
+    ) -> Result<PlanningRequest> {
+        let worker_principal = self.state.principal(worker)?;
+        if worker_principal.kind != PrincipalKind::Agent {
+            return Err(RelayError::PermissionDenied(
+                "只有 Agent 身份可以领取规划请求".into(),
+            ));
+        }
+        let (worker_id, worker_name) = (worker_principal.id.clone(), worker_principal.name.clone());
+        let request = self.planning_request(request_id)?.clone();
+        let now = Utc::now();
+        let claimable = match request.status {
+            PlanningStatus::Queued => true,
+            // 上一个领取者失联：租约过期就允许别人接手。
+            PlanningStatus::Claimed => request
+                .lease_expires_at
+                .is_some_and(|expires| expires <= now),
+            _ => false,
+        };
+        if !claimable {
+            return Err(RelayError::InvalidTransition(format!(
+                "planning request {} is {:?}",
+                request.id, request.status
+            )));
+        }
+        let lease_expires_at = now + Duration::seconds(lease_seconds.clamp(30, 3_600) as i64);
+        self.commit(
+            &worker_name,
+            vec![DomainEvent::PlanningClaimed {
+                request_id: request.id.clone(),
+                claimed_by: worker_id,
+                claimed_at: now,
+                lease_expires_at,
+            }],
+        )?;
+        self.planning_request(&request.id).cloned()
+    }
+
+    /// Worker 回传方案，落成 Flow。
+    pub fn submit_planning_result(
+        &mut self,
+        request_id: &str,
+        plan: PlanDraft,
+        worker: &str,
+    ) -> Result<Flow> {
+        let worker_principal = self.state.principal(worker)?;
+        if worker_principal.kind != PrincipalKind::Agent {
+            return Err(RelayError::PermissionDenied(
+                "只有 Agent 身份可以回传规划结果".into(),
+            ));
+        }
+        let worker_name = worker_principal.name.clone();
+        let request = self.planning_request(request_id)?.clone();
+        if request.status != PlanningStatus::Claimed {
+            return Err(RelayError::InvalidTransition(format!(
+                "planning request {} is {:?}, expected claimed",
+                request.id, request.status
+            )));
+        }
+        // 校验放在落库之前：Worker 那边跑的是模型，回传什么都有可能。
+        let plan = validate_plan(plan)?;
+        let flow = self.land_plan(
+            plan,
+            request.demand.clone(),
+            request.flow_id.clone(),
+            request.repository_id.clone(),
+            request.planner.clone(),
+            &request.requester,
+        )?;
+        self.commit(
+            &worker_name,
+            vec![DomainEvent::PlanningSettled {
+                request_id: request.id,
+                status: PlanningStatus::Planned,
+                error: None,
+                settled_at: Utc::now(),
+            }],
+        )?;
+        Ok(flow)
+    }
+
+    /// Worker 报告拆解失败，或人工放弃。
+    pub fn fail_planning_request(
+        &mut self,
+        request_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> Result<PlanningRequest> {
+        let actor_name = self.state.principal(actor)?.name.clone();
+        let request = self.planning_request(request_id)?.clone();
+        if matches!(request.status, PlanningStatus::Planned) {
+            return Err(RelayError::InvalidTransition(format!(
+                "planning request {} already produced a flow",
+                request.id
+            )));
+        }
+        self.commit(
+            &actor_name,
+            vec![DomainEvent::PlanningSettled {
+                request_id: request.id.clone(),
+                status: PlanningStatus::Failed,
+                error: Some(reason.trim().to_string()),
+                settled_at: Utc::now(),
+            }],
+        )?;
+        self.planning_request(&request.id).cloned()
+    }
+
+    /// 保存「我自己的」模型服务配置。
+    ///
+    /// 不写事件：Ledger 删不掉东西，而密钥必须能真删除。配了主密钥就加密存，
+    /// 没配就明文存——这是部署时的取舍，代码两条路都支持。
+    pub fn set_provider_credential(
+        &mut self,
+        principal_id: &str,
+        provider: &str,
+        base_url: Option<&str>,
+        model: Option<&str>,
+        api_key: &str,
+    ) -> Result<()> {
+        let principal = self.state.principal(principal_id)?;
+        let principal_id = principal.id.clone();
+        if api_key.trim().is_empty() {
+            return Err(RelayError::Validation("API Key 不能为空".into()));
+        }
+        if let Some(url) = base_url.map(str::trim).filter(|value| !value.is_empty()) {
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|_| RelayError::Validation("baseURL 不是合法的地址".into()))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(RelayError::Validation(
+                    "baseURL 只能用 http 或 https".into(),
+                ));
+            }
+        }
+        let (nonce, secret) = match SecretBox::from_env()? {
+            Some(box_) => {
+                let (nonce, ciphertext) = box_.seal(api_key.trim())?;
+                (Some(nonce), ciphertext)
+            }
+            None => (None, api_key.trim().as_bytes().to_vec()),
+        };
+        self.store
+            .upsert_provider_credential(&ProviderCredentialRecord {
+                principal_id,
+                provider: provider.trim().to_string(),
+                base_url: base_url
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                model: model
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                nonce,
+                secret,
+                updated_at: Utc::now(),
+            })
+    }
+
+    /// 读回明文凭据。只给两个地方用：Worker 领取时下发，以及自检。
+    pub fn provider_credential(&self, principal_id: &str) -> Result<Option<ProviderCredential>> {
+        let Some(record) = self.store.provider_credential(principal_id)? else {
+            return Ok(None);
+        };
+        let api_key = match (&record.nonce, SecretBox::from_env()?) {
+            (Some(nonce), Some(box_)) => box_.open(nonce, &record.secret)?,
+            // 存的时候没加密，现在也不需要解密。
+            (None, _) => String::from_utf8(record.secret.clone())
+                .map_err(|_| RelayError::Validation("凭据不是合法的 UTF-8".into()))?,
+            // 存的是密文但主密钥没了：明确报错，不要静默当成明文。
+            (Some(_), None) => {
+                return Err(RelayError::Validation(
+                    "凭据是加密存储的，但当前没有配置 RELAY_CREDENTIAL_KEY".into(),
+                ));
+            }
+        };
+        Ok(Some(ProviderCredential {
+            provider: record.provider,
+            base_url: record.base_url,
+            model: record.model,
+            api_key,
+            updated_at: record.updated_at,
+        }))
+    }
+
+    pub fn delete_provider_credential(&mut self, principal_id: &str) -> Result<()> {
+        let principal_id = self.state.principal(principal_id)?.id.clone();
+        self.store.delete_provider_credential(&principal_id)
+    }
+
+    pub fn planning_requests(&self) -> Vec<PlanningRequest> {
+        let mut requests: Vec<_> = self.state.planning_requests.values().cloned().collect();
+        requests.sort_by_key(|request| request.created_at);
+        requests
+    }
+
+    fn planning_request(&self, id: &str) -> Result<&PlanningRequest> {
+        self.state
+            .planning_requests
+            .get(id)
+            .ok_or_else(|| RelayError::NotFound {
+                entity: "planning request",
+                id: id.to_string(),
+            })
+    }
+
+    /// 把一份已经校验过的方案落成 Flow。
+    ///
+    /// 本地拆解和 Worker 回传共用这一段：匹配负责人、排期、写 Ledger。谁生成的方案
+    /// 不影响这里，所以远程规划不需要复制一份调度逻辑。
+    fn land_plan(
+        &mut self,
+        plan: PlanDraft,
+        demand: Demand,
+        flow_id: String,
+        repository_id: Option<String>,
+        planner: String,
+        requester: &str,
+    ) -> Result<Flow> {
+        let mut matcher = Matcher::new(&self.state);
+        let mut assignments = BTreeMap::new();
+        for task in &plan.tasks {
+            assignments.insert(task.key.clone(), matcher.match_task(task)?);
+        }
+        let scheduled = schedule(&plan.tasks, &assignments, &self.state)?;
+        let now = Utc::now();
         let flow = Flow {
             repository_id: repository_id.clone(),
             id: flow_id,
@@ -432,7 +741,7 @@ impl RelayApp {
             prd: plan.prd,
             tasks: scheduled.tasks,
             status: FlowStatus::Draft,
-            planner: planner.to_string(),
+            planner,
             p50_finish: scheduled.p50_finish,
             p80_finish: scheduled.p80_finish,
             critical_path: scheduled.critical_path,
@@ -441,7 +750,7 @@ impl RelayApp {
             completed_at: None,
         };
         self.commit(
-            &requester,
+            requester,
             vec![
                 DomainEvent::DemandCreated { demand },
                 DomainEvent::PlanGenerated { flow: flow.clone() },
@@ -1983,6 +2292,7 @@ impl RelayApp {
             kind: match mode {
                 ExecutorMode::Plan => "executor-plan",
                 ExecutorMode::Execute => "executor-run",
+                ExecutorMode::Decompose => "executor-decompose",
             }
             .into(),
             uri: log_path.display().to_string(),
@@ -2435,7 +2745,9 @@ fn validate_external_artifact(artifact: &ExternalArtifact) -> Result<()> {
 
 fn task_prompt(flow: &Flow, task: &Task, mode: &ExecutorMode, requested_by: &str) -> String {
     let action = match mode {
-        ExecutorMode::Plan => {
+        // 拆解需求走的是 planning-request 那条链路，不会进到任务提示词这里；
+        // 真被用到也按只读处理最安全。
+        ExecutorMode::Plan | ExecutorMode::Decompose => {
             "Inspect the workspace read-only. Return a concrete implementation plan, risks, checks and questions. Do not modify files."
         }
         ExecutorMode::Execute => {

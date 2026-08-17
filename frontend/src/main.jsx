@@ -13,6 +13,8 @@ import NewDemand from "./pages/NewDemand.jsx";
 import Approvals from "./pages/Approvals.jsx";
 import Flows from "./pages/Flows.jsx";
 import Flights from "./pages/Flights.jsx";
+import Agents from "./pages/Agents.jsx";
+import ModelProvider from "./pages/ModelProvider.jsx";
 
 dayjs.locale("zh-cn");
 
@@ -31,6 +33,8 @@ const router = createBrowserRouter(
         { path: "approvals", element: <Approvals /> },
         { path: "flows", element: <Flows /> },
         { path: "flights", element: <Flights /> },
+        { path: "agents", element: <Agents /> },
+        { path: "settings/model", element: <ModelProvider /> },
       ],
     },
   ],

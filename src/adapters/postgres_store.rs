@@ -7,6 +7,7 @@ use postgres::Client;
 use postgres_native_tls::MakeTlsConnector;
 use serde::Serialize;
 
+use super::store::ProviderCredentialRecord;
 use crate::error::{RelayError, Result};
 use crate::event::{CURRENT_EVENT_VERSION, EventEnvelope};
 use crate::store::{ArtifactBlob, CredentialSnapshot, StorageHealth, decode_event_payload};
@@ -132,6 +133,18 @@ impl PostgresEventStore {
                  );
                  CREATE INDEX IF NOT EXISTS idx_relay_credentials_principal
                      ON relay_api_credentials(tenant_id, principal_id, revoked_at);
+                 CREATE TABLE IF NOT EXISTS relay_provider_credentials (
+                     tenant_id    TEXT NOT NULL,
+                     principal_id TEXT NOT NULL,
+                     provider     TEXT NOT NULL,
+                     base_url     TEXT,
+                     model        TEXT,
+                     -- nonce 为空表示 secret 是明文（没配 RELAY_CREDENTIAL_KEY）。
+                     nonce        BYTEA,
+                     secret       BYTEA NOT NULL,
+                     updated_at   TEXT NOT NULL,
+                     PRIMARY KEY (tenant_id, principal_id)
+                 );
                  CREATE TABLE IF NOT EXISTS relay_artifacts (
                      tenant_id  TEXT NOT NULL,
                      sha256     TEXT NOT NULL,
@@ -504,6 +517,82 @@ impl PostgresEventStore {
                 )?
             };
             rows.into_iter().map(decode_row).collect()
+        })
+    }
+
+    pub(crate) fn upsert_provider_credential(
+        &mut self,
+        record: &ProviderCredentialRecord,
+    ) -> Result<()> {
+        let tenant_id = self.tenant_id.clone();
+        let record = record.clone();
+        self.database.call(move |client| {
+            client.execute(
+                "INSERT INTO relay_provider_credentials(
+                    tenant_id, principal_id, provider, base_url, model, nonce, secret, updated_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (tenant_id, principal_id) DO UPDATE SET
+                    provider = EXCLUDED.provider,
+                    base_url = EXCLUDED.base_url,
+                    model = EXCLUDED.model,
+                    nonce = EXCLUDED.nonce,
+                    secret = EXCLUDED.secret,
+                    updated_at = EXCLUDED.updated_at",
+                &[
+                    &tenant_id,
+                    &record.principal_id,
+                    &record.provider,
+                    &record.base_url,
+                    &record.model,
+                    &record.nonce,
+                    &record.secret,
+                    &record.updated_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn provider_credential(
+        &self,
+        principal_id: &str,
+    ) -> Result<Option<ProviderCredentialRecord>> {
+        let tenant_id = self.tenant_id.clone();
+        let principal_id = principal_id.to_string();
+        self.database.call(move |client| {
+            let rows = client.query(
+                "SELECT principal_id, provider, base_url, model, nonce, secret, updated_at
+                 FROM relay_provider_credentials
+                 WHERE tenant_id = $1 AND principal_id = $2",
+                &[&tenant_id, &principal_id],
+            )?;
+            let Some(row) = rows.first() else {
+                return Ok(None);
+            };
+            let updated_at: String = row.get(6);
+            Ok(Some(ProviderCredentialRecord {
+                principal_id: row.get(0),
+                provider: row.get(1),
+                base_url: row.get(2),
+                model: row.get(3),
+                nonce: row.get(4),
+                secret: row.get(5),
+                updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                    .map_err(|error| RelayError::Validation(error.to_string()))?
+                    .with_timezone(&Utc),
+            }))
+        })
+    }
+
+    pub(crate) fn delete_provider_credential(&mut self, principal_id: &str) -> Result<()> {
+        let tenant_id = self.tenant_id.clone();
+        let principal_id = principal_id.to_string();
+        self.database.call(move |client| {
+            client.execute(
+                "DELETE FROM relay_provider_credentials WHERE tenant_id = $1 AND principal_id = $2",
+                &[&tenant_id, &principal_id],
+            )?;
+            Ok(())
         })
     }
 

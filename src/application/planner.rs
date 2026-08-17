@@ -107,13 +107,39 @@ async fn model_plan(
         .min_by(|(left, _), (right, _)| left.name.cmp(&right.name));
     let command = executor.and_then(|(_, config)| config.command.clone());
     let model = executor.and_then(|(_, config)| config.model.clone());
+    run_plan_executor(
+        kind,
+        command,
+        model,
+        prompt,
+        workspace,
+        log_path,
+        timeout_seconds,
+    )
+    .await
+}
+
+/// 用指定执行器跑一次拆解，产出 PlanDraft。
+///
+/// 控制面（本地拆解）和 Worker（远程拆解）都走这里：前者从组织状态里查执行器配置，
+/// 后者用自己启动参数里的配置。JSON Schema 两边都由同一个 PlanDraft 生成，
+/// 所以回传的结构必然对得上。
+pub(crate) async fn run_plan_executor(
+    kind: ExecutorKind,
+    command: Option<PathBuf>,
+    model: Option<String>,
+    prompt: String,
+    workspace: &Path,
+    log_path: PathBuf,
+    timeout_seconds: u64,
+) -> Result<PlanDraft> {
     let schema = serde_json::to_value(schema_for!(PlanDraft))?;
     let output = TerminalExecutor::run(ExecutionRequest {
         kind,
         command,
         workspace: workspace.to_path_buf(),
         model,
-        mode: ExecutorMode::Plan,
+        mode: ExecutorMode::Decompose,
         prompt,
         output_schema: Some(schema),
         timeout_seconds,
@@ -127,7 +153,7 @@ async fn model_plan(
     )?)
 }
 
-fn planner_prompt(demand: &str, state: &OrganizationState) -> String {
+pub(crate) fn planner_prompt(demand: &str, state: &OrganizationState) -> String {
     let teams = state
         .teams
         .values()
@@ -414,7 +440,7 @@ fn task(
     }
 }
 
-fn validate_plan(mut plan: PlanDraft) -> Result<PlanDraft> {
+pub(crate) fn validate_plan(mut plan: PlanDraft) -> Result<PlanDraft> {
     if plan.prd.title.trim().is_empty() || plan.prd.acceptance_criteria.is_empty() {
         return Err(RelayError::Validation(
             "PRD title and acceptance criteria are required".into(),

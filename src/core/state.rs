@@ -7,9 +7,10 @@ use crate::domain::{
     FlightLease, FlightLeaseStatus, FlightRecoveryDecision, Flow, FlowChangeRequest,
     FlowChangeStatus, FlowMessage, FlowScheduleRevision, FlowStatus, GitLabWriteRequest,
     GitLabWriteStatus, NotificationDelivery, NotificationEndpoint, NotificationStatus,
-    OfficeReleaseRequest, OfficeReleaseStatus, Organization, OrganizationRole, Principal,
-    PrincipalKind, Repository, ResourceLease, ResourceLeaseStatus, RoleBinding, StagedArtifact,
-    TargetKind, TaskStatus, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
+    OfficeReleaseRequest, OfficeReleaseStatus, Organization, OrganizationRole, PlanningRequest,
+    PlanningStatus, Principal, PrincipalKind, Repository, ResourceLease, ResourceLeaseStatus,
+    RoleBinding, StagedArtifact, TargetKind, TaskStatus, Team, Tenant, TrackingAttention,
+    TrackingEscalation, WorkCalendar,
 };
 use crate::error::{RelayError, Result};
 use crate::event::{DomainEvent, EventEnvelope};
@@ -20,6 +21,7 @@ pub struct OrganizationState {
     pub organization: Option<Organization>,
     pub teams: BTreeMap<String, Team>,
     pub repositories: BTreeMap<String, Repository>,
+    pub planning_requests: BTreeMap<String, PlanningRequest>,
     pub principals: BTreeMap<String, Principal>,
     pub external_identities: BTreeMap<String, ExternalIdentityBinding>,
     pub external_interactions: BTreeMap<String, ExternalInteractionReceipt>,
@@ -84,6 +86,37 @@ impl OrganizationState {
             DomainEvent::RepositoryRegistered { repository } => {
                 self.repositories
                     .insert(repository.id.clone(), repository.clone());
+            }
+            DomainEvent::PlanningRequested { request } => {
+                self.planning_requests
+                    .insert(request.id.clone(), request.clone());
+            }
+            DomainEvent::PlanningClaimed {
+                request_id,
+                claimed_by,
+                claimed_at,
+                lease_expires_at,
+            } => {
+                if let Some(request) = self.planning_requests.get_mut(request_id) {
+                    request.status = PlanningStatus::Claimed;
+                    request.claimed_by = Some(claimed_by.clone());
+                    request.claimed_at = Some(*claimed_at);
+                    request.lease_expires_at = Some(*lease_expires_at);
+                    request.attempt += 1;
+                }
+            }
+            DomainEvent::PlanningSettled {
+                request_id,
+                status,
+                error,
+                settled_at,
+            } => {
+                if let Some(request) = self.planning_requests.get_mut(request_id) {
+                    request.status = *status;
+                    request.error = error.clone();
+                    request.settled_at = Some(*settled_at);
+                    request.lease_expires_at = None;
+                }
             }
             DomainEvent::RepositoryArchived { repository_id, .. } => {
                 if let Some(repository) = self.repositories.get_mut(repository_id) {

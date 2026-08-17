@@ -13,6 +13,8 @@ export default function NewDemand() {
   // 生成完直接把方案摊开在这一页——之前点完按钮什么都看不到，
   // 结果其实躺在另一个区块里。
   const [plan, setPlan] = useState(null);
+  // 需要模型的拆解不在控制面里跑，会先排队等 Worker 领走。
+  const [queued, setQueued] = useState(null);
 
   useEffect(() => {
     api.repositories().then(setRepositories).catch(() => {});
@@ -22,15 +24,21 @@ export default function NewDemand() {
     setBusy(true);
     setError("");
     setPlan(null);
+    setQueued(null);
     try {
-      const flow = await api.createDemand({
+      const result = await api.createDemand({
         summary: values.summary.trim(),
         planner: values.planner,
         timeout_seconds: 300,
         ...(values.repository ? { repository: values.repository } : {}),
       });
-      setPlan(flow);
-      message.success("方案已生成");
+      if (result.planning_request) {
+        setQueued(result.planning_request);
+        message.info("已排队，等 Worker 领走");
+      } else {
+        setPlan(result.flow);
+        message.success("方案已生成");
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -74,9 +82,9 @@ export default function NewDemand() {
           <Form.Item name="planner" label="谁来拆解">
             <Select
               options={[
-                { value: "local", label: "按模板（控制面直接生成）" },
-                { value: "claude_code", label: "Claude Code（需要 Worker 在线）" },
-                { value: "codex", label: "Codex（需要 Worker 在线）" },
+                { value: "local", label: "按模板（控制面直接生成，立刻出结果）" },
+                { value: "claude_code", label: "Claude Code（排队，等 Worker 领走）" },
+                { value: "codex", label: "Codex（排队，等 Worker 领走）" },
               ]}
             />
           </Form.Item>
@@ -85,6 +93,21 @@ export default function NewDemand() {
           </Button>
         </Form>
       </Card>
+
+      {queued && (
+        <Card size="small" title="已排队" style={{ marginTop: 16 }}>
+          <Alert
+            type="info"
+            showIcon
+            message={`${queued.id} 正在等待 ${queued.planner} 拆解`}
+            description="控制面不跑模型，这条请求要由 Worker 领走执行。Worker 没在线的话会一直排队——去「Agent」页看有没有在线的执行器。"
+          />
+          <Descriptions size="small" column={2} style={{ marginTop: 12 }}>
+            <Descriptions.Item label="Flow">{queued.flow_id}</Descriptions.Item>
+            <Descriptions.Item label="状态">{queued.status}</Descriptions.Item>
+          </Descriptions>
+        </Card>
+      )}
 
       {plan && (
         <Card

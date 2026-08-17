@@ -3586,7 +3586,7 @@ fn composer_meta(purpose: &InputPurpose) -> (&'static str, String, Color) {
         InputPurpose::Run { mode, .. } => (
             "执行放行 CLEARANCE",
             match mode {
-                ExecutorMode::Plan => {
+                ExecutorMode::Plan | ExecutorMode::Decompose => {
                     "只读规划会调用已分配终端并产生模型费用；输入 PASS 放行".into()
                 }
                 ExecutorMode::Execute => {
@@ -3594,7 +3594,7 @@ fn composer_meta(purpose: &InputPurpose) -> (&'static str, String, Color) {
                 }
             },
             match mode {
-                ExecutorMode::Plan => CYAN,
+                ExecutorMode::Plan | ExecutorMode::Decompose => CYAN,
                 ExecutorMode::Execute => ORANGE,
             },
         ),
@@ -3887,7 +3887,7 @@ fn planner_color(planner: PlannerKind) -> Color {
 
 fn confirmation_token(mode: &ExecutorMode) -> &'static str {
     match mode {
-        ExecutorMode::Plan => "PASS",
+        ExecutorMode::Plan | ExecutorMode::Decompose => "PASS",
         ExecutorMode::Execute => "RELAY",
     }
 }
@@ -3895,6 +3895,7 @@ fn confirmation_token(mode: &ExecutorMode) -> &'static str {
 fn executor_mode_label(mode: &ExecutorMode) -> &'static str {
     match mode {
         ExecutorMode::Plan => "PLAN",
+        ExecutorMode::Decompose => "DECOMPOSE",
         ExecutorMode::Execute => "EXECUTE",
     }
 }

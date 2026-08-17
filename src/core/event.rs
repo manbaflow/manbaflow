@@ -7,8 +7,9 @@ use crate::domain::{
     FlightLease, FlightRecoveryDecision, Flow, FlowChangeRequest, FlowMessage,
     FlowScheduleRevision, GitLabWriteRequest, GitLabWriteResult, MessageAcknowledgement,
     NotificationDelivery, NotificationEndpoint, OfficeReleaseRequest, OfficeReleaseResult,
-    Organization, PrdDraft, Principal, RemoteFlightReport, Repository, ResourceLease, RoleBinding,
-    StagedArtifact, Task, Team, Tenant, TrackingAttention, TrackingEscalation, WorkCalendar,
+    Organization, PlanningRequest, PlanningStatus, PrdDraft, Principal, RemoteFlightReport,
+    Repository, ResourceLease, RoleBinding, StagedArtifact, Task, Team, Tenant, TrackingAttention,
+    TrackingEscalation, WorkCalendar,
 };
 
 pub const CURRENT_EVENT_VERSION: u16 = 2;
@@ -31,6 +32,21 @@ pub enum DomainEvent {
     },
     RepositoryRegistered {
         repository: Repository,
+    },
+    PlanningRequested {
+        request: PlanningRequest,
+    },
+    PlanningClaimed {
+        request_id: String,
+        claimed_by: String,
+        claimed_at: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    },
+    PlanningSettled {
+        request_id: String,
+        status: PlanningStatus,
+        error: Option<String>,
+        settled_at: DateTime<Utc>,
     },
     RepositoryArchived {
         repository_id: String,
@@ -465,6 +481,9 @@ impl DomainEvent {
             Self::OrganizationInitialized { .. } => "organization.initialized",
             Self::TeamCreated { .. } => "team.created",
             Self::RepositoryRegistered { .. } => "repository.registered",
+            Self::PlanningRequested { .. } => "planning.requested",
+            Self::PlanningClaimed { .. } => "planning.claimed",
+            Self::PlanningSettled { .. } => "planning.settled",
             Self::RepositoryArchived { .. } => "repository.archived",
             Self::TeamDirectoryUpdated { .. } => "team.directory_updated",
             Self::PrincipalRegistered { .. } => "principal.registered",
@@ -567,6 +586,9 @@ impl DomainEvent {
         match self {
             Self::DemandCreated { demand } => Some(&demand.flow_id),
             Self::PlanGenerated { flow } => Some(&flow.id),
+            // 排队中的规划已经占好了 Flow ID，这样界面能顺着同一个 ID 追下去。
+            Self::PlanningRequested { request } => Some(&request.flow_id),
+            Self::PlanningClaimed { .. } | Self::PlanningSettled { .. } => None,
             Self::FlowApproved { flow_id, .. }
             | Self::WorkRequestSent { flow_id, .. }
             | Self::FlowMessageAcknowledged { flow_id, .. }
