@@ -879,6 +879,7 @@ fn router_with_identity(app: Arc<Mutex<RelayApp>>, integrations: ServerIntegrati
         .route("/scim/v2/ResourceTypes", get(scim_resource_types))
         .route("/scim/v2/Schemas", get(scim_schemas))
         .route("/metrics", get(metrics))
+        .route("/api/v1/auth/methods", get(auth_methods))
         .route("/api/v1/me", get(me))
         .route("/api/v1/organization", get(organization))
         .route("/api/v1/teams", get(teams).post(create_team))
@@ -1800,6 +1801,15 @@ async fn metrics(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult
         body,
     )
         .into_response())
+}
+
+/// 本部署配置了哪些登录方式。故意不鉴权：登录页在拿到身份之前就要用它决定
+/// 显示哪些按钮。只暴露布尔值，不泄露 App ID、Issuer 这类配置细节。
+async fn auth_methods(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    Json(json!({
+        "feishu": state.feishu.is_some(),
+        "oidc": state.oidc.is_some(),
+    }))
 }
 
 async fn me(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Json<Principal>> {

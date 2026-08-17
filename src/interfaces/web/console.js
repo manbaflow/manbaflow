@@ -528,6 +528,22 @@ function startLogin(path) {
 $("#feishu-login").addEventListener("click", () => startLogin("/auth/feishu/login"));
 $("#oidc-login").addEventListener("click", () => startLogin("/auth/oidc/login"));
 
+// 只显示本部署真正配置了的登录方式。默认全部隐藏：探测失败时留下令牌登录这条
+// 一定可用的路，也好过给出一个点了就报错的按钮。
+async function detectLoginMethods() {
+  try {
+    const response = await fetch("/api/v1/auth/methods");
+    if (!response.ok) return;
+    const methods = await response.json();
+    $("#feishu-block").hidden = !methods.feishu;
+    $("#oidc-block").hidden = !methods.oidc;
+    $("#auth-divider").hidden = !(methods.feishu || methods.oidc);
+  } catch {
+    /* 探测失败就维持隐藏，令牌登录不受影响 */
+  }
+}
+detectLoginMethods();
+
 $("#refresh").addEventListener("click", () => loadDashboard());
 $("#logout").addEventListener("click", async () => {
   await fetch("/auth/logout", { method: "POST" });

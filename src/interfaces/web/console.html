@@ -85,11 +85,18 @@
 
   <dialog id="auth-dialog">
     <form id="auth-form" method="dialog" class="dialog-form">
-      <p class="eyebrow">登录</p><h2>进入 Relay</h2>
-      <button id="feishu-login" type="button" class="primary">用飞书登录</button>
-      <p class="dialog-note">本企业员工首次登录自动开通账号，无需管理员预先添加。</p>
-      <label><span>租户 ID（企业 SSO 可选填）</span><input id="sso-tenant" autocomplete="organization" placeholder="TEN-xxxxxxxx"></label>
-      <button id="oidc-login" type="button">企业 SSO</button>
+      <div><p class="eyebrow">登录</p><h2>进入 Relay</h2></div>
+      <!-- 这两块由 /api/v1/auth/methods 决定是否显示：没配置就不该出现在界面上，
+           否则点下去只会甩一个 JSON 错误给用户。 -->
+      <div id="feishu-block" hidden>
+        <button id="feishu-login" type="button" class="primary" style="width:100%">用飞书登录</button>
+        <p class="dialog-note">本企业员工首次登录自动开通账号，无需管理员预先添加。</p>
+      </div>
+      <div id="oidc-block" hidden>
+        <label><span>租户 ID（可选填）</span><input id="sso-tenant" autocomplete="organization" placeholder="TEN-xxxxxxxx"></label>
+        <button id="oidc-login" type="button" style="width:100%">企业 SSO</button>
+      </div>
+      <p id="auth-divider" class="divider" hidden>或</p>
       <label><span>接入令牌</span><input id="token" type="password" autocomplete="off" required placeholder="rly_..."></label>
       <p class="dialog-note">令牌只保留在当前浏览器标签页，适合 Agent 与自动化使用。</p>
       <button type="submit">用令牌进入</button>
