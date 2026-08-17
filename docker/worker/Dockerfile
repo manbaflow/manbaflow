@@ -18,12 +18,23 @@ ARG CLAUDE_CODE_VERSION=2.1.208
 ARG OCI_REVISION=unknown
 LABEL org.opencontainers.image.revision=$OCI_REVISION
 
-RUN apt-get update \
+# 官方 node 镜像的 apt/npm 源都在境外，从国内构建慢到不可用——实测装 perl
+# 一个包就花了 20 分钟。内网的基础镜像本来改过源，换成官方镜像就丢了这层优化，
+# 所以这里自己参数化。境外构建把这两个 ARG 留空即可。
+ARG APT_MIRROR=deb.debian.org
+ARG NPM_REGISTRY=https://registry.npmjs.org/
+
+RUN if [ "${APT_MIRROR}" != "deb.debian.org" ]; then \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         bash ca-certificates curl git jq python3 ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install --global \
+RUN npm config set registry "${NPM_REGISTRY}" \
+    && npm install --global \
         "@openai/codex@${CODEX_VERSION}" \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force \
