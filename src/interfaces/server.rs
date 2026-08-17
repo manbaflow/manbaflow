@@ -240,6 +240,7 @@ struct OrganizationView {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateRepositoryInput {
     /// GitLab 上的完整路径，例如 acme/web-app
     gitlab_project_path: String,
@@ -255,6 +256,7 @@ struct CreateRepositoryInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateTeamInput {
     name: String,
     #[serde(default)]
@@ -262,6 +264,7 @@ struct CreateTeamInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreatePrincipalInput {
     name: String,
     kind: PrincipalKind,
@@ -276,11 +279,13 @@ struct CreatePrincipalInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GrantRoleInput {
     role: OrganizationRole,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IssueCredentialInput {
     label: String,
     #[serde(default = "default_credential_ttl_days")]
@@ -288,6 +293,7 @@ struct IssueCredentialInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateDemandInput {
     summary: String,
     /// 这条需求在哪个代码仓库上做（ID 或名称）
@@ -300,17 +306,20 @@ struct CreateDemandInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HeartbeatInput {
     #[serde(default)]
     note: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BlockInput {
     reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EvidenceInput {
     kind: String,
     uri: String,
@@ -318,11 +327,13 @@ struct EvidenceInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NegotiateInput {
     effort_hours: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReassignInput {
     owner: String,
     #[serde(default)]
@@ -331,16 +342,19 @@ struct ReassignInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProposeFlowChangeInput {
     summary: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RejectFlowChangeInput {
     reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigureCalendarInput {
     utc_offset_minutes: i32,
     working_days: Vec<Workday>,
@@ -349,6 +363,7 @@ struct ConfigureCalendarInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TimeOffInput {
     starts_at: DateTime<Utc>,
     ends_at: DateTime<Utc>,
@@ -356,6 +371,7 @@ struct TimeOffInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DispatchNotificationsInput {
     #[serde(default = "default_notification_dispatch_limit")]
     limit: usize,
@@ -412,6 +428,7 @@ impl From<&NotificationEndpoint> for NotificationEndpointView {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PostMessageInput {
     #[serde(default)]
     task_id: Option<String>,
@@ -423,6 +440,7 @@ struct PostMessageInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuthorizeFlightInput {
     agent: String,
     executor: ExecutorKind,
@@ -433,11 +451,13 @@ struct AuthorizeFlightInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClaimFlightInput {
     run_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FinishFlightInput {
     landed: bool,
     report: RemoteFlightReport,
@@ -449,6 +469,7 @@ struct StageArtifactQuery {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecoverFlightInput {
     action: RecoveryAction,
     reason: String,
@@ -489,6 +510,7 @@ struct OfficeReleasesQuery {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RequestOfficeReleaseInput {
     task_id: String,
     provider: OfficeProvider,
@@ -496,6 +518,7 @@ struct RequestOfficeReleaseInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RejectOfficeReleaseInput {
     reason: String,
 }
@@ -507,12 +530,14 @@ struct GitLabWritesQuery {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RequestGitLabWriteInput {
     task_id: String,
     payload: GitLabWritePayload,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RejectGitLabWriteInput {
     reason: String,
 }
