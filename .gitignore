@@ -6,3 +6,7 @@
 /backups/
 /deploy/secrets/
 /deploy/.remote-install.env
+
+# 前端依赖。构建产物（src/interfaces/web/{index.html,assets/}）**要**提交：
+# 控制面用 include_str! 编译期嵌入，不提交的话没装 Node 的人构建不了。
+/frontend/node_modules/

@@ -842,12 +842,10 @@ fn router_with_identity(app: Arc<Mutex<RelayApp>>, integrations: ServerIntegrati
     Router::new()
         .route("/", get(root))
         .route("/console", get(crate::console::index))
-        .route("/console/", get(root))
-        .route(
-            "/console/assets/console.css",
-            get(crate::console::stylesheet),
-        )
-        .route("/console/assets/console.js", get(crate::console::script))
+        .route("/console/assets/app.js", get(crate::console::script))
+        // Console 是单页应用，路由在浏览器里：/console/repositories 这类地址
+        // 直接刷新时服务端必须回同一个 index.html，否则就是 404。
+        .route("/console/{*path}", get(crate::console::index))
         .route("/health", get(health))
         .route("/health/live", get(health))
         .route("/health/ready", get(readiness))
@@ -3366,7 +3364,7 @@ mod tests {
         assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         // 直接打开域名根路径的人最多，别让他们撞上 404。
-        for uri in ["/", "/console/"] {
+        for uri in ["/"] {
             let landing = service
                 .clone()
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -3392,13 +3390,14 @@ mod tests {
         let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
         // 断言页面骨架而不是某句文案——文案会随可读性调整而变。
         let page_html = String::from_utf8_lossy(&body);
-        assert!(page_html.contains("/console/assets/console.js"));
-        assert!(page_html.contains("id=\"demand-form\""));
+        // 断言 SPA 的挂载点与入口脚本，不断言具体文案——前端产物是构建出来的。
+        assert!(page_html.contains("/console/assets/app.js"));
+        assert!(page_html.contains("id=\"root\""));
 
         let script = service
             .oneshot(
                 Request::builder()
-                    .uri("/console/assets/console.js")
+                    .uri("/console/assets/app.js")
                     .body(Body::empty())
                     .unwrap(),
             )
