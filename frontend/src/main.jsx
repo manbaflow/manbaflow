@@ -16,6 +16,7 @@ import Flights from "./pages/Flights.jsx";
 import Agents from "./pages/Agents.jsx";
 import ModelProvider from "./pages/ModelProvider.jsx";
 import FlowDetail from "./pages/FlowDetail.jsx";
+import Inbox from "./pages/Inbox.jsx";
 
 dayjs.locale("zh-cn");
 
@@ -29,6 +30,7 @@ const router = createBrowserRouter(
       children: [
         { index: true, element: <Navigate to="overview" replace /> },
         { path: "overview", element: <Overview /> },
+        { path: "inbox", element: <Inbox /> },
         { path: "repositories", element: <Repositories /> },
         { path: "demands/new", element: <NewDemand /> },
         { path: "approvals", element: <Approvals /> },

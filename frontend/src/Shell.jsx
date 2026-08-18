@@ -10,6 +10,7 @@ import {
   RocketOutlined,
   RobotOutlined,
   KeyOutlined,
+  InboxOutlined,
 } from "@ant-design/icons";
 
 import { api, auth } from "./api.js";
@@ -19,6 +20,7 @@ const { Sider, Header, Content } = Layout;
 
 const NAV = [
   { key: "overview", icon: <DashboardOutlined />, label: "概览" },
+  { key: "inbox", icon: <InboxOutlined />, label: "我的任务" },
   { key: "repositories", icon: <DatabaseOutlined />, label: "代码仓库" },
   { key: "demands/new", icon: <PlusCircleOutlined />, label: "提交需求" },
   { key: "approvals", icon: <CheckSquareOutlined />, label: "待确认" },
