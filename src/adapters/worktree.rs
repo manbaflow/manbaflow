@@ -4,6 +4,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
 use crate::error::{RelayError, Result};
 
 #[derive(Clone, Debug)]
@@ -167,6 +170,10 @@ impl IsolatedWorktree {
     /// 认证走临时的 `http.extraHeader`，不写进 remote URL——URL 会进 reflog、
     /// 进 `git remote -v`、也可能被别的进程看到，令牌放那里等于泄露。
     ///
+    /// 用 Basic 而不是 `PRIVATE-TOKEN`：后者只对 GitLab 的 REST API 有效，
+    /// git 的 HTTP 传输走的是标准 Basic 认证，用错了会退化成交互式询问用户名，
+    /// 在容器里就是 `could not read Username`。
+    ///
     /// 分支名由调用方给（约定 `relay/<任务ID>`）。用 `--force-with-lease` 之外
     /// 的普通推送：同名分支已存在说明上一次执行的结果还在，不该悄悄覆盖。
     pub fn publish(
@@ -196,7 +203,8 @@ impl IsolatedWorktree {
             ],
         )?;
         let commit = git_text(&self.root, &["rev-parse", "HEAD"])?;
-        let auth_header = format!("http.extraHeader=PRIVATE-TOKEN: {token}");
+        let credentials = BASE64.encode(format!("relay:{token}"));
+        let auth_header = format!("http.extraHeader=Authorization: Basic {credentials}");
         let refspec = format!("HEAD:refs/heads/{branch}");
         let mut args: Vec<&str> = vec!["-c", &auth_header, "push"];
         // push option 建 MR 只需要 write_repository；走 API 建则要 api scope。
