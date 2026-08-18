@@ -55,6 +55,43 @@ struct ExecutorLog {
 
 pub struct TerminalExecutor;
 
+/// 把 schemars 生成的 2020-12 Schema 降级成 draft-07。
+///
+/// Claude Code 的 `--json-schema` 用的校验器只认 draft-07：直接递 2020-12 的
+/// Schema 会报 `no schema with key or ref "https://json-schema.org/draft/2020-12/schema"`，
+/// 整次执行随之失败。
+///
+/// 两处差异要处理：顶层的 `$schema` 声明，以及 `$defs`（draft-07 里叫
+/// `definitions`，`$ref` 路径要跟着改）。其余关键字两个草案兼容。
+fn to_draft07(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("$schema");
+        if let Some(defs) = object.remove("$defs") {
+            object.insert("definitions".into(), defs);
+        }
+    }
+    rewrite_defs_refs(&mut schema);
+    schema
+}
+
+fn rewrite_defs_refs(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get_mut("$ref") {
+                if let Some(rest) = reference.strip_prefix("#/$defs/") {
+                    *reference = format!("#/definitions/{rest}");
+                }
+            }
+            for nested in map.values_mut() {
+                rewrite_defs_refs(nested);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(rewrite_defs_refs),
+        _ => {}
+    }
+}
+
 impl TerminalExecutor {
     pub async fn run(request: ExecutionRequest) -> Result<ExecutionOutput> {
         Self::run_inner(request, None).await
@@ -229,7 +266,7 @@ fn build_command(
             if let Some(schema) = &request.output_schema {
                 command
                     .arg("--json-schema")
-                    .arg(serde_json::to_string(schema)?);
+                    .arg(serde_json::to_string(&to_draft07(schema))?);
             }
             Ok(BuiltCommand {
                 command,
@@ -605,5 +642,29 @@ printf '%s\n' '{{"thread_id":"docker-thread"}}'
         assert!(args.contains("--network\nnone"));
         assert!(args.contains("readonly"));
         assert!(args.contains(&format!("sha256:{}", "a".repeat(64))));
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use crate::domain::PlanDraft;
+    use schemars::schema_for;
+
+    #[test]
+    fn plan_schema_is_downgraded_to_draft07() {
+        let raw = serde_json::to_value(schema_for!(PlanDraft)).unwrap();
+        // schemars 1.x 默认产出 2020-12，正是 Claude Code 认不了的那版。
+        assert!(raw.get("$schema").is_some());
+
+        let converted = to_draft07(&raw);
+        assert!(converted.get("$schema").is_none(), "$schema 必须去掉");
+        assert!(converted.get("$defs").is_none(), "draft-07 用 definitions");
+        assert!(converted.get("definitions").is_some());
+
+        // 引用路径必须跟着改，否则 $ref 会指向一个不存在的位置。
+        let dumped = serde_json::to_string(&converted).unwrap();
+        assert!(!dumped.contains("#/$defs/"), "残留的 $defs 引用会解析失败");
+        assert!(dumped.contains("#/definitions/"));
     }
 }
