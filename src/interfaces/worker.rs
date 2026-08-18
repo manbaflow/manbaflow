@@ -225,7 +225,20 @@ impl RemoteWorker {
         );
         let branch = format!("relay/{}", lease.task_id);
         let message = format!("relay: {} ({})", lease.task_id, lease.flow_id);
-        worktree.publish(&branch, &remote, token.trim(), &message)
+        // 推送的同时开 MR：GitLab 的 push option 只要 write_repository 权限，
+        // 走 API 建 MR 则要 api scope。让 Worker 的令牌停在"只能推这个仓库"
+        // 这一层，被拿到也做不了别的事。
+        //
+        // 开成 Draft：Relay 的产出要人看过才该合并，草稿状态能挡住手滑点合并。
+        let push_options = vec![
+            "merge_request.create".to_string(),
+            format!("merge_request.target={}", repository.branch),
+            format!("merge_request.title=Draft: relay {}", lease.task_id),
+            "merge_request.draft".to_string(),
+            "merge_request.label=relay".to_string(),
+            "merge_request.remove_source_branch".to_string(),
+        ];
+        worktree.publish(&branch, &remote, token.trim(), &message, &push_options)
     }
 
     async fn run_decompose_once(&self) -> Result<WorkerOutcome> {
@@ -728,6 +741,17 @@ impl RemoteWorker {
                 }
             }
         }
+        // 分支和 MR 是人验收时最先要看的东西，写进摘要，界面上就能直接看到。
+        if let Some(published) = &published_branch {
+            summary = truncate(
+                &format!(
+                    "{summary}；已推送分支 {}（{}），MR 已按草稿创建",
+                    published.branch,
+                    &published.commit[..published.commit.len().min(8)]
+                ),
+                4_000,
+            );
+        }
         if !log_path.is_file() {
             write_setup_blackbox(&log_path, &run_id, &RelayError::Validation(summary.clone()))?;
         }
@@ -765,18 +789,6 @@ impl RemoteWorker {
                 report: report.clone(),
             })?,
         )?;
-        // 分支推上去了就顺手发起 MR 创建请求。它不会立刻写 GitLab——
-        // 写入网关的设计是等人在 Console 里放行，这里只是把请求排上。
-        if let Some(published) = &published_branch
-            && let Some(repository) = lease.manifest.as_ref().and_then(|m| m.repository.as_ref())
-            && let Err(error) = self
-                .control_plane
-                .request_merge_request(&lease.task_id, repository, published)
-                .await
-        {
-            eprintln!("MR 创建请求发起失败（分支已推送）：{error}");
-        }
-
         let finished = self
             .control_plane
             .finish_flight(&lease.id, landed, &report)
@@ -902,37 +914,6 @@ impl ControlPlaneClient {
             Method::POST,
             &["planning-requests", id, "submit"],
             Some(json!({ "plan": plan })),
-        )
-        .await
-    }
-
-    /// 请求创建 MR。落成一条待放行的写入请求，不直接改 GitLab。
-    async fn request_merge_request(
-        &self,
-        task_id: &str,
-        repository: &crate::domain::RepositoryRef,
-        published: &crate::worktree::PublishedBranch,
-    ) -> Result<serde_json::Value> {
-        self.request(
-            Method::POST,
-            &["gitlab", "writes"],
-            Some(json!({
-                "task_id": task_id,
-                "payload": {
-                    "kind": "create_merge_request",
-                    "project": repository.gitlab_project_path,
-                    "source_branch": published.branch,
-                    "target_branch": repository.branch,
-                    "title": format!("relay: {task_id}"),
-                    "description": format!(
-                        "由 Relay 执行 {task_id} 产生。\n\n提交：{}",
-                        published.commit
-                    ),
-                    "labels": ["relay"],
-                    "remove_source_branch": true,
-                    "draft": true
-                }
-            })),
         )
         .await
     }

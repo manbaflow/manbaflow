@@ -175,6 +175,7 @@ impl IsolatedWorktree {
         remote_url: &str,
         token: &str,
         message: &str,
+        push_options: &[String],
     ) -> Result<Option<PublishedBranch>> {
         git_ok(&self.root, &["add", "-A"])?;
         let staged = git_output(&self.root, &["diff", "--cached", "--name-only"])?.stdout;
@@ -196,16 +197,18 @@ impl IsolatedWorktree {
         )?;
         let commit = git_text(&self.root, &["rev-parse", "HEAD"])?;
         let auth_header = format!("http.extraHeader=PRIVATE-TOKEN: {token}");
-        git_ok(
-            &self.root,
-            &[
-                "-c",
-                &auth_header,
-                "push",
-                remote_url,
-                &format!("HEAD:refs/heads/{branch}"),
-            ],
-        )?;
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        let mut args: Vec<&str> = vec!["-c", &auth_header, "push"];
+        // push option 建 MR 只需要 write_repository；走 API 建则要 api scope。
+        // 用前者可以让 Worker 的令牌保持在"只能推这个仓库"的最小权限上。
+        let option_args: Vec<String> = push_options
+            .iter()
+            .flat_map(|option| ["-o".to_string(), option.clone()])
+            .collect();
+        args.extend(option_args.iter().map(String::as_str));
+        args.push(remote_url);
+        args.push(&refspec);
+        git_ok(&self.root, &args)?;
         Ok(Some(PublishedBranch {
             branch: branch.to_string(),
             commit,
@@ -311,6 +314,7 @@ mod tests {
                 remote.to_str().unwrap(),
                 "unused-for-local-remote",
                 "relay: TSK-1",
+                &[],
             )
             .unwrap()
             .expect("有改动就应该产出分支");
@@ -347,7 +351,13 @@ mod tests {
         // 一行没改：不该推一个空分支出去。
         assert!(
             worktree
-                .publish("relay/TSK-2", remote.to_str().unwrap(), "t", "relay: TSK-2")
+                .publish(
+                    "relay/TSK-2",
+                    remote.to_str().unwrap(),
+                    "t",
+                    "relay: TSK-2",
+                    &[]
+                )
                 .unwrap()
                 .is_none()
         );
