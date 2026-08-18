@@ -17,6 +17,7 @@ import {
 } from "antd";
 
 import { api } from "../api.js";
+import Conversation from "../components/Conversation.jsx";
 
 const TASK_STATUS = {
   pending: { text: "未开始", color: "default" },
@@ -174,6 +175,8 @@ export default function FlowDetail() {
           ]}
         />
       </Card>
+
+      <Conversation flowId={flow.id} tasks={tasks} />
 
       <Button style={{ marginTop: 16 }} onClick={() => navigate(-1)}>
         返回

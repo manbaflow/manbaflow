@@ -62,6 +62,10 @@ export const api = {
   planningRequests: () => get("/planning-requests"),
   failPlanning: (id, reason) => post(`/planning-requests/${encodeURIComponent(id)}/fail`, { reason }),
   flow: (id) => get(`/flows/${encodeURIComponent(id)}`),
+  flowMessages: (id) => get(`/flows/${encodeURIComponent(id)}/messages`),
+  postMessage: (id, payload) => post(`/flows/${encodeURIComponent(id)}/messages`, payload),
+  ackMessage: (id) => post(`/messages/${encodeURIComponent(id)}/ack`),
+  principalsList: () => get("/principals"),
   approveFlow: (id) => post(`/flows/${encodeURIComponent(id)}/approve`),
 
   authorizeFlight: (taskId, payload) =>
