@@ -78,10 +78,10 @@ fn to_draft07(schema: &Value) -> Value {
 fn rewrite_defs_refs(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            if let Some(Value::String(reference)) = map.get_mut("$ref") {
-                if let Some(rest) = reference.strip_prefix("#/$defs/") {
-                    *reference = format!("#/definitions/{rest}");
-                }
+            if let Some(Value::String(reference)) = map.get_mut("$ref")
+                && let Some(rest) = reference.strip_prefix("#/$defs/")
+            {
+                *reference = format!("#/definitions/{rest}");
             }
             for nested in map.values_mut() {
                 rewrite_defs_refs(nested);
