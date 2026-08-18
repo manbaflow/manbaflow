@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Alert, Progress, Table, Tag, Typography } from "antd";
+import { Link } from "react-router-dom";
 
 import { api } from "../api.js";
 
@@ -33,7 +34,10 @@ export default function Flows() {
             dataIndex: "health",
             render: (value) => <Tag color={HEALTH[value] || "default"}>{value}</Tag>,
           },
-          { title: "需求", dataIndex: "title" },
+          {
+            title: "需求",
+            render: (_, flow) => <Link to={`/flows/${flow.id}`}>{flow.title}</Link>,
+          },
           { title: "提出人", dataIndex: "requester" },
           {
             title: "进度",

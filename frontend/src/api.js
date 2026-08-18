@@ -61,6 +61,7 @@ export const api = {
   createDemand: (payload) => post("/demands", payload),
   planningRequests: () => get("/planning-requests"),
   failPlanning: (id, reason) => post(`/planning-requests/${encodeURIComponent(id)}/fail`, { reason }),
+  flow: (id) => get(`/flows/${encodeURIComponent(id)}`),
   approveFlow: (id) => post(`/flows/${encodeURIComponent(id)}/approve`),
 
   authorizeFlight: (taskId, payload) =>

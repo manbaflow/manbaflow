@@ -998,6 +998,8 @@ fn router_with_identity(app: Arc<Mutex<RelayApp>>, integrations: ServerIntegrati
         .route("/api/v1/messages/{id}/ack", post(acknowledge_message))
         .route("/api/v1/escalations", get(escalations))
         .route("/api/v1/escalations/{id}/ack", post(ack_escalation))
+        .route("/api/v1/flows", get(flows))
+        .route("/api/v1/flows/{id}", get(flow_detail))
         .route("/api/v1/flows/{id}/approve", post(approve_flow))
         .route(
             "/api/v1/flows/{id}/messages",
@@ -2111,6 +2113,32 @@ async fn create_demand(
     Ok(Json(
         json!({ "flow": serde_json::Value::Null, "planning_request": request }),
     ))
+}
+
+/// 方案全文：PRD、任务、依赖、负责人、排期。
+///
+/// 看板只给聚合数字，确认方案时需要看到具体内容——否则点「确认并执行」
+/// 等于闭眼签字。
+async fn flow_detail(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Flow>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    // 借看板的权限判定：能看看板就能看方案，两者是同一层可见性。
+    app.admin_dashboard(&principal.id)?;
+    Ok(Json(app.state().flow(&id)?.clone()))
+}
+
+async fn flows(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Json<Vec<Flow>>> {
+    let app = state.app.lock().await;
+    let principal = authenticate(&app, &headers)?;
+    app.admin_dashboard(&principal.id)?;
+    let mut flows: Vec<Flow> = app.state().flows.values().cloned().collect();
+    flows.sort_by_key(|flow| flow.created_at);
+    flows.reverse();
+    Ok(Json(flows))
 }
 
 async fn planning_requests(

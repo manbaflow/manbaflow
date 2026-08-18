@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { App, Alert, Button, Card, Empty, Space, Table, Tag, Typography } from "antd";
+import { Link } from "react-router-dom";
 
 import { api } from "../api.js";
 
@@ -44,28 +45,37 @@ export default function Approvals() {
             dataSource={drafts}
             pagination={false}
             columns={[
-              { title: "需求", dataIndex: "title" },
+              {
+                title: "需求",
+                render: (_, flow) => <Link to={`/flows/${flow.id}`}>{flow.title}</Link>,
+              },
               { title: "提出人", dataIndex: "requester" },
               { title: "任务数", dataIndex: "total_tasks" },
               {
                 title: "",
                 align: "right",
                 render: (_, flow) => (
-                  <Button
-                    type="primary"
-                    size="small"
-                    onClick={async () => {
-                      try {
-                        await api.approveFlow(flow.id);
-                        message.success("已确认，进入执行");
-                        load();
-                      } catch (err) {
-                        message.error(err.message);
-                      }
-                    }}
-                  >
-                    确认并执行
-                  </Button>
+                  <Space>
+                    {/* 先看方案再确认：这一页只有聚合数字，不足以判断该不该放行。 */}
+                    <Link to={`/flows/${flow.id}`}>
+                      <Button size="small">查看方案</Button>
+                    </Link>
+                    <Button
+                      type="primary"
+                      size="small"
+                      onClick={async () => {
+                        try {
+                          await api.approveFlow(flow.id);
+                          message.success("已确认，进入执行");
+                          load();
+                        } catch (err) {
+                          message.error(err.message);
+                        }
+                      }}
+                    >
+                      确认并执行
+                    </Button>
+                  </Space>
                 ),
               },
             ]}

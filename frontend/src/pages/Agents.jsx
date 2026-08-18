@@ -25,6 +25,13 @@ const STATUS_COLOR = {
   failed: "error",
 };
 
+const STATUS_TEXT = {
+  queued: "排队中",
+  claimed: "执行中",
+  planned: "已完成",
+  failed: "失败",
+};
+
 export default function Agents() {
   const { message, modal } = App.useApp();
   const [agents, setAgents] = useState([]);
@@ -116,16 +123,21 @@ export default function Agents() {
           loading={loading}
           dataSource={agents}
           pagination={false}
+          tableLayout="fixed"
           locale={{ emptyText: <Empty description="暂无执行器" image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
           columns={[
-            { title: "名称", dataIndex: "name" },
+            { title: "名称", dataIndex: "name", width: 200, ellipsis: true },
             {
               title: "执行器",
               render: (_, agent) =>
                 agent.executor ? <Tag>{agent.executor.kind}</Tag> : <Tag color="warning">未配置</Tag>,
             },
-            { title: "模型", render: (_, agent) => agent.executor?.model || "默认" },
-            { title: "能力", render: (_, agent) => (agent.capabilities || []).join("、") || "—" },
+            { title: "模型", width: 180, ellipsis: true, render: (_, agent) => agent.executor?.model || "默认" },
+            {
+              title: "能力",
+              ellipsis: true,
+              render: (_, agent) => (agent.capabilities || []).join("、") || "—",
+            },
             {
               title: "状态",
               dataIndex: "active",
@@ -151,24 +163,51 @@ export default function Agents() {
           loading={loading}
           dataSource={requests}
           pagination={false}
+          // 固定布局 + 明确列宽：失败原因常常是执行器吐出来的整段 JSON，
+          // 不定宽的话它会把中文需求挤成一列一个字。
+          tableLayout="fixed"
+          scroll={{ x: 900 }}
           locale={{ emptyText: <Empty description="队列为空" image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
           columns={[
             {
               title: "状态",
               dataIndex: "status",
-              render: (status) => <Tag color={STATUS_COLOR[status]}>{status}</Tag>,
+              width: 96,
+              render: (status) => <Tag color={STATUS_COLOR[status]}>{STATUS_TEXT[status] || status}</Tag>,
             },
-            { title: "需求", render: (_, row) => row.demand?.summary },
-            { title: "执行器", dataIndex: "planner" },
-            { title: "尝试次数", dataIndex: "attempt" },
+            {
+              title: "需求",
+              width: 260,
+              render: (_, row) => (
+                <Typography.Text ellipsis={{ tooltip: row.demand?.summary }}>
+                  {row.demand?.summary}
+                </Typography.Text>
+              ),
+            },
+            { title: "执行器", dataIndex: "planner", width: 120 },
+            { title: "尝试次数", dataIndex: "attempt", width: 90, align: "center" },
             {
               title: "失败原因",
               dataIndex: "error",
-              render: (value) => value || "—",
+              render: (value) =>
+                value ? (
+                  // 默认收成两行，点「展开」看全文：执行器的原始输出可能上千字符。
+                  <Typography.Paragraph
+                    type="danger"
+                    style={{ marginBottom: 0, whiteSpace: "pre-wrap" }}
+                    ellipsis={{ rows: 2, expandable: true, symbol: "展开" }}
+                    copyable={{ text: value }}
+                  >
+                    {value}
+                  </Typography.Paragraph>
+                ) : (
+                  "—"
+                ),
             },
             {
               title: "",
               align: "right",
+              width: 88,
               render: (_, row) =>
                 row.status === "queued" || row.status === "claimed" ? (
                   <Button
