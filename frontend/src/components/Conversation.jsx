@@ -17,7 +17,7 @@ const KIND_LABEL = {
  * 这不只是留言板：执行器每次开工前会把这条线程读成指令上下文，所以在这里
  * 追加一句话，等同于给下一轮执行补充要求——多轮对话就是这么形成的。
  */
-export default function Conversation({ flowId, tasks = [] }) {
+export default function Conversation({ flowId, tasks = [], onChanged }) {
   const { message: toast } = App.useApp();
   const [messages, setMessages] = useState([]);
   const [participants, setParticipants] = useState([]);
@@ -55,6 +55,8 @@ export default function Conversation({ flowId, tasks = [] }) {
       });
       form.resetFields(["body"]);
       load();
+      // 指令通常意味着"照这个再跑一轮"，让调用方刷新任务状态。
+      onChanged?.();
     } catch (err) {
       toast.error(err.message);
     } finally {
@@ -65,7 +67,8 @@ export default function Conversation({ flowId, tasks = [] }) {
   return (
     <Card size="small" title="对话" style={{ marginTop: 16 }}>
       <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
-        执行器开工前会读取这条线程。在这里补充的要求会带进下一轮执行。
+        执行器开工前会读取这条线程。在这里补充要求后，回到上面的任务点「让 Agent 开工」，
+        新一轮执行就会带着这些消息跑。
       </Typography.Paragraph>
 
       {messages.length === 0 ? (

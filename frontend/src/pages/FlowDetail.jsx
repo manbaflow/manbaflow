@@ -7,8 +7,12 @@ import {
   Card,
   Col,
   Descriptions,
+  Form,
+  Input,
   List,
+  Modal,
   Row,
+  Select,
   Space,
   Spin,
   Table,
@@ -36,6 +40,45 @@ export default function FlowDetail() {
   const [flow, setFlow] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // 任务级操作：授权开工、转派、上报阻塞。三个都在同一个抽屉里完成，
+  // 省得为每种操作各开一页。
+  const [action, setAction] = useState(null);
+  const [candidates, setCandidates] = useState([]);
+  const [actionForm] = Form.useForm();
+
+  async function runAction(values) {
+    const { task, kind } = action;
+    try {
+      if (kind === "start") {
+        await api.authorizeFlight(task.id, {
+          agent: values.agent,
+          executor: values.executor,
+        });
+        message.success("已授权开工");
+      } else if (kind === "reassign") {
+        await api.reassignTask(task.id, { owner: values.owner, reason: values.reason });
+        message.success("已转派");
+      } else {
+        await api.blockTask(task.id, { reason: values.reason });
+        message.success("已上报阻塞");
+      }
+      setAction(null);
+      actionForm.resetFields();
+      load();
+    } catch (err) {
+      message.error(err.message);
+    }
+  }
+
+  async function openAction(task, kind) {
+    setAction({ task, kind });
+    actionForm.resetFields();
+    if (kind === "reassign") {
+      setCandidates(await api.reassignCandidates(task.id).catch(() => []));
+    } else if (kind === "start") {
+      setCandidates((await api.principalsList().catch(() => [])).filter((p) => p.kind === "agent"));
+    }
+  }
 
   async function load() {
     try {
@@ -172,11 +215,86 @@ export default function FlowDetail() {
                 return <Tag color={meta.color}>{meta.text}</Tag>;
               },
             },
+            {
+              title: "",
+              width: 210,
+              align: "right",
+              render: (_, task) => (
+                <Space size={4}>
+                  {!draft && task.status !== "completed" && (
+                    <Button size="small" type="primary" onClick={() => openAction(task, "start")}>
+                      让 Agent 开工
+                    </Button>
+                  )}
+                  <Button size="small" onClick={() => openAction(task, "reassign")}>
+                    转派
+                  </Button>
+                  <Button size="small" danger onClick={() => openAction(task, "block")}>
+                    上报阻塞
+                  </Button>
+                </Space>
+              ),
+            },
           ]}
         />
       </Card>
 
-      <Conversation flowId={flow.id} tasks={tasks} />
+      <Conversation flowId={flow.id} tasks={tasks} onChanged={load} />
+
+      <Modal
+        open={Boolean(action)}
+        title={
+          action?.kind === "start"
+            ? "授权开工"
+            : action?.kind === "reassign"
+              ? "转派任务"
+              : "上报阻塞"
+        }
+        onCancel={() => setAction(null)}
+        onOk={() => actionForm.submit()}
+        okText="提交"
+      >
+        <Typography.Paragraph type="secondary">{action?.task?.title}</Typography.Paragraph>
+        <Form form={actionForm} layout="vertical" onFinish={runAction}>
+          {action?.kind === "start" && (
+            <>
+              <Form.Item name="agent" label="交给哪个执行器" rules={[{ required: true }]}>
+                <Select
+                  options={candidates.map((c) => ({ value: c.name, label: c.name }))}
+                  placeholder="选择一个 Agent"
+                />
+              </Form.Item>
+              <Form.Item name="executor" label="用什么执行" initialValue="claude_code">
+                <Select
+                  options={[
+                    { value: "claude_code", label: "Claude Code" },
+                    { value: "codex", label: "Codex" },
+                  ]}
+                />
+              </Form.Item>
+              <Typography.Text type="secondary">
+                执行器会在隔离副本里改代码，完成后推分支并开草稿 MR。
+              </Typography.Text>
+            </>
+          )}
+          {action?.kind === "reassign" && (
+            <Form.Item name="owner" label="转派给" rules={[{ required: true }]}>
+              <Select
+                options={(candidates || []).map((c) => ({
+                  value: c.name || c.id,
+                  label: c.name || c.id,
+                }))}
+                placeholder="选择接手的人或 Agent"
+              />
+            </Form.Item>
+          )}
+          {action?.kind !== "start" && (
+            <Form.Item name="reason" label="原因" rules={[{ required: true, message: "写清楚原因" }]}>
+              <Input.TextArea rows={3} placeholder="转派或阻塞的理由会记进 Ledger" />
+            </Form.Item>
+          )}
+        </Form>
+      </Modal>
 
       <Button style={{ marginTop: 16 }} onClick={() => navigate(-1)}>
         返回

@@ -68,6 +68,9 @@ export const api = {
   principalsList: () => get("/principals"),
   approveFlow: (id) => post(`/flows/${encodeURIComponent(id)}/approve`),
 
+  reassignTask: (taskId, payload) => post(`/tasks/${encodeURIComponent(taskId)}/reassign`, payload),
+  reassignCandidates: (taskId) => get(`/tasks/${encodeURIComponent(taskId)}/reassignment-candidates`),
+  blockTask: (taskId, payload) => post(`/tasks/${encodeURIComponent(taskId)}/block`, payload),
   authorizeFlight: (taskId, payload) =>
     post(`/tasks/${encodeURIComponent(taskId)}/flight-leases`, payload),
   recoverFlight: (id, payload) => post(`/flight-leases/${encodeURIComponent(id)}/recover`, payload),

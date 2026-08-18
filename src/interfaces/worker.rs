@@ -599,6 +599,25 @@ impl RemoteWorker {
         let source_workspace = self
             .workspace_for(&lease)
             .unwrap_or_else(|| self.options.workspace.clone());
+        // 关键节点往线程里说话，人在 Console 里能看到执行进展。
+        // 发失败不影响执行——消息只是可见性，不是交付的一部分。
+        let _ = self
+            .control_plane
+            .say(
+                &lease.flow_id,
+                &lease.task_id,
+                "update",
+                &format!(
+                    "开始执行 {}（{}）",
+                    lease.task_id,
+                    match self.options.executor {
+                        ExecutorKind::ClaudeCode => "Claude Code",
+                        ExecutorKind::Codex => "Codex",
+                    }
+                ),
+            )
+            .await;
+
         // 推送成功时记下分支，后面据此发起 MR 创建请求。
         let mut published_branch: Option<crate::worktree::PublishedBranch> = None;
         let (result, artifact) = {
@@ -789,6 +808,21 @@ impl RemoteWorker {
                 report: report.clone(),
             })?,
         )?;
+        let _ = self
+            .control_plane
+            .say(
+                &lease.flow_id,
+                &lease.task_id,
+                if landed { "update" } else { "question" },
+                &if landed {
+                    format!("完成 {}：{summary}", lease.task_id)
+                } else {
+                    // 失败发成 question：它需要人来决定下一步，不是单纯的进展播报。
+                    format!("{} 执行失败：{summary}", lease.task_id)
+                },
+            )
+            .await;
+
         let finished = self
             .control_plane
             .finish_flight(&lease.id, landed, &report)
@@ -914,6 +948,31 @@ impl ControlPlaneClient {
             Method::POST,
             &["planning-requests", id, "submit"],
             Some(json!({ "plan": plan })),
+        )
+        .await
+    }
+
+    /// 往 Flow 线程里发一条消息。
+    ///
+    /// Agent 只写证据的话，线程就是单向的——人看不到它什么时候开工、卡在哪、
+    /// 做完了什么。让它在关键节点说话，线程才是人机双向的。
+    async fn say(
+        &self,
+        flow_id: &str,
+        task_id: &str,
+        kind: &str,
+        body: &str,
+    ) -> Result<serde_json::Value> {
+        self.request(
+            Method::POST,
+            &["flows", flow_id, "messages"],
+            Some(json!({
+                "task_id": task_id,
+                "kind": kind,
+                "recipients": [],
+                "body": body,
+                "requires_ack": false
+            })),
         )
         .await
     }
