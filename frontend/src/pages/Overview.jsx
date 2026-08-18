@@ -6,10 +6,10 @@ import { api } from "../api.js";
 
 const CARDS = [
   { key: "active_flows", title: "进行中的需求" },
-  { key: "awaiting_human", title: "等你确认", tone: "#b45309" },
+  { key: "awaiting_human", title: "待确认", tone: "#b45309" },
   { key: "blocked_tasks", title: "被阻塞的任务", tone: "#b91c1c" },
   { key: "at_risk_tasks", title: "有风险的任务", tone: "#b45309" },
-  { key: "open_flights", title: "Agent 正在执行" },
+  { key: "open_flights", title: "执行中" },
   { key: "completed_tasks", title: "已完成任务", tone: "#047857" },
 ];
 
@@ -32,7 +32,7 @@ export default function Overview() {
         概览
       </Typography.Title>
       <Typography.Paragraph type="secondary">
-        这一页只回答一件事：现在有什么需要你。要动手就去左边对应的页面。
+        当前待办与执行情况汇总。
       </Typography.Paragraph>
 
       <Row gutter={[12, 12]}>
@@ -49,9 +49,9 @@ export default function Overview() {
         ))}
       </Row>
 
-      <Card size="small" title="最近的需求" style={{ marginTop: 16 }} extra={<Link to="/flows">全部</Link>}>
+      <Card size="small" title="最近需求" style={{ marginTop: 16 }} extra={<Link to="/flows">全部</Link>}>
         {(data.flows || []).length === 0 ? (
-          <Empty description="还没有需求，去「提需求」开一条" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+          <Empty description="暂无需求" image={Empty.PRESENTED_IMAGE_SIMPLE} />
         ) : (
           (data.flows || []).slice(0, 5).map((flow) => (
             <div

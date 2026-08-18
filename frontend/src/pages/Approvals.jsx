@@ -31,12 +31,12 @@ export default function Approvals() {
         等我确认
       </Typography.Title>
       <Typography.Paragraph type="secondary">
-        方案生成后不会自动开工，要你点头。确认之后任务才会派下去。
+        方案生成后需经确认才会进入执行。确认后任务将按依赖顺序派发。
       </Typography.Paragraph>
 
       <Card size="small" title="待确认的方案" loading={!data}>
         {drafts.length === 0 ? (
-          <Empty description="没有待确认的方案" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+          <Empty description="暂无待确认方案" image={Empty.PRESENTED_IMAGE_SIMPLE} />
         ) : (
           <Table
             size="middle"
@@ -57,14 +57,14 @@ export default function Approvals() {
                     onClick={async () => {
                       try {
                         await api.approveFlow(flow.id);
-                        message.success("已确认，开始执行");
+                        message.success("已确认，进入执行");
                         load();
                       } catch (err) {
                         message.error(err.message);
                       }
                     }}
                   >
-                    确认方案，开始执行
+                    确认并执行
                   </Button>
                 ),
               },
@@ -73,9 +73,9 @@ export default function Approvals() {
         )}
       </Card>
 
-      <Card size="small" title="其他需要你处理的" style={{ marginTop: 16 }}>
+      <Card size="small" title="其他待处理事项" style={{ marginTop: 16 }}>
         {items.length === 0 ? (
-          <Empty description="暂时没有" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+          <Empty description="暂无" image={Empty.PRESENTED_IMAGE_SIMPLE} />
         ) : (
           <Table
             size="middle"
@@ -90,7 +90,7 @@ export default function Approvals() {
               },
               { title: "事项", dataIndex: "title" },
               { title: "负责人", dataIndex: "owner" },
-              { title: "为什么找你", dataIndex: "reason" },
+              { title: "事由", dataIndex: "reason" },
             ]}
           />
         )}

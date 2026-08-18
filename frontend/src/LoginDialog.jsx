@@ -65,7 +65,7 @@ export default function LoginDialog({ onSignedIn }) {
             name="token"
             label="接入令牌"
             rules={[{ required: true, message: "请填写令牌" }]}
-            extra="令牌只保留在当前标签页，适合 Agent 与自动化使用。"
+            extra="令牌仅保存在当前标签页，适用于自动化接入。"
           >
             <Input.Password placeholder="rly_..." autoComplete="off" />
           </Form.Item>

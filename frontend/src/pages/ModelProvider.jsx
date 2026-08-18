@@ -45,11 +45,10 @@ export default function ModelProvider() {
   return (
     <>
       <Typography.Title level={4} style={{ marginTop: 0 }}>
-        我的模型配置
+        模型配置
       </Typography.Title>
       <Typography.Paragraph type="secondary">
-        你提的需求由 Worker 用<strong>你自己的</strong> Key 去拆解，费用记在你头上。
-        没配的话，Worker 会用它自己环境里的凭据——本机跑的 Worker 通常已经登录过。
+        执行器使用需求提交人配置的凭据调用模型，费用归属提交人。未配置时，执行器将使用其自身环境中的凭据。
       </Typography.Paragraph>
 
       {error && <Alert type="error" message={error} showIcon style={{ marginBottom: 12 }} />}
@@ -71,8 +70,8 @@ export default function ModelProvider() {
               style={{ marginTop: 12 }}
               onClick={() =>
                 modal.confirm({
-                  title: "删除我的模型配置？",
-                  content: "删除后你提的需求会改用 Worker 自身环境里的凭据。",
+                  title: "删除模型配置",
+                  content: "删除后提交的需求将使用执行器自身环境中的凭据。",
                   onOk: async () => {
                     await api.deleteMyProvider();
                     message.success("已删除");
@@ -85,7 +84,7 @@ export default function ModelProvider() {
             </Button>
           </>
         ) : (
-          <Typography.Text type="secondary">还没配置</Typography.Text>
+          <Typography.Text type="secondary">尚未配置</Typography.Text>
         )}
       </Card>
 
@@ -107,18 +106,18 @@ export default function ModelProvider() {
           <Form.Item
             name="base_url"
             label="baseURL（可选）"
-            extra="留空用官方地址。中转或自建网关填在这里。"
+            extra="留空则使用服务商官方地址。"
           >
             <Input placeholder="https://api.example.com/v1" />
           </Form.Item>
-          <Form.Item name="model" label="模型（可选）" extra="留空用执行器默认模型">
+          <Form.Item name="model" label="模型（可选）" extra="留空则使用执行器默认模型">
             <Input placeholder="claude-opus-5" />
           </Form.Item>
           <Form.Item
             name="api_key"
             label="API Key"
-            rules={[{ required: true, message: "填一个 Key" }]}
-            extra="保存后只能看到掩码，看不到原文。要换就重新填一次。"
+            rules={[{ required: true, message: "请填写 API Key" }]}
+            extra="保存后仅显示掩码。如需更换请重新填写。"
           >
             <Input.Password placeholder="sk-..." autoComplete="off" />
           </Form.Item>

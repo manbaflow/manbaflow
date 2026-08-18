@@ -2083,50 +2083,33 @@ async fn create_demand(
         )
         .into());
     }
-    let workspace = std::env::current_dir().map_err(RelayError::from)?;
-    let (data_dir, principal_id, tenant_id) = {
+    let principal_id = {
         let app = state.app.lock().await;
-        let principal = authenticate(&app, &headers)?;
-        (
-            app.data_dir().to_path_buf(),
-            principal.id,
-            app.state().tenant()?.id.clone(),
-        )
+        authenticate(&app, &headers)?.id
     };
-    // 需要模型的拆解一律排队交给 Worker：控制面容器里没有 claude / codex，
-    // 也不该有——那等于把凭据和任意代码执行塞进管状态的进程里。
-    if input.planner != PlannerKind::Local {
-        let request = {
-            let mut app = state.app.lock().await;
-            app.request_planning(
-                &input.summary,
-                &principal_id,
-                input.planner,
-                input.repository.as_deref(),
-            )?
-        };
-        // 信封固定两个字段：排队时 flow 为 null，本地拆解时 planning_request 为 null。
-        // 形状不随 planner 变化，客户端不用猜。
-        return Ok(Json(
-            json!({ "flow": serde_json::Value::Null, "planning_request": request }),
-        ));
+    // 控制面不做拆解，一律排队交给执行器。
+    //
+    // 校验放在鉴权之后：没权限的调用应该先收到 403，而不是先被参数问题挡下。
+    // 拒绝在接口层而不是只在界面上隐藏——绕过界面直接调 API 同样不该让控制面
+    // 起模型进程。它的容器里没有 claude / codex，装上就等于把凭据和任意代码
+    // 执行放进管状态的进程里。
+    if input.planner == PlannerKind::Local {
+        return Err(
+            RelayError::Validation("控制面不执行拆解，请选择 claude_code 或 codex".into()).into(),
+        );
     }
-
-    // 必须跟主实例连同一个库；写死 SQLite 会在 PostgreSQL 部署下开出空库。
-    let mut planning_app = RelayApp::open_for_side_task(data_dir, &tenant_id)?;
-    let flow = planning_app
-        .create_demand(
+    let request = {
+        let mut app = state.app.lock().await;
+        app.request_planning(
             &input.summary,
             &principal_id,
             input.planner,
-            &workspace,
-            input.timeout_seconds,
             input.repository.as_deref(),
-        )
-        .await?;
-    state.app.lock().await.reload()?;
+        )?
+    };
+    // 信封保留两个字段：排队时 flow 为 null。形状固定，客户端不用按 planner 猜。
     Ok(Json(
-        json!({ "flow": flow, "planning_request": serde_json::Value::Null }),
+        json!({ "flow": serde_json::Value::Null, "planning_request": request }),
     ))
 }
 
@@ -3312,7 +3295,8 @@ fn default_capacity_percent() -> u8 {
 }
 
 fn default_planner_kind() -> PlannerKind {
-    PlannerKind::Local
+    // 控制面不做拆解，Local 已经不是合法选项，默认值也不能再是它。
+    PlannerKind::ClaudeCode
 }
 
 fn default_planner_timeout_seconds() -> u64 {
@@ -3815,11 +3799,32 @@ mod tests {
         assert_eq!(created.status(), StatusCode::OK);
         let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
         let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // 本地拆解直接出 Flow；需要模型的拆解会走 planning_request 那一支。
-        let flow: Flow = serde_json::from_value(envelope["flow"].clone()).unwrap();
-        assert!(envelope["planning_request"].is_null());
-        assert_eq!(flow.demand.requester, member.name);
-        assert!(app.lock().await.state().flows.contains_key(&flow.id));
+        // 控制面不拆解：需求进队列，Flow 要等执行器回传方案才出现。
+        assert!(envelope["flow"].is_null());
+        let request: crate::domain::PlanningRequest =
+            serde_json::from_value(envelope["planning_request"].clone()).unwrap();
+        assert_eq!(request.requester, member.name);
+        assert_eq!(request.status, crate::domain::PlanningStatus::Queued);
+        assert!(
+            app.lock()
+                .await
+                .state()
+                .planning_requests
+                .contains_key(&request.id)
+        );
+
+        // 显式要求控制面拆解要被挡下，光靠界面不给选是不够的。
+        let refused = service
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/api/v1/demands",
+                &member_token.token,
+                json!({"summary": "Build an internal gateway", "planner": "local"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
 
         let dashboard = service
             .oneshot(authenticated_request(

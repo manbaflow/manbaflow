@@ -51,8 +51,8 @@ export default function Repositories() {
         代码仓库
       </Typography.Title>
       <Typography.Paragraph type="secondary">
-        先把要开发的项目登记进来，提需求时才能选。登记时会连到 GitLab 校验项目是否存在、凭据是否有权限，
-        所以路径要写完整的 <code>group/project</code>。
+        登记后的仓库可在提交需求时选择。登记时会校验 GitLab 项目是否存在及凭据权限，路径需填写完整的
+        <code>group/project</code>。
       </Typography.Paragraph>
 
       <Card size="small" style={{ marginBottom: 16 }}>
@@ -63,12 +63,12 @@ export default function Repositories() {
           <Form.Item
             name="gitlab_project_path"
             label="GitLab 项目路径"
-            rules={[{ required: true, message: "例如 acme/web-app" }]}
+            rules={[{ required: true, message: "格式为 group/project" }]}
           >
             <Input placeholder="acme/web-app" style={{ width: 260 }} />
           </Form.Item>
           <Form.Item name="name" label="显示名称">
-            <Input placeholder="默认取路径最后一段" style={{ width: 200 }} />
+            <Input placeholder="留空则取路径最后一段" style={{ width: 200 }} />
           </Form.Item>
           <Form.Item>
             <Button type="primary" htmlType="submit" loading={submitting}>

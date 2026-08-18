@@ -20,7 +20,7 @@ export default function Flows() {
       <Typography.Title level={4} style={{ marginTop: 0 }}>
         进行中
       </Typography.Title>
-      <Typography.Paragraph type="secondary">已确认、正在推进的需求都在这里。</Typography.Paragraph>
+      <Typography.Paragraph type="secondary">已确认并正在执行的需求。</Typography.Paragraph>
       <Table
         size="middle"
         rowKey="id"

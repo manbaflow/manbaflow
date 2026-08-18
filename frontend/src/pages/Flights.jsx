@@ -21,11 +21,11 @@ export default function Flights() {
         执行与交付
       </Typography.Title>
       <Typography.Paragraph type="secondary">
-        Agent 在隔离的工作副本里改代码，不动你本地的工作区。完成后回来给你看 diff，验收后才算完成。
+        执行器在隔离的工作副本中修改代码，不影响本地工作区。完成后提交变更供验收。
       </Typography.Paragraph>
 
       {flights.length === 0 ? (
-        <Empty description="现在没有正在执行的任务" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        <Empty description="暂无执行中的任务" image={Empty.PRESENTED_IMAGE_SIMPLE} />
       ) : (
         <Space direction="vertical" style={{ width: "100%" }} size={10}>
           {flights.map((flight) => {

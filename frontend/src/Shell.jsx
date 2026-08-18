@@ -20,12 +20,12 @@ const { Sider, Header, Content } = Layout;
 const NAV = [
   { key: "overview", icon: <DashboardOutlined />, label: "概览" },
   { key: "repositories", icon: <DatabaseOutlined />, label: "代码仓库" },
-  { key: "demands/new", icon: <PlusCircleOutlined />, label: "提需求" },
-  { key: "approvals", icon: <CheckSquareOutlined />, label: "等我确认" },
+  { key: "demands/new", icon: <PlusCircleOutlined />, label: "提交需求" },
+  { key: "approvals", icon: <CheckSquareOutlined />, label: "待确认" },
   { key: "flows", icon: <NodeIndexOutlined />, label: "进行中" },
   { key: "flights", icon: <RocketOutlined />, label: "执行与交付" },
-  { key: "agents", icon: <RobotOutlined />, label: "Agent" },
-  { key: "settings/model", icon: <KeyOutlined />, label: "我的模型配置" },
+  { key: "agents", icon: <RobotOutlined />, label: "执行器" },
+  { key: "settings/model", icon: <KeyOutlined />, label: "模型配置" },
 ];
 
 export default function Shell() {

@@ -34,7 +34,7 @@ export default function NewDemand() {
       });
       if (result.planning_request) {
         setQueued(result.planning_request);
-        message.info("已排队，等 Worker 领走");
+        message.success("需求已提交，等待执行器拆解");
       } else {
         setPlan(result.flow);
         message.success("方案已生成");
@@ -52,24 +52,24 @@ export default function NewDemand() {
         提需求
       </Typography.Title>
       <Typography.Paragraph type="secondary">
-        用一句话说清楚要做什么。系统会拆成任务、估算工期、分配给人或 Agent，等你确认后才开始。
+        描述需要交付的内容。系统据此生成方案、拆分任务并估算工期，经确认后进入执行。
       </Typography.Paragraph>
 
       <Card size="small">
         {error && <Alert type="error" message={error} showIcon style={{ marginBottom: 12 }} />}
-        <Form layout="vertical" onFinish={submit} initialValues={{ planner: "local" }}>
+        <Form layout="vertical" onFinish={submit} initialValues={{ planner: "claude_code" }}>
           <Form.Item
             name="summary"
-            label="要做什么"
-            rules={[{ required: true, message: "写一句话" }]}
+            label="需求描述"
+            rules={[{ required: true, message: "请填写需求描述" }]}
           >
             <Input.TextArea
               rows={3}
               maxLength={4000}
-              placeholder="例如：教师端加一个「今日课表一键导出」"
+              placeholder="例如：教师端支持导出当日课表"
             />
           </Form.Item>
-          <Form.Item name="repository" label="在哪个仓库">
+          <Form.Item name="repository" label="目标仓库">
             <Select
               allowClear
               placeholder="不指定"
@@ -79,12 +79,11 @@ export default function NewDemand() {
               }))}
             />
           </Form.Item>
-          <Form.Item name="planner" label="谁来拆解">
+          <Form.Item name="planner" label="拆解执行器">
             <Select
               options={[
-                { value: "local", label: "按模板（控制面直接生成，立刻出结果）" },
-                { value: "claude_code", label: "Claude Code（排队，等 Worker 领走）" },
-                { value: "codex", label: "Codex（排队，等 Worker 领走）" },
+                { value: "claude_code", label: "Claude Code" },
+                { value: "codex", label: "Codex" },
               ]}
             />
           </Form.Item>
@@ -95,12 +94,12 @@ export default function NewDemand() {
       </Card>
 
       {queued && (
-        <Card size="small" title="已排队" style={{ marginTop: 16 }}>
+        <Card size="small" title="排队中" style={{ marginTop: 16 }}>
           <Alert
             type="info"
             showIcon
-            message={`${queued.id} 正在等待 ${queued.planner} 拆解`}
-            description="控制面不跑模型，这条请求要由 Worker 领走执行。Worker 没在线的话会一直排队——去「Agent」页看有没有在线的执行器。"
+            message={`${queued.id} 等待 ${queued.planner} 拆解`}
+            description="拆解由执行器完成。若当前无可用执行器，请求将保持排队，可在「执行器」页查看运行状态。"
           />
           <Descriptions size="small" column={2} style={{ marginTop: 12 }}>
             <Descriptions.Item label="Flow">{queued.flow_id}</Descriptions.Item>
@@ -116,7 +115,7 @@ export default function NewDemand() {
           style={{ marginTop: 16 }}
           extra={
             <Button type="primary" onClick={() => navigate("/approvals")}>
-              去确认
+              前往确认
             </Button>
           }
         >

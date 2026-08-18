@@ -93,21 +93,20 @@ export default function Agents() {
   return (
     <>
       <Typography.Title level={4} style={{ marginTop: 0 }}>
-        Agent
+        执行器
       </Typography.Title>
       <Typography.Paragraph type="secondary">
-        控制面自己不跑模型。要让 Claude Code / Codex 真的干活，得有 Worker 领走任务——
-        Worker 可以跑在你的电脑上，也可以是集群里的常驻进程，用的是同一套协议。
+        执行器负责拆解需求与执行任务。可部署在本地工作站或集群中，两者使用相同的接入协议。
       </Typography.Paragraph>
 
       {error && <Alert type="error" message={error} showIcon style={{ marginBottom: 12 }} />}
 
       <Card
         size="small"
-        title="已注册的执行器"
+        title="已注册执行器"
         extra={
           <Button type="primary" size="small" onClick={() => setCreating(true)}>
-            注册 Agent
+            注册执行器
           </Button>
         }
       >
@@ -117,7 +116,7 @@ export default function Agents() {
           loading={loading}
           dataSource={agents}
           pagination={false}
-          locale={{ emptyText: <Empty description="还没有 Agent" image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
+          locale={{ emptyText: <Empty description="暂无执行器" image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
           columns={[
             { title: "名称", dataIndex: "name" },
             {
@@ -152,7 +151,7 @@ export default function Agents() {
           loading={loading}
           dataSource={requests}
           pagination={false}
-          locale={{ emptyText: <Empty description="队列是空的" image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
+          locale={{ emptyText: <Empty description="队列为空" image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
           columns={[
             {
               title: "状态",
@@ -161,7 +160,7 @@ export default function Agents() {
             },
             { title: "需求", render: (_, row) => row.demand?.summary },
             { title: "执行器", dataIndex: "planner" },
-            { title: "第几次", dataIndex: "attempt" },
+            { title: "尝试次数", dataIndex: "attempt" },
             {
               title: "失败原因",
               dataIndex: "error",
@@ -177,8 +176,8 @@ export default function Agents() {
                     danger
                     onClick={() =>
                       modal.confirm({
-                        title: "放弃这条拆解？",
-                        content: "需求记录会保留，但不会再有 Worker 来处理它。",
+                        title: "放弃该拆解请求",
+                        content: "需求记录保留，但不再分配执行器处理。",
                         onOk: async () => {
                           await api.failPlanning(row.id, "人工放弃");
                           load();
@@ -195,15 +194,15 @@ export default function Agents() {
       </Card>
 
       <Modal
-        title="注册 Agent"
+        title="注册执行器"
         open={creating}
         onCancel={() => setCreating(false)}
         onOk={() => form.submit()}
         okText="注册"
       >
         <Form form={form} layout="vertical" onFinish={register} initialValues={{ executor: "claude_code" }}>
-          <Form.Item name="name" label="名称" rules={[{ required: true, message: "起个名字" }]}>
-            <Input placeholder="例如：我的 Mac" />
+          <Form.Item name="name" label="名称" rules={[{ required: true, message: "请填写名称" }]}>
+            <Input placeholder="例如：集群执行器" />
           </Form.Item>
           <Form.Item name="executor" label="执行器">
             <Select
@@ -213,10 +212,10 @@ export default function Agents() {
               ]}
             />
           </Form.Item>
-          <Form.Item name="model" label="模型（可选）" extra="留空用执行器默认模型">
-            <Input placeholder="例如：claude-opus-5" />
+          <Form.Item name="model" label="模型（可选）" extra="留空则使用执行器默认模型">
+            <Input placeholder="claude-opus-5" />
           </Form.Item>
-          <Form.Item name="capabilities" label="能力（逗号分隔，可选）">
+          <Form.Item name="capabilities" label="能力标签（逗号分隔，可选）">
             <Input placeholder="backend,frontend" />
           </Form.Item>
         </Form>
@@ -226,14 +225,14 @@ export default function Agents() {
         title="令牌只显示一次"
         open={Boolean(issued)}
         onCancel={() => setIssued(null)}
-        footer={<Button onClick={() => setIssued(null)}>我已保存</Button>}
+        footer={<Button onClick={() => setIssued(null)}>已保存</Button>}
       >
         <Descriptions column={1} size="small" style={{ marginBottom: 12 }}>
           <Descriptions.Item label="Agent">{issued?.agent}</Descriptions.Item>
         </Descriptions>
         <Input.TextArea value={issued?.token} readOnly autoSize />
         <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
-          服务端只保留哈希，关掉这个框就再也看不到了。把它放进 Worker 的 RELAY_TOKEN。
+          服务端仅保留哈希值，关闭后无法再次查看。请配置到执行器的 RELAY_TOKEN。
         </Typography.Paragraph>
       </Modal>
     </>
