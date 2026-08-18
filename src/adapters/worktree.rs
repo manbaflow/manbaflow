@@ -154,6 +154,65 @@ impl IsolatedWorktree {
     }
 }
 
+/// 推送成功后的分支信息。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedBranch {
+    pub branch: String,
+    pub commit: String,
+}
+
+impl IsolatedWorktree {
+    /// 把工作副本里的改动提交并推到远端分支。
+    ///
+    /// 认证走临时的 `http.extraHeader`，不写进 remote URL——URL 会进 reflog、
+    /// 进 `git remote -v`、也可能被别的进程看到，令牌放那里等于泄露。
+    ///
+    /// 分支名由调用方给（约定 `relay/<任务ID>`）。用 `--force-with-lease` 之外
+    /// 的普通推送：同名分支已存在说明上一次执行的结果还在，不该悄悄覆盖。
+    pub fn publish(
+        &self,
+        branch: &str,
+        remote_url: &str,
+        token: &str,
+        message: &str,
+    ) -> Result<Option<PublishedBranch>> {
+        git_ok(&self.root, &["add", "-A"])?;
+        let staged = git_output(&self.root, &["diff", "--cached", "--name-only"])?.stdout;
+        if staged.is_empty() {
+            // 没有改动就不要造一个空分支出来。
+            return Ok(None);
+        }
+        git_ok(
+            &self.root,
+            &[
+                "-c",
+                "user.email=relay@localhost",
+                "-c",
+                "user.name=Relay",
+                "commit",
+                "-m",
+                message,
+            ],
+        )?;
+        let commit = git_text(&self.root, &["rev-parse", "HEAD"])?;
+        let auth_header = format!("http.extraHeader=PRIVATE-TOKEN: {token}");
+        git_ok(
+            &self.root,
+            &[
+                "-c",
+                &auth_header,
+                "push",
+                remote_url,
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+        )?;
+        Ok(Some(PublishedBranch {
+            branch: branch.to_string(),
+            commit,
+        }))
+    }
+}
+
 impl Drop for IsolatedWorktree {
     fn drop(&mut self) {
         if self.attached {
@@ -223,6 +282,77 @@ fn path_arg(path: &Path) -> Result<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publish_commits_and_reports_the_branch() {
+        // 用一个本地裸仓库当远端：不需要真的 GitLab 就能验证提交与推送。
+        let source = tempdir().unwrap();
+        let repository = source.path().join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        git_ok(&repository, &["init", "-q"]).unwrap();
+        git_ok(&repository, &["config", "user.email", "t@example.com"]).unwrap();
+        git_ok(&repository, &["config", "user.name", "T"]).unwrap();
+        fs::write(repository.join("README.md"), "base").unwrap();
+        git_ok(&repository, &["add", "README.md"]).unwrap();
+        git_ok(&repository, &["commit", "-qm", "base"]).unwrap();
+
+        let remote = source.path().join("remote.git");
+        git_ok(
+            source.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let worktree = IsolatedWorktree::create(&repository, source.path().join("work")).unwrap();
+        fs::write(worktree.workspace().join("added.txt"), "changed").unwrap();
+
+        let published = worktree
+            .publish(
+                "relay/TSK-1",
+                remote.to_str().unwrap(),
+                "unused-for-local-remote",
+                "relay: TSK-1",
+            )
+            .unwrap()
+            .expect("有改动就应该产出分支");
+        assert_eq!(published.branch, "relay/TSK-1");
+        assert_eq!(published.commit.len(), 40);
+
+        // 远端确实收到了这个分支。
+        let refs = git_text(&remote, &["for-each-ref", "--format=%(refname)"]).unwrap();
+        assert!(
+            refs.contains("refs/heads/relay/TSK-1"),
+            "远端分支未创建: {refs}"
+        );
+    }
+
+    #[test]
+    fn publish_without_changes_creates_no_branch() {
+        let source = tempdir().unwrap();
+        let repository = source.path().join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        git_ok(&repository, &["init", "-q"]).unwrap();
+        git_ok(&repository, &["config", "user.email", "t@example.com"]).unwrap();
+        git_ok(&repository, &["config", "user.name", "T"]).unwrap();
+        fs::write(repository.join("README.md"), "base").unwrap();
+        git_ok(&repository, &["add", "README.md"]).unwrap();
+        git_ok(&repository, &["commit", "-qm", "base"]).unwrap();
+        let remote = source.path().join("remote.git");
+        git_ok(
+            source.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let worktree = IsolatedWorktree::create(&repository, source.path().join("work")).unwrap();
+        // 一行没改：不该推一个空分支出去。
+        assert!(
+            worktree
+                .publish("relay/TSK-2", remote.to_str().unwrap(), "t", "relay: TSK-2")
+                .unwrap()
+                .is_none()
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
 

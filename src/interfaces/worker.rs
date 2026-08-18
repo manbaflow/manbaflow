@@ -197,6 +197,37 @@ impl RemoteWorker {
     ///
     /// 和 `run_plan_once` 的区别在输入：那个的输入是已分配的任务，这个的输入是
     /// 一句需求。提示词由控制面在建请求时拼好带过来——它才知道团队、人员和产能。
+    /// 把工作副本推成分支。没配推送凭据就跳过。
+    ///
+    /// 凭据独立于控制面的 GitLab 只读令牌：推代码要写权限，应该用限定到项目的
+    /// Project Access Token，而不是复用那把读令牌。
+    fn publish_branch(
+        &self,
+        worktree: &IsolatedWorktree,
+        lease: &FlightLease,
+    ) -> Result<Option<crate::worktree::PublishedBranch>> {
+        let (Ok(base), Ok(token)) = (
+            std::env::var("RELAY_GIT_PUSH_URL"),
+            std::env::var("RELAY_GIT_PUSH_TOKEN"),
+        ) else {
+            return Ok(None);
+        };
+        if base.trim().is_empty() || token.trim().is_empty() {
+            return Ok(None);
+        }
+        let Some(repository) = lease.manifest.as_ref().and_then(|m| m.repository.as_ref()) else {
+            return Ok(None);
+        };
+        let remote = format!(
+            "{}/{}.git",
+            base.trim().trim_end_matches('/'),
+            repository.gitlab_project_path
+        );
+        let branch = format!("relay/{}", lease.task_id);
+        let message = format!("relay: {} ({})", lease.task_id, lease.flow_id);
+        worktree.publish(&branch, &remote, token.trim(), &message)
+    }
+
     async fn run_decompose_once(&self) -> Result<WorkerOutcome> {
         let principal = self.control_plane.me().await?;
         // 队列里存的是 PlannerKind 的字符串形式（claude-code / codex）。
@@ -555,6 +586,8 @@ impl RemoteWorker {
         let source_workspace = self
             .workspace_for(&lease)
             .unwrap_or_else(|| self.options.workspace.clone());
+        // 推送成功时记下分支，后面据此发起 MR 创建请求。
+        let mut published_branch: Option<crate::worktree::PublishedBranch> = None;
         let (result, artifact) = {
             let worktree = if worktree_root.exists() {
                 IsolatedWorktree::resume(&source_workspace, worktree_root)
@@ -587,6 +620,21 @@ impl RemoteWorker {
                         };
                         Ok((artifact, files))
                     });
+                    // 执行成功且配了推送凭据时，把改动推成分支。
+                    //
+                    // 失败不影响交付：补丁已经收进证据了，推送只是让人少一步手工
+                    // apply。所以这里只记日志，不把整次执行判负。
+                    if execution.is_ok() {
+                        match self.publish_branch(&worktree, &lease) {
+                            Ok(Some(published)) => {
+                                published_branch = Some(published);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                eprintln!("分支推送失败（补丁仍在证据里）：{error}");
+                            }
+                        }
+                    }
                     let cleanup = worktree.cleanup();
                     let artifact = collected.and_then(|artifact| cleanup.map(|_| artifact));
                     (execution, artifact)
@@ -717,6 +765,18 @@ impl RemoteWorker {
                 report: report.clone(),
             })?,
         )?;
+        // 分支推上去了就顺手发起 MR 创建请求。它不会立刻写 GitLab——
+        // 写入网关的设计是等人在 Console 里放行，这里只是把请求排上。
+        if let Some(published) = &published_branch
+            && let Some(repository) = lease.manifest.as_ref().and_then(|m| m.repository.as_ref())
+            && let Err(error) = self
+                .control_plane
+                .request_merge_request(&lease.task_id, repository, published)
+                .await
+        {
+            eprintln!("MR 创建请求发起失败（分支已推送）：{error}");
+        }
+
         let finished = self
             .control_plane
             .finish_flight(&lease.id, landed, &report)
@@ -842,6 +902,37 @@ impl ControlPlaneClient {
             Method::POST,
             &["planning-requests", id, "submit"],
             Some(json!({ "plan": plan })),
+        )
+        .await
+    }
+
+    /// 请求创建 MR。落成一条待放行的写入请求，不直接改 GitLab。
+    async fn request_merge_request(
+        &self,
+        task_id: &str,
+        repository: &crate::domain::RepositoryRef,
+        published: &crate::worktree::PublishedBranch,
+    ) -> Result<serde_json::Value> {
+        self.request(
+            Method::POST,
+            &["gitlab", "writes"],
+            Some(json!({
+                "task_id": task_id,
+                "payload": {
+                    "kind": "create_merge_request",
+                    "project": repository.gitlab_project_path,
+                    "source_branch": published.branch,
+                    "target_branch": repository.branch,
+                    "title": format!("relay: {task_id}"),
+                    "description": format!(
+                        "由 Relay 执行 {task_id} 产生。\n\n提交：{}",
+                        published.commit
+                    ),
+                    "labels": ["relay"],
+                    "remove_source_branch": true,
+                    "draft": true
+                }
+            })),
         )
         .await
     }
